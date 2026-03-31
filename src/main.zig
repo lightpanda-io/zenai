@@ -101,6 +101,7 @@ pub fn main() !void {
         "Write a short poem about the moon.",
         .{ .temperature = 0.7, .thinkingConfig = .{ .thinkingBudget = 0 } },
         .{},
+        {},
         &printStreamChunk,
     );
     std.debug.print("\n\n", .{});
@@ -120,7 +121,13 @@ pub fn main() !void {
 
         const r2 = try chat.sendMessage("What is my name?");
         std.debug.print("User: What is my name?\n", .{});
-        std.debug.print("Model: {s}\n\n", .{r2.text() orelse "(no text)"});
+        std.debug.print("Model: {s}\n", .{r2.text() orelse "(no text)"});
+
+        // Streaming chat — model still remembers context
+        std.debug.print("User (stream): Tell me a joke about my name.\n", .{});
+        std.debug.print("Model: ", .{});
+        try chat.sendMessageStream("Tell me a joke about my name.", {}, &printStreamChunk);
+        std.debug.print("\n\n", .{});
     }
 
     // --- Function calling ---
@@ -128,7 +135,7 @@ pub fn main() !void {
     try functionCallingExample(&client);
 }
 
-fn printStreamChunk(response: zenai.types.GenerateContentResponse) void {
+fn printStreamChunk(_: void, response: zenai.types.GenerateContentResponse) void {
     if (response.text()) |t| {
         const fd = std.posix.STDOUT_FILENO;
         _ = std.posix.write(fd, t) catch return;

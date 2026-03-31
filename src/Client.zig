@@ -193,7 +193,8 @@ pub fn generateContentStream(
     contents: []const Content,
     config: ?GenerationConfig,
     options: RequestOptions,
-    callback: *const fn (GenerateContentResponse) void,
+    context: anytype,
+    callback: *const fn (@TypeOf(context), GenerateContentResponse) void,
 ) StreamError!void {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
@@ -258,7 +259,7 @@ pub fn generateContentStream(
             const json_data = trimmed["data: ".len..];
             const parsed = std.json.parseFromSlice(GenerateContentResponse, self.allocator, json_data, .{ .ignore_unknown_fields = true }) catch continue;
             defer parsed.deinit();
-            callback(parsed.value);
+            callback(context, parsed.value);
         }
     }
 }
@@ -269,11 +270,12 @@ pub fn generateContentStreamFromText(
     prompt: []const u8,
     config: ?GenerationConfig,
     options: RequestOptions,
-    callback: *const fn (GenerateContentResponse) void,
+    context: anytype,
+    callback: *const fn (@TypeOf(context), GenerateContentResponse) void,
 ) StreamError!void {
     const parts = [_]Part{.{ .text = prompt }};
     const contents = [_]Content{.{ .role = "user", .parts = &parts }};
-    return self.generateContentStream(model, &contents, config, options, callback);
+    return self.generateContentStream(model, &contents, config, options, context, callback);
 }
 
 // --- Model Management ---
