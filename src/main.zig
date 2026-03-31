@@ -72,7 +72,7 @@ pub fn main() !void {
     std.debug.print("=== Cached content ===\n", .{});
     {
         // List existing cached contents
-        var list_result = try client.listCachedContents();
+        var list_result = try client.listCachedContents(.{});
         defer list_result.deinit();
         const count = if (list_result.value.cachedContents) |cc| cc.len else 0;
         std.debug.print("Existing cached contents: {d}\n\n", .{count});

@@ -257,6 +257,10 @@ pub const GenerationConfig = struct {
     responseLogprobs: ?bool = null,
     logprobs: ?i32 = null,
     thinkingConfig: ?ThinkingConfig = null,
+    cachedContent: ?[]const u8 = null,
+    responseModalities: ?[]const []const u8 = null,
+    mediaResolution: ?[]const u8 = null,
+    audioTimestamp: ?bool = null,
 };
 
 // --- Request ---
@@ -299,6 +303,12 @@ pub const UsageMetadata = struct {
     totalTokenCount: ?i32 = null,
     cachedContentTokenCount: ?i32 = null,
     thoughtsTokenCount: ?i32 = null,
+    toolUsePromptTokenCount: ?i32 = null,
+};
+
+pub const PromptFeedback = struct {
+    blockReason: ?[]const u8 = null,
+    safetyRatings: ?[]const SafetyRating = null,
 };
 
 pub const GenerateContentResponse = struct {
@@ -306,6 +316,9 @@ pub const GenerateContentResponse = struct {
     usageMetadata: ?UsageMetadata = null,
     modelVersion: ?[]const u8 = null,
     responseId: ?[]const u8 = null,
+    createTime: ?[]const u8 = null,
+    modelStatus: ?[]const u8 = null,
+    promptFeedback: ?PromptFeedback = null,
 
     /// Extract text from the first candidate's first part.
     pub fn text(self: GenerateContentResponse) ?[]const u8 {

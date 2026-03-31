@@ -374,6 +374,24 @@ fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) (G
     };
 }
 
+pub const ListOptions = struct {
+    pageSize: ?i32 = null,
+    pageToken: ?[]const u8 = null,
+};
+
+fn appendListParams(allocator: std.mem.Allocator, base_url: []const u8, options: ListOptions) ![]u8 {
+    if (options.pageSize == null and options.pageToken == null) {
+        return allocator.dupe(u8, base_url);
+    }
+    if (options.pageSize != null and options.pageToken != null) {
+        return std.fmt.allocPrint(allocator, "{s}?pageSize={d}&pageToken={s}", .{ base_url, options.pageSize.?, options.pageToken.? });
+    }
+    if (options.pageSize) |ps| {
+        return std.fmt.allocPrint(allocator, "{s}?pageSize={d}", .{ base_url, ps });
+    }
+    return std.fmt.allocPrint(allocator, "{s}?pageToken={s}", .{ base_url, options.pageToken.? });
+}
+
 pub fn getModel(self: *Client, model: []const u8) !ParsedResponse(types.Model) {
     if (self.api_key.len == 0) return error.MissingApiKey;
     const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}/models/{s}", .{ self.base_url, self.api_version, model });
@@ -381,9 +399,11 @@ pub fn getModel(self: *Client, model: []const u8) !ParsedResponse(types.Model) {
     return self.fetchGet(url, types.Model);
 }
 
-pub fn listModels(self: *Client) !ParsedResponse(types.ListModelsResponse) {
+pub fn listModels(self: *Client, options: ListOptions) !ParsedResponse(types.ListModelsResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}/models", .{ self.base_url, self.api_version });
+    const base = try std.fmt.allocPrint(self.allocator, "{s}/{s}/models", .{ self.base_url, self.api_version });
+    defer self.allocator.free(base);
+    const url = try appendListParams(self.allocator, base, options);
     defer self.allocator.free(url);
     return self.fetchGet(url, types.ListModelsResponse);
 }
@@ -591,11 +611,38 @@ pub fn getFile(self: *Client, name: []const u8) !ParsedResponse(types.File) {
     return self.fetchGet(url, types.File);
 }
 
-pub fn listFiles(self: *Client) !ParsedResponse(types.ListFilesResponse) {
+pub fn listFiles(self: *Client, options: ListOptions) !ParsedResponse(types.ListFilesResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}/files", .{ self.base_url, self.api_version });
+    const base = try std.fmt.allocPrint(self.allocator, "{s}/{s}/files", .{ self.base_url, self.api_version });
+    defer self.allocator.free(base);
+    const url = try appendListParams(self.allocator, base, options);
     defer self.allocator.free(url);
     return self.fetchGet(url, types.ListFilesResponse);
+}
+
+pub fn downloadFile(self: *Client, uri: []const u8) ![]u8 {
+    if (self.api_key.len == 0) return error.MissingApiKey;
+
+    // Append API key as query parameter
+    const sep: []const u8 = if (std.mem.indexOf(u8, uri, "?") != null) "&" else "?";
+    const url = try std.fmt.allocPrint(self.allocator, "{s}{s}key={s}", .{ uri, sep, self.api_key });
+    defer self.allocator.free(url);
+
+    var response_buf: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer response_buf.deinit();
+
+    const result = try self.http_client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &response_buf.writer,
+    });
+
+    const status_code = @intFromEnum(result.status);
+    if (status_code < 200 or status_code >= 300) {
+        response_buf.deinit();
+        return error.ApiError;
+    }
+
+    return response_buf.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 pub fn deleteFile(self: *Client, name: []const u8) !void {
@@ -662,9 +709,11 @@ pub fn getCachedContent(self: *Client, name: []const u8) !ParsedResponse(types.C
     return self.fetchGet(url, types.CachedContent);
 }
 
-pub fn listCachedContents(self: *Client) !ParsedResponse(types.ListCachedContentsResponse) {
+pub fn listCachedContents(self: *Client, options: ListOptions) !ParsedResponse(types.ListCachedContentsResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}/cachedContents", .{ self.base_url, self.api_version });
+    const base = try std.fmt.allocPrint(self.allocator, "{s}/{s}/cachedContents", .{ self.base_url, self.api_version });
+    defer self.allocator.free(base);
+    const url = try appendListParams(self.allocator, base, options);
     defer self.allocator.free(url);
     return self.fetchGet(url, types.ListCachedContentsResponse);
 }
