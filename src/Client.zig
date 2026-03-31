@@ -163,6 +163,121 @@ pub fn generateContentFromText(
     return self.generateContent(model, &contents, config, options);
 }
 
+pub const StreamError = error{
+    ApiError,
+    MissingApiKey,
+    InvalidSseData,
+} || std.http.Client.RequestError || std.http.Client.Request.ReceiveHeadError || std.Io.Writer.Error || std.Io.Reader.DelimiterError || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error || std.Uri.ParseError;
+
+pub fn generateContentStream(
+    self: *Client,
+    model: []const u8,
+    contents: []const Content,
+    config: ?GenerationConfig,
+    options: RequestOptions,
+    callback: *const fn (GenerateContentResponse) void,
+) StreamError!void {
+    if (self.api_key.len == 0) return error.MissingApiKey;
+
+    // Build URL with streaming endpoint
+    const url = try std.fmt.allocPrint(
+        self.allocator,
+        "{s}/{s}/models/{s}:streamGenerateContent?alt=sse",
+        .{ self.base_url, self.api_version, model },
+    );
+    defer self.allocator.free(url);
+
+    // Build request body
+    const req_body = GenerateContentRequest{
+        .contents = contents,
+        .generationConfig = config,
+        .systemInstruction = options.systemInstruction,
+        .safetySettings = options.safetySettings,
+        .tools = options.tools,
+        .toolConfig = options.toolConfig,
+    };
+    var payload_buf: std.Io.Writer.Allocating = .init(self.allocator);
+    defer payload_buf.deinit();
+    std.json.Stringify.value(req_body, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
+        return error.OutOfMemory;
+    const payload = payload_buf.written();
+
+    // Create low-level request
+    const uri = try std.Uri.parse(url);
+    var req = try self.http_client.request(.POST, uri, .{
+        .extra_headers = &.{
+            .{ .name = "x-goog-api-key", .value = self.api_key },
+        },
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+        },
+        .redirect_behavior = .unhandled,
+    });
+    defer req.deinit();
+
+    // Send body
+    req.transfer_encoding = .{ .content_length = payload.len };
+    var bw = try req.sendBodyUnflushed(&.{});
+    try bw.writer.writeAll(payload);
+    try bw.end();
+    try req.connection.?.flush();
+
+    // Receive response headers
+    var redirect_buf: [0]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+
+    // Check HTTP status
+    const status_code = @intFromEnum(response.head.status);
+    if (status_code < 200 or status_code >= 300) {
+        std.log.err("Gemini API streaming error (HTTP {d})", .{status_code});
+        return error.ApiError;
+    }
+
+    // Read SSE lines — buffer must be large enough to hold a full SSE data line
+    const transfer_buf = try self.allocator.alloc(u8, 256 * 1024);
+    defer self.allocator.free(transfer_buf);
+    const reader = response.reader(transfer_buf);
+
+    while (true) {
+        const line = reader.takeDelimiter('\n') catch |err| switch (err) {
+            error.StreamTooLong => return error.InvalidSseData,
+            error.ReadFailed => return, // connection closed
+        } orelse return; // end of stream
+
+        // Skip empty lines and carriage returns
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        if (trimmed.len == 0) continue;
+
+        // Parse SSE data lines
+        if (std.mem.startsWith(u8, trimmed, "data: ")) {
+            const json_data = trimmed["data: ".len..];
+
+            const parsed = std.json.parseFromSlice(
+                GenerateContentResponse,
+                self.allocator,
+                json_data,
+                .{ .ignore_unknown_fields = true },
+            ) catch continue; // skip malformed chunks
+            defer parsed.deinit();
+
+            callback(parsed.value);
+        }
+    }
+}
+
+pub fn generateContentStreamFromText(
+    self: *Client,
+    model: []const u8,
+    prompt: []const u8,
+    config: ?GenerationConfig,
+    options: RequestOptions,
+    callback: *const fn (GenerateContentResponse) void,
+) StreamError!void {
+    const parts = [_]Part{.{ .text = prompt }};
+    const contents = [_]Content{.{ .role = "user", .parts = &parts }};
+    return self.generateContentStream(model, &contents, config, options, callback);
+}
+
 test "Client init and deinit" {
     var client = Client.init(std.testing.allocator, "test-key", .{});
     defer client.deinit();

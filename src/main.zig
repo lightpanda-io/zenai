@@ -30,9 +30,29 @@ pub fn main() !void {
         }
     }
 
+    // --- Streaming ---
+    std.debug.print("=== Streaming ===\n", .{});
+    // Note: gemini-2.5-flash uses extended thinking so tokens arrive after a pause.
+    // Use gemini-2.0-flash to see tokens stream incrementally.
+    try client.generateContentStreamFromText(
+        "gemini-2.0-flash",
+        "Write a short poem about the moon.",
+        .{ .temperature = 0.7 },
+        .{},
+        &printStreamChunk,
+    );
+    std.debug.print("\n\n", .{});
+
     // --- Function calling ---
     std.debug.print("=== Function calling ===\n", .{});
     try functionCallingExample(&client);
+}
+
+fn printStreamChunk(response: zenai.types.GenerateContentResponse) void {
+    if (response.text()) |t| {
+        const fd = std.posix.STDOUT_FILENO;
+        _ = std.posix.write(fd, t) catch return;
+    }
 }
 
 fn functionCallingExample(client: *zenai.Client) !void {
