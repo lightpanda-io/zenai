@@ -41,6 +41,24 @@ pub fn main() !void {
     );
     std.debug.print("\n\n", .{});
 
+    // --- Chat session ---
+    std.debug.print("=== Chat session ===\n", .{});
+    {
+        var chat = zenai.Chat.init(&client, "gemini-2.5-flash", .{
+            .temperature = 0,
+            .thinkingConfig = .{ .thinkingBudget = 0 },
+        }, .{});
+        defer chat.deinit();
+
+        const r1 = try chat.sendMessage("My name is Alice. Remember it.");
+        std.debug.print("User: My name is Alice. Remember it.\n", .{});
+        std.debug.print("Model: {s}\n", .{r1.text() orelse "(no text)"});
+
+        const r2 = try chat.sendMessage("What is my name?");
+        std.debug.print("User: What is my name?\n", .{});
+        std.debug.print("Model: {s}\n\n", .{r2.text() orelse "(no text)"});
+    }
+
     // --- Function calling ---
     std.debug.print("=== Function calling ===\n", .{});
     try functionCallingExample(&client);
