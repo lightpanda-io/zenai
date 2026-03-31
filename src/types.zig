@@ -133,12 +133,17 @@ pub const Content = struct {
 
 // --- Schema ---
 
+pub const Property = struct {
+    key: []const u8,
+    value: Schema,
+};
+
 pub const Schema = struct {
     type: ?SchemaType = null,
     description: ?[]const u8 = null,
     @"enum": ?[]const []const u8 = null,
     items: ?*const Schema = null,
-    properties: ?std.json.Value = null,
+    properties: ?[]const Property = null,
     required: ?[]const []const u8 = null,
     nullable: ?bool = null,
     format: ?[]const u8 = null,
@@ -150,6 +155,39 @@ pub const Schema = struct {
     minLength: ?i64 = null,
     maxLength: ?i64 = null,
     pattern: ?[]const u8 = null,
+
+    /// Custom JSON serialization: emit `properties` as a JSON object instead of an array.
+    pub fn jsonStringify(self: *const Schema, jw: *std.json.Stringify) !void {
+        try jw.beginObject();
+        inline for (std.meta.fields(Schema)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "properties")) {
+                if (self.properties) |props| {
+                    try jw.objectField("properties");
+                    try jw.beginObject();
+                    for (props) |prop| {
+                        try jw.objectField(prop.key);
+                        try jw.write(prop.value);
+                    }
+                    try jw.endObject();
+                }
+            } else {
+                const val = @field(self, field.name);
+                if (comptime @typeInfo(field.type) == .optional) {
+                    if (val) |unwrapped| {
+                        try jw.objectField(field.name);
+                        try jw.write(unwrapped);
+                    } else if (jw.options.emit_null_optional_fields) {
+                        try jw.objectField(field.name);
+                        try jw.write(null);
+                    }
+                } else {
+                    try jw.objectField(field.name);
+                    try jw.write(val);
+                }
+            }
+        }
+        try jw.endObject();
+    }
 };
 
 // --- Safety ---
@@ -270,9 +308,19 @@ pub const GenerateContentResponse = struct {
         return content.parts[0].text;
     }
 
-    /// Extract function calls from the first candidate's parts.
-    /// Returns the parts slice so the caller can filter for .functionCall.
-    pub fn functionCalls(self: GenerateContentResponse) ?[]const Part {
+    /// Extract the first function call from the first candidate.
+    pub fn firstFunctionCall(self: GenerateContentResponse) ?FunctionCall {
+        const candidates = self.candidates orelse return null;
+        if (candidates.len == 0) return null;
+        const content = candidates[0].content orelse return null;
+        for (content.parts) |part| {
+            if (part.functionCall) |fc| return fc;
+        }
+        return null;
+    }
+
+    /// Return all parts from the first candidate.
+    pub fn parts(self: GenerateContentResponse) ?[]const Part {
         const candidates = self.candidates orelse return null;
         if (candidates.len == 0) return null;
         const content = candidates[0].content orelse return null;

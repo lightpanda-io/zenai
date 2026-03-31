@@ -14,17 +14,110 @@ pub fn main() !void {
     var client = zenai.Client.init(allocator, api_key, .{});
     defer client.deinit();
 
-    const response = try client.generateContentFromText(
-        "gemini-2.5-flash",
-        "What is your name?",
+    // --- Simple text generation ---
+    std.debug.print("=== Simple text generation ===\n", .{});
+    {
+        var response = try client.generateContentFromText(
+            "gemini-2.5-flash",
+            "What is your name?",
+            .{ .temperature = 0 },
+            .{},
+        );
+        defer response.deinit();
+
+        if (response.text()) |text| {
+            std.debug.print("{s}\n\n", .{text});
+        }
+    }
+
+    // --- Function calling ---
+    std.debug.print("=== Function calling ===\n", .{});
+    try functionCallingExample(&client);
+}
+
+fn functionCallingExample(client: *zenai.Client) !void {
+    const model = "gemini-2.5-flash";
+
+    // Define the tool
+    const tools = [_]zenai.types.Tool{.{
+        .functionDeclarations = &.{.{
+            .name = "get_weather",
+            .description = "Get the current weather for a given city.",
+            .parameters = .{
+                .type = .OBJECT,
+                .properties = &.{
+                    .{ .key = "city", .value = .{ .type = .STRING, .description = "The city name" } },
+                },
+                .required = &.{"city"},
+            },
+        }},
+    }};
+
+    const request_options = zenai.Client.RequestOptions{
+        .tools = &tools,
+    };
+
+    // Step 1: Send the user prompt
+    std.debug.print("User: What's the weather like in Paris?\n", .{});
+
+    const user_parts = [_]zenai.types.Part{.{ .text = "What's the weather like in Paris?" }};
+    const user_content = [_]zenai.types.Content{.{ .role = "user", .parts = &user_parts }};
+
+    var response1 = try client.generateContent(
+        model,
+        &user_content,
         .{ .temperature = 0 },
+        request_options,
+    );
+    defer response1.deinit();
+
+    // Step 2: Check if the model wants to call a function
+    const fc = response1.firstFunctionCall() orelse {
+        std.debug.print("Model responded with text: {s}\n", .{response1.text() orelse "no text"});
+        return;
+    };
+
+    std.debug.print("Model wants to call: {s}\n", .{fc.name orelse "unknown"});
+
+    // Step 3: "Execute" the function (simulated)
+    const weather_result = "{\"temperature\": \"22°C\", \"condition\": \"Sunny\", \"humidity\": \"45%\"}";
+    std.debug.print("Function result: {s}\n", .{weather_result});
+
+    // Step 4: Send the function response back to the model
+    // Build the conversation history: user message + model's function call + function response
+    const model_parts = response1.value.candidates.?[0].content.?.parts;
+
+    const fr_response = try std.json.parseFromSlice(
+        std.json.Value,
+        std.heap.page_allocator,
+        weather_result,
         .{},
     );
-    defer client.freeResponse(response);
+    defer fr_response.deinit();
 
-    if (response.text()) |text| {
-        std.debug.print("{s}\n", .{text});
-    } else {
-        std.debug.print("No response text received\n", .{});
+    const fn_response_parts = [_]zenai.types.Part{.{
+        .functionResponse = .{
+            .name = fc.name,
+            .response = fr_response.value,
+        },
+    }};
+
+    const history = [_]zenai.types.Content{
+        .{ .role = "user", .parts = &user_parts },
+        .{ .role = "model", .parts = model_parts },
+        .{ .role = "user", .parts = &fn_response_parts },
+    };
+
+    var response2 = try client.generateContent(
+        model,
+        &history,
+        .{ .temperature = 0 },
+        request_options,
+    );
+    defer response2.deinit();
+
+    // Step 5: Print the final response
+    if (response2.text()) |text| {
+        std.debug.print("Model: {s}\n", .{text});
     }
 }

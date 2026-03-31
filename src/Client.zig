@@ -50,13 +50,36 @@ pub const RequestOptions = struct {
     toolConfig: ?ToolConfig = null,
 };
 
+/// Owns the parsed response and its backing memory.
+/// Call `deinit()` when done to free all resources.
+pub const Response = struct {
+    value: GenerateContentResponse,
+    /// Owns the JSON bytes backing the parsed response.
+    json_buf: std.Io.Writer.Allocating,
+    /// Owns the parsed JSON arena (strings, slices, etc. point into json_buf).
+    parsed: std.json.Parsed(GenerateContentResponse),
+
+    pub fn deinit(self: *Response) void {
+        self.parsed.deinit();
+        self.json_buf.deinit();
+    }
+
+    pub fn text(self: Response) ?[]const u8 {
+        return self.value.text();
+    }
+
+    pub fn firstFunctionCall(self: Response) ?types.FunctionCall {
+        return self.value.firstFunctionCall();
+    }
+};
+
 pub fn generateContent(
     self: *Client,
     model: []const u8,
     contents: []const Content,
     config: ?GenerationConfig,
     options: RequestOptions,
-) GenerateContentError!GenerateContentResponse {
+) GenerateContentError!Response {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
     // Build URL
@@ -82,9 +105,9 @@ pub fn generateContent(
         return error.OutOfMemory;
     const payload = payload_buf.written();
 
-    // Prepare response writer
+    // Prepare response writer — ownership transfers to Response
     var response_buf: std.Io.Writer.Allocating = .init(self.allocator);
-    defer response_buf.deinit();
+    errdefer response_buf.deinit();
 
     // Make HTTP request
     const result = try self.http_client.fetch(.{
@@ -113,16 +136,19 @@ pub fn generateContent(
 
     if (response_body.len == 0) return error.EmptyResponse;
 
-    // Parse response
+    // Parse response — ownership transfers to Response
     const parsed = try std.json.parseFromSlice(
         GenerateContentResponse,
         self.allocator,
         response_body,
         .{ .ignore_unknown_fields = true },
     );
-    defer parsed.deinit();
 
-    return dupeResponse(self.allocator, parsed.value);
+    return .{
+        .value = parsed.value,
+        .json_buf = response_buf,
+        .parsed = parsed,
+    };
 }
 
 pub fn generateContentFromText(
@@ -131,176 +157,10 @@ pub fn generateContentFromText(
     prompt: []const u8,
     config: ?GenerationConfig,
     options: RequestOptions,
-) GenerateContentError!GenerateContentResponse {
+) GenerateContentError!Response {
     const parts = [_]Part{.{ .text = prompt }};
     const contents = [_]Content{.{ .role = "user", .parts = &parts }};
     return self.generateContent(model, &contents, config, options);
-}
-
-pub fn freeResponse(self: *Client, response: GenerateContentResponse) void {
-    freeResponseAlloc(self.allocator, response);
-}
-
-fn freeResponseAlloc(allocator: std.mem.Allocator, response: GenerateContentResponse) void {
-    if (response.modelVersion) |v| allocator.free(v);
-    if (response.responseId) |v| allocator.free(v);
-
-    if (response.candidates) |candidates| {
-        for (candidates) |candidate| {
-            if (candidate.content) |content| {
-                freeParts(allocator, content.parts);
-                allocator.free(content.parts);
-                if (content.role) |r| allocator.free(r);
-            }
-            if (candidate.safetyRatings) |ratings| {
-                allocator.free(ratings);
-            }
-            if (candidate.citationMetadata) |cm| {
-                if (cm.citationSources) |sources| {
-                    for (sources) |src| {
-                        if (src.uri) |v| allocator.free(v);
-                        if (src.license) |v| allocator.free(v);
-                    }
-                    allocator.free(sources);
-                }
-            }
-        }
-        allocator.free(candidates);
-    }
-}
-
-fn freeParts(allocator: std.mem.Allocator, parts: []const Part) void {
-    for (parts) |part| {
-        if (part.text) |t| allocator.free(t);
-        if (part.inlineData) |b| {
-            if (b.data) |d| allocator.free(d);
-            if (b.mimeType) |m| allocator.free(m);
-            if (b.displayName) |n| allocator.free(n);
-        }
-        if (part.fileData) |f| {
-            if (f.fileUri) |u| allocator.free(u);
-            if (f.mimeType) |m| allocator.free(m);
-        }
-        if (part.functionCall) |fc| {
-            if (fc.id) |v| allocator.free(v);
-            if (fc.name) |v| allocator.free(v);
-            // args is std.json.Value — owned by the parsed JSON, but since we dupe
-            // strings manually, we don't free the Value tree here.
-        }
-        if (part.functionResponse) |fr| {
-            if (fr.id) |v| allocator.free(v);
-            if (fr.name) |v| allocator.free(v);
-        }
-        if (part.executableCode) |ec| {
-            if (ec.code) |v| allocator.free(v);
-        }
-        if (part.codeExecutionResult) |cr| {
-            if (cr.output) |v| allocator.free(v);
-        }
-    }
-}
-
-fn dupeResponse(allocator: std.mem.Allocator, resp: GenerateContentResponse) std.mem.Allocator.Error!GenerateContentResponse {
-    var result: GenerateContentResponse = .{};
-
-    result.modelVersion = if (resp.modelVersion) |v| try allocator.dupe(u8, v) else null;
-    result.responseId = if (resp.responseId) |v| try allocator.dupe(u8, v) else null;
-    result.usageMetadata = resp.usageMetadata;
-
-    if (resp.candidates) |candidates| {
-        const duped = try allocator.alloc(types.Candidate, candidates.len);
-        errdefer allocator.free(duped);
-
-        for (candidates, 0..) |candidate, i| {
-            duped[i] = .{
-                .finishReason = candidate.finishReason,
-                .tokenCount = candidate.tokenCount,
-                .avgLogprobs = candidate.avgLogprobs,
-                .index = candidate.index,
-            };
-
-            if (candidate.content) |content| {
-                duped[i].content = .{
-                    .role = if (content.role) |r| try allocator.dupe(u8, r) else null,
-                    .parts = try dupeParts(allocator, content.parts),
-                };
-            }
-
-            if (candidate.safetyRatings) |ratings| {
-                duped[i].safetyRatings = try allocator.dupe(types.SafetyRating, ratings);
-            }
-
-            if (candidate.citationMetadata) |cm| {
-                var dcm: types.CitationMetadata = .{};
-                if (cm.citationSources) |sources| {
-                    const ds = try allocator.alloc(types.CitationSource, sources.len);
-                    for (sources, 0..) |src, j| {
-                        ds[j] = .{
-                            .startIndex = src.startIndex,
-                            .endIndex = src.endIndex,
-                            .uri = if (src.uri) |v| try allocator.dupe(u8, v) else null,
-                            .license = if (src.license) |v| try allocator.dupe(u8, v) else null,
-                        };
-                    }
-                    dcm.citationSources = ds;
-                }
-                duped[i].citationMetadata = dcm;
-            }
-        }
-        result.candidates = duped;
-    }
-
-    return result;
-}
-
-fn dupeParts(allocator: std.mem.Allocator, parts: []const Part) std.mem.Allocator.Error![]Part {
-    const duped = try allocator.alloc(Part, parts.len);
-    for (parts, 0..) |part, i| {
-        duped[i] = .{};
-        duped[i].text = if (part.text) |t| try allocator.dupe(u8, t) else null;
-        duped[i].thought = part.thought;
-
-        if (part.inlineData) |b| {
-            duped[i].inlineData = .{
-                .data = if (b.data) |d| try allocator.dupe(u8, d) else null,
-                .mimeType = if (b.mimeType) |m| try allocator.dupe(u8, m) else null,
-                .displayName = if (b.displayName) |n| try allocator.dupe(u8, n) else null,
-            };
-        }
-        if (part.fileData) |f| {
-            duped[i].fileData = .{
-                .fileUri = if (f.fileUri) |u| try allocator.dupe(u8, u) else null,
-                .mimeType = if (f.mimeType) |m| try allocator.dupe(u8, m) else null,
-            };
-        }
-        if (part.functionCall) |fc| {
-            duped[i].functionCall = .{
-                .id = if (fc.id) |v| try allocator.dupe(u8, v) else null,
-                .name = if (fc.name) |v| try allocator.dupe(u8, v) else null,
-                .args = fc.args, // json Value — not deep-duped
-            };
-        }
-        if (part.functionResponse) |fr| {
-            duped[i].functionResponse = .{
-                .id = if (fr.id) |v| try allocator.dupe(u8, v) else null,
-                .name = if (fr.name) |v| try allocator.dupe(u8, v) else null,
-                .response = fr.response,
-            };
-        }
-        if (part.executableCode) |ec| {
-            duped[i].executableCode = .{
-                .code = if (ec.code) |v| try allocator.dupe(u8, v) else null,
-                .language = ec.language,
-            };
-        }
-        if (part.codeExecutionResult) |cr| {
-            duped[i].codeExecutionResult = .{
-                .outcome = cr.outcome,
-                .output = if (cr.output) |v| try allocator.dupe(u8, v) else null,
-            };
-        }
-    }
-    return duped;
 }
 
 test "Client init and deinit" {
