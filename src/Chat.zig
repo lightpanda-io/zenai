@@ -151,12 +151,19 @@ pub fn getHistory(self: *const Chat) []const Content {
 }
 
 fn dupeParts(self: *Chat, parts: []const Part) std.mem.Allocator.Error![]Part {
-    const arena_alloc = self.arena.allocator();
-    const duped = try arena_alloc.alloc(Part, parts.len);
+    const a = self.arena.allocator();
+    const duped = try a.alloc(Part, parts.len);
     for (parts, 0..) |part, i| {
         duped[i] = part;
-        if (part.text) |txt| {
-            duped[i].text = try arena_alloc.dupe(u8, txt);
+        if (part.text) |txt| duped[i].text = try a.dupe(u8, txt);
+        if (part.inlineData) |blob| {
+            if (blob.data) |d| duped[i].inlineData.?.data = try a.dupe(u8, d);
+            if (blob.mimeType) |m| duped[i].inlineData.?.mimeType = try a.dupe(u8, m);
+            if (blob.displayName) |d| duped[i].inlineData.?.displayName = try a.dupe(u8, d);
+        }
+        if (part.fileData) |fd| {
+            if (fd.fileUri) |u| duped[i].fileData.?.fileUri = try a.dupe(u8, u);
+            if (fd.mimeType) |m| duped[i].fileData.?.mimeType = try a.dupe(u8, m);
         }
     }
     return duped;
