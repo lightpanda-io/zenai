@@ -233,6 +233,13 @@ pub const ToolConfig = struct {
     functionCallingConfig: ?FunctionCallingConfig = null,
 };
 
+// --- Thinking Config ---
+
+pub const ThinkingConfig = struct {
+    includeThoughts: ?bool = null,
+    thinkingBudget: ?i32 = null,
+};
+
 // --- Generation Config ---
 
 pub const GenerationConfig = struct {
@@ -249,6 +256,7 @@ pub const GenerationConfig = struct {
     responseSchema: ?Schema = null,
     responseLogprobs: ?bool = null,
     logprobs: ?i32 = null,
+    thinkingConfig: ?ThinkingConfig = null,
 };
 
 // --- Request ---

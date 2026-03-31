@@ -32,12 +32,10 @@ pub fn main() !void {
 
     // --- Streaming ---
     std.debug.print("=== Streaming ===\n", .{});
-    // Note: gemini-2.5-flash uses extended thinking so tokens arrive after a pause.
-    // Use gemini-2.0-flash to see tokens stream incrementally.
     try client.generateContentStreamFromText(
-        "gemini-2.0-flash",
+        "gemini-2.5-flash",
         "Write a short poem about the moon.",
-        .{ .temperature = 0.7 },
+        .{ .temperature = 0.7, .thinkingConfig = .{ .thinkingBudget = 0 } },
         .{},
         &printStreamChunk,
     );
