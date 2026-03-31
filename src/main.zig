@@ -1,5 +1,5 @@
 const std = @import("std");
-const zenai = @import("zen");
+const zenai = @import("zenai");
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -18,6 +18,7 @@ pub fn main() !void {
         "gemini-2.5-flash",
         "What is your name?",
         .{ .temperature = 0 },
+        .{},
     );
     defer client.freeResponse(response);
 

@@ -1,5 +1,6 @@
 .{
     .name = .zenai,
+    .fingerprint = 0x73796d72543fe688,
     .version = "0.0.0",
     .minimum_zig_version = "0.15.2",
     .dependencies = .{},
