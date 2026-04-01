@@ -550,15 +550,14 @@ pub fn listFiles(self: *Client, options: ListOptions) !Response(types.ListFilesR
 pub fn downloadFile(self: *Client, uri: []const u8) ![]u8 {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const sep: []const u8 = if (std.mem.indexOf(u8, uri, "?") != null) "&" else "?";
-    const url = try std.fmt.allocPrint(self.allocator, "{s}{s}key={s}", .{ uri, sep, self.api_key });
-    defer self.allocator.free(url);
-
     var response_buf: std.Io.Writer.Allocating = .init(self.allocator);
     errdefer response_buf.deinit();
 
     const result = try self.http_client.fetch(.{
-        .location = .{ .url = url },
+        .location = .{ .url = uri },
+        .extra_headers = &.{
+            .{ .name = "x-goog-api-key", .value = self.api_key },
+        },
         .response_writer = &response_buf.writer,
     });
 
