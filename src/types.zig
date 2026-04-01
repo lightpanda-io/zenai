@@ -458,8 +458,8 @@ pub const GenerationConfig = struct {
     thinkingConfig: ?ThinkingConfig = null,
     /// Resource name of cached content to use as context.
     cachedContent: ?[]const u8 = null,
-    /// Requested response modalities (e.g. "TEXT", "IMAGE", "AUDIO").
-    responseModalities: ?[]const []const u8 = null,
+    /// Requested response modalities.
+    responseModalities: ?[]const Modality = null,
     /// Media resolution for input media.
     mediaResolution: ?MediaResolution = null,
     /// Whether to include audio timestamps in the response.
@@ -636,10 +636,28 @@ pub const Candidate = struct {
     groundingMetadata: ?GroundingMetadata = null,
 };
 
+/// Response modality type.
+pub const Modality = enum {
+    MODALITY_UNSPECIFIED,
+    TEXT,
+    IMAGE,
+    AUDIO,
+};
+
+/// Media modality type (superset of Modality, used in token count breakdowns).
+pub const MediaModality = enum {
+    MODALITY_UNSPECIFIED,
+    TEXT,
+    IMAGE,
+    VIDEO,
+    AUDIO,
+    DOCUMENT,
+};
+
 /// Token count broken down by modality.
 pub const ModalityTokenCount = struct {
-    /// The modality (e.g. "TEXT", "IMAGE", "AUDIO").
-    modality: ?[]const u8 = null,
+    /// The modality.
+    modality: ?MediaModality = null,
     /// The number of tokens for this modality.
     tokenCount: ?i32 = null,
 };
