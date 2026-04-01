@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types.zig");
+const http = @import("../http.zig");
 
 const Content = types.Content;
 const Part = types.Part;
@@ -68,18 +69,7 @@ pub const RequestOptions = struct {
 
 /// Owns the parsed response and its backing memory.
 /// Call `deinit()` when done to free all resources.
-pub fn Response(comptime T: type) type {
-    return struct {
-        value: T,
-        json_buf: std.Io.Writer.Allocating,
-        parsed: std.json.Parsed(T),
-
-        pub fn deinit(self: *@This()) void {
-            self.parsed.deinit();
-            self.json_buf.deinit();
-        }
-    };
-}
+pub const Response = http.Response;
 
 pub const ApiError = error{
     ApiError,
@@ -161,25 +151,7 @@ fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) Ap
 }
 
 /// Pagination options for list operations.
-pub const ListOptions = struct {
-    /// Maximum number of items to return per page.
-    pageSize: ?i32 = null,
-    /// Token from a previous response's `nextPageToken` to fetch the next page.
-    pageToken: ?[]const u8 = null,
-};
-
-fn appendListParams(allocator: std.mem.Allocator, base_url: []const u8, options: ListOptions) ![]u8 {
-    if (options.pageSize == null and options.pageToken == null) {
-        return allocator.dupe(u8, base_url);
-    }
-    if (options.pageSize != null and options.pageToken != null) {
-        return std.fmt.allocPrint(allocator, "{s}?pageSize={d}&pageToken={s}", .{ base_url, options.pageSize.?, options.pageToken.? });
-    }
-    if (options.pageSize) |ps| {
-        return std.fmt.allocPrint(allocator, "{s}?pageSize={d}", .{ base_url, ps });
-    }
-    return std.fmt.allocPrint(allocator, "{s}?pageToken={s}", .{ base_url, options.pageToken.? });
-}
+pub const ListOptions = http.ListOptions;
 
 // --- Generate Content ---
 
@@ -343,7 +315,7 @@ pub fn listModels(self: *Client, options: ListOptions) !Response(types.ListModel
     if (self.api_key.len == 0) return error.MissingApiKey;
     const base = try std.fmt.allocPrint(self.allocator, "{s}/{s}/models", .{ self.base_url, self.api_version });
     defer self.allocator.free(base);
-    const url = try appendListParams(self.allocator, base, options);
+    const url = try http.appendListParams(self.allocator, base, options);
     defer self.allocator.free(url);
     return self.fetchGet(url, types.ListModelsResponse);
 }
@@ -414,9 +386,9 @@ pub fn embedContent(
 pub fn embedText(
     self: *Client,
     model: []const u8,
-    text: []const u8,
+    text_content: []const u8,
 ) !Response(types.EmbedContentResponse) {
-    const parts = [_]Part{.{ .text = text }};
+    const parts = [_]Part{.{ .text = text_content }};
     const content = Content{ .parts = &parts };
     return self.embedContent(model, content, .{});
 }
@@ -563,7 +535,7 @@ pub fn listFiles(self: *Client, options: ListOptions) !Response(types.ListFilesR
     if (self.api_key.len == 0) return error.MissingApiKey;
     const base = try std.fmt.allocPrint(self.allocator, "{s}/{s}/files", .{ self.base_url, self.api_version });
     defer self.allocator.free(base);
-    const url = try appendListParams(self.allocator, base, options);
+    const url = try http.appendListParams(self.allocator, base, options);
     defer self.allocator.free(url);
     return self.fetchGet(url, types.ListFilesResponse);
 }
@@ -673,7 +645,7 @@ pub fn listCachedContents(self: *Client, options: ListOptions) !Response(types.L
     if (self.api_key.len == 0) return error.MissingApiKey;
     const base = try std.fmt.allocPrint(self.allocator, "{s}/{s}/cachedContents", .{ self.base_url, self.api_version });
     defer self.allocator.free(base);
-    const url = try appendListParams(self.allocator, base, options);
+    const url = try http.appendListParams(self.allocator, base, options);
     defer self.allocator.free(url);
     return self.fetchGet(url, types.ListCachedContentsResponse);
 }

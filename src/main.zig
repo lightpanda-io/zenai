@@ -11,7 +11,7 @@ pub fn main() !void {
             std.process.exit(1);
         };
 
-    var client = zenai.Client.init(allocator, api_key, .{});
+    var client = zenai.gemini.Client.init(allocator, api_key, .{});
     defer client.deinit();
 
     // --- Model info ---
@@ -109,7 +109,7 @@ pub fn main() !void {
     // --- Chat session ---
     std.debug.print("=== Chat session ===\n", .{});
     {
-        var chat = zenai.Chat.init(&client, "gemini-2.5-flash", .{
+        var chat = zenai.gemini.Chat.init(&client, "gemini-2.5-flash", .{
             .temperature = 0,
             .thinkingConfig = .{ .thinkingBudget = 0 },
         }, .{});
@@ -135,18 +135,18 @@ pub fn main() !void {
     try functionCallingExample(&client);
 }
 
-fn printStreamChunk(_: void, response: zenai.types.GenerateContentResponse) void {
+fn printStreamChunk(_: void, response: zenai.gemini.types.GenerateContentResponse) void {
     if (response.text()) |t| {
         const fd = std.posix.STDOUT_FILENO;
         _ = std.posix.write(fd, t) catch return;
     }
 }
 
-fn functionCallingExample(client: *zenai.Client) !void {
+fn functionCallingExample(client: *zenai.gemini.Client) !void {
     const model = "gemini-2.5-flash";
 
     // Define the tool
-    const tools = [_]zenai.types.Tool{.{
+    const tools = [_]zenai.gemini.types.Tool{.{
         .functionDeclarations = &.{.{
             .name = "get_weather",
             .description = "Get the current weather for a given city.",
@@ -160,15 +160,15 @@ fn functionCallingExample(client: *zenai.Client) !void {
         }},
     }};
 
-    const request_options = zenai.Client.RequestOptions{
+    const request_options = zenai.gemini.Client.RequestOptions{
         .tools = &tools,
     };
 
     // Step 1: Send the user prompt
     std.debug.print("User: What's the weather like in Paris?\n", .{});
 
-    const user_parts = [_]zenai.types.Part{.{ .text = "What's the weather like in Paris?" }};
-    const user_content = [_]zenai.types.Content{.{ .role = "user", .parts = &user_parts }};
+    const user_parts = [_]zenai.gemini.types.Part{.{ .text = "What's the weather like in Paris?" }};
+    const user_content = [_]zenai.gemini.types.Content{.{ .role = "user", .parts = &user_parts }};
 
     var response1 = try client.generateContent(
         model,
@@ -202,14 +202,14 @@ fn functionCallingExample(client: *zenai.Client) !void {
     );
     defer fr_response.deinit();
 
-    const fn_response_parts = [_]zenai.types.Part{.{
+    const fn_response_parts = [_]zenai.gemini.types.Part{.{
         .functionResponse = .{
             .name = fc.name,
             .response = fr_response.value,
         },
     }};
 
-    const history = [_]zenai.types.Content{
+    const history = [_]zenai.gemini.types.Content{
         .{ .role = "user", .parts = &user_parts },
         .{ .role = "model", .parts = model_parts },
         .{ .role = "user", .parts = &fn_response_parts },

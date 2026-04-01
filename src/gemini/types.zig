@@ -956,8 +956,8 @@ pub const ListCachedContentsResponse = struct {
 // --- Tests ---
 
 test "GenerateContentRequest serializes to JSON" {
-    const parts = [_]Part{.{ .text = "hello" }};
-    const contents = [_]Content{.{ .role = "user", .parts = &parts }};
+    const parts_arr = [_]Part{.{ .text = "hello" }};
+    const contents = [_]Content{.{ .role = "user", .parts = &parts_arr }};
     const req = GenerateContentRequest{
         .contents = &contents,
         .generationConfig = .{ .temperature = 0.5 },
@@ -971,8 +971,8 @@ test "GenerateContentRequest serializes to JSON" {
 }
 
 test "GenerateContentRequest with systemInstruction serializes correctly" {
-    const parts = [_]Part{.{ .text = "hello" }};
-    const contents = [_]Content{.{ .role = "user", .parts = &parts }};
+    const parts_arr = [_]Part{.{ .text = "hello" }};
+    const contents = [_]Content{.{ .role = "user", .parts = &parts_arr }};
     const sys_parts = [_]Part{.{ .text = "You are helpful." }};
     const req = GenerateContentRequest{
         .contents = &contents,
