@@ -1,8 +1,10 @@
 const std = @import("std");
 const gemini_mod = @import("gemini/Client.zig");
 const openai_mod = @import("openai/Client.zig");
+const anthropic_mod = @import("anthropic/Client.zig");
 const gemini_types = @import("gemini/types.zig");
 const openai_types = @import("openai/types.zig");
+const anthropic_types = @import("anthropic/types.zig");
 const http = @import("http.zig");
 
 /// A message role, normalized across providers.
@@ -57,13 +59,16 @@ pub const GenerateResult = struct {
     /// Provider response backing memory.
     _gemini_response: ?GeminiResponse = null,
     _openai_response: ?OpenAIResponse = null,
+    _anthropic_response: ?AnthropicResponse = null,
 
     const GeminiResponse = http.Response(gemini_types.GenerateContentResponse);
     const OpenAIResponse = http.Response(openai_types.ChatCompletionResponse);
+    const AnthropicResponse = http.Response(anthropic_types.MessageResponse);
 
     pub fn deinit(self: *GenerateResult) void {
         if (self._gemini_response) |*r| r.deinit();
         if (self._openai_response) |*r| r.deinit();
+        if (self._anthropic_response) |*r| r.deinit();
     }
 };
 
@@ -85,9 +90,10 @@ pub const EmbedResult = struct {
 pub const Client = union(enum) {
     gemini: *gemini_mod,
     openai: *openai_mod,
+    anthropic: *anthropic_mod,
 
-    pub const Error = gemini_mod.ApiError || openai_mod.ApiError;
-    pub const StreamError = gemini_mod.StreamError || openai_mod.StreamError;
+    pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError;
+    pub const StreamError = gemini_mod.StreamError || openai_mod.StreamError || anthropic_mod.StreamError;
 
     /// Generate content from a list of messages.
     pub fn generateContent(
@@ -141,6 +147,24 @@ pub const Client = union(enum) {
                     .usage = mapOpenAIUsage(response.value),
                     .allocator = o.allocator,
                     ._openai_response = response,
+                };
+            },
+            .anthropic => |a| {
+                const ant_messages = try messagesToAnthropicMessages(a.allocator, messages);
+                defer a.allocator.free(ant_messages);
+
+                const response = try a.createMessage(model, ant_messages, config.max_tokens orelse 4096, .{
+                    .temperature = config.temperature,
+                    .top_p = config.top_p,
+                    .stop_sequences = config.stop,
+                });
+
+                return GenerateResult{
+                    .text = response.value.text(),
+                    .finish_reason = mapAnthropicFinishReason(response.value),
+                    .usage = mapAnthropicUsage(response.value),
+                    .allocator = a.allocator,
+                    ._anthropic_response = response,
                 };
             },
         }
@@ -208,6 +232,29 @@ pub const Client = union(enum) {
                     .seed = config.seed,
                 }, .{ .user_ctx = context, .user_cb = callback, .alloc = o.allocator }, &Wrapper.wrap);
             },
+            .anthropic => |a| {
+                const ant_messages = messagesToAnthropicMessages(a.allocator, messages) catch return error.OutOfMemory;
+                defer a.allocator.free(ant_messages);
+
+                const Wrapper = struct {
+                    fn wrap(ctx: struct { user_ctx: @TypeOf(context), user_cb: *const fn (@TypeOf(context), GenerateResult) void, alloc: std.mem.Allocator }, event: anthropic_types.StreamEvent) void {
+                        // Extract text from content_block_delta events
+                        const text_content = if (event.delta) |delta| delta.text else null;
+                        var result = GenerateResult{
+                            .text = text_content,
+                            .allocator = ctx.alloc,
+                        };
+                        ctx.user_cb(ctx.user_ctx, result);
+                        _ = &result;
+                    }
+                };
+
+                try a.createMessageStream(model, ant_messages, config.max_tokens orelse 4096, .{
+                    .temperature = config.temperature,
+                    .top_p = config.top_p,
+                    .stop_sequences = config.stop,
+                }, .{ .user_ctx = context, .user_cb = callback, .alloc = a.allocator }, &Wrapper.wrap);
+            },
         }
     }
 
@@ -237,6 +284,10 @@ pub const Client = union(enum) {
                     ._openai_response = response,
                 };
             },
+            .anthropic => {
+                // Anthropic does not offer an embeddings API.
+                return error.ApiError;
+            },
         }
     }
 
@@ -252,6 +303,14 @@ pub const Client = union(enum) {
     pub fn asOpenAI(self: Client) ?*openai_mod {
         return switch (self) {
             .openai => |o| o,
+            else => null,
+        };
+    }
+
+    /// Drop down to the Anthropic-specific client.
+    pub fn asAnthropic(self: Client) ?*anthropic_mod {
+        return switch (self) {
+            .anthropic => |a| a,
             else => null,
         };
     }
@@ -331,6 +390,44 @@ fn mapOpenAIUsage(response: openai_types.ChatCompletionResponse) Usage {
         .prompt_tokens = usage.prompt_tokens,
         .completion_tokens = usage.completion_tokens,
         .total_tokens = usage.total_tokens,
+    };
+}
+
+fn messagesToAnthropicMessages(allocator: std.mem.Allocator, messages: []const Message) ![]anthropic_types.MessageParam {
+    const ant_messages = try allocator.alloc(anthropic_types.MessageParam, messages.len);
+    for (messages, 0..) |msg, i| {
+        const role: anthropic_types.Role = switch (msg.role) {
+            .system, .user, .tool => .user,
+            .assistant => .assistant,
+        };
+        const content: []const anthropic_types.ContentBlockParam = if (msg.content) |c|
+            @as([]const anthropic_types.ContentBlockParam, &.{.{ .text = c }})
+        else
+            &.{};
+        ant_messages[i] = .{ .role = role, .content = content };
+    }
+    return ant_messages;
+}
+
+fn mapAnthropicFinishReason(response: anthropic_types.MessageResponse) FinishReason {
+    const reason = response.stop_reason orelse return .unknown;
+    return switch (reason) {
+        .end_turn, .stop_sequence => .stop,
+        .max_tokens, .pause_turn => .max_tokens,
+        .tool_use => .tool_call,
+        .refusal => .safety,
+    };
+}
+
+fn mapAnthropicUsage(response: anthropic_types.MessageResponse) Usage {
+    const usage = response.usage orelse return .{};
+    return .{
+        .prompt_tokens = usage.input_tokens,
+        .completion_tokens = usage.output_tokens,
+        .total_tokens = if (usage.input_tokens != null and usage.output_tokens != null)
+            usage.input_tokens.? + usage.output_tokens.?
+        else
+            null,
     };
 }
 

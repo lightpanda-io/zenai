@@ -10,6 +10,12 @@ pub const openai = struct {
     pub const types = @import("openai/types.zig");
 };
 
+pub const anthropic = struct {
+    pub const Client = @import("anthropic/Client.zig");
+    pub const Chat = @import("anthropic/Chat.zig");
+    pub const types = @import("anthropic/types.zig");
+};
+
 pub const provider = @import("provider.zig");
 
 test {
@@ -19,5 +25,8 @@ test {
     _ = openai.Client;
     _ = openai.Chat;
     _ = openai.types;
+    _ = anthropic.Client;
+    _ = anthropic.Chat;
+    _ = anthropic.types;
     _ = provider;
 }

@@ -1,6 +1,6 @@
 # zenai
 
-Zig client for AI APIs, supporting [Google Gemini](https://ai.google.dev/gemini-api/docs) and [OpenAI](https://platform.openai.com/docs/api-reference). Ported from the official [Go Gen AI SDK](https://github.com/googleapis/go-genai) and [openai-go](https://github.com/openai/openai-go).
+Zig client for AI APIs, supporting [Google Gemini](https://ai.google.dev/gemini-api/docs), [OpenAI](https://platform.openai.com/docs/api-reference), and [Anthropic](https://docs.anthropic.com/en/docs/about-claude/models). Ported from the official [Go Gen AI SDK](https://github.com/googleapis/go-genai), [openai-go](https://github.com/openai/openai-go), and [anthropic-sdk-go](https://github.com/anthropics/anthropic-sdk-go).
 
 ## Installation
 
@@ -173,6 +173,81 @@ if (response.value.firstToolCall()) |tc| {
 }
 ```
 
+## Anthropic
+
+Set your API key ([get one here](https://console.anthropic.com/settings/keys)):
+
+```bash
+export ANTHROPIC_API_KEY='your-api-key'
+```
+
+```zig
+const zenai = @import("zenai");
+
+const api_key = std.posix.getenv("ANTHROPIC_API_KEY") orelse return error.MissingApiKey;
+var client = zenai.anthropic.Client.init(allocator, api_key, .{});
+defer client.deinit();
+
+var response = try client.createMessageFromText("claude-sonnet-4-6", "What is Zig?", 1024, .{});
+defer response.deinit();
+
+std.debug.print("{s}\n", .{response.value.text() orelse ""});
+```
+
+### Streaming
+
+```zig
+try client.createMessageStreamFromText(
+    "claude-sonnet-4-6",
+    "Write a poem about the moon.",
+    1024,
+    .{},
+    {},
+    &struct {
+        fn cb(_: void, event: zenai.anthropic.types.StreamEvent) void {
+            if (event.delta) |delta| {
+                if (delta.text) |t| {
+                    const fd = std.posix.STDOUT_FILENO;
+                    _ = std.posix.write(fd, t) catch return;
+                }
+            }
+        }
+    }.cb,
+);
+```
+
+### Chat
+
+```zig
+var chat = zenai.anthropic.Chat.init(&client, "claude-sonnet-4-6", 1024, .{});
+defer chat.deinit();
+
+const r1 = try chat.sendMessage("My name is Alice.");
+std.debug.print("{s}\n", .{r1.text() orelse ""});
+
+const r2 = try chat.sendMessage("What is my name?");
+std.debug.print("{s}\n", .{r2.text() orelse ""});
+```
+
+### Function calling
+
+```zig
+const tools = [_]zenai.anthropic.types.Tool{.{
+    .name = "get_weather",
+    .description = "Get the current weather for a city.",
+    .input_schema = // JSON Schema as std.json.Value
+}};
+
+var response = try client.createMessage("claude-sonnet-4-6", &.{
+    .{ .role = .user, .content = &.{.{ .text = "What's the weather in Paris?" }} },
+}, 1024, .{ .tools = &tools });
+defer response.deinit();
+
+if (response.value.firstToolUse()) |tu| {
+    std.debug.print("Call: {s}\n", .{tu.name orelse ""});
+}
+```
+
 ## Provider Abstraction
 
 Use `zenai.provider.Client` to write provider-agnostic code. Swap providers by changing one line:
@@ -188,6 +263,10 @@ const ai: zenai.provider.Client = .{ .gemini = &gemini_client };
 // Or:
 // var openai_client = zenai.openai.Client.init(allocator, openai_key, .{});
 // const ai: zenai.provider.Client = .{ .openai = &openai_client };
+
+// Or:
+// var anthropic_client = zenai.anthropic.Client.init(allocator, anthropic_key, .{});
+// const ai: zenai.provider.Client = .{ .anthropic = &anthropic_client };
 
 var result = try ai.generateContent("gemini-2.5-flash", &.{
     .{ .role = .user, .content = "What is Zig?" },
@@ -225,6 +304,12 @@ if (ai.asGemini()) |g| {
 - Function calling and tool use
 - Embeddings
 - Model listing and info
+
+**Anthropic:**
+- Message creation and streaming (SSE)
+- Multi-turn chat with history management
+- Function calling and tool use
+- Extended thinking support
 
 **Provider abstraction:**
 - Unified text generation, streaming, and embeddings
