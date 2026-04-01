@@ -195,7 +195,6 @@ fn dupeParts(self: *Chat, parts: []const Part) std.mem.Allocator.Error![]Part {
         if (part.inlineData) |blob| {
             if (blob.data) |d| duped[i].inlineData.?.data = try a.dupe(u8, d);
             if (blob.mimeType) |m| duped[i].inlineData.?.mimeType = try a.dupe(u8, m);
-            if (blob.displayName) |d| duped[i].inlineData.?.displayName = try a.dupe(u8, d);
         }
         if (part.fileData) |fd| {
             if (fd.fileUri) |u| duped[i].fileData.?.fileUri = try a.dupe(u8, u);

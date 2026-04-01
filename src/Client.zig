@@ -355,6 +355,7 @@ pub fn countTokens(
     self: *Client,
     model: []const u8,
     contents: []const Content,
+    config: ?GenerationConfig,
     options: RequestOptions,
 ) !Response(types.CountTokensResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
@@ -364,6 +365,7 @@ pub fn countTokens(
         .contents = contents,
         .systemInstruction = options.systemInstruction,
         .tools = options.tools,
+        .generationConfig = config,
     }, types.CountTokensResponse);
 }
 
@@ -375,7 +377,7 @@ pub fn countTokensFromText(
 ) !Response(types.CountTokensResponse) {
     const parts = [_]Part{.{ .text = prompt }};
     const contents = [_]Content{.{ .role = "user", .parts = &parts }};
-    return self.countTokens(model, &contents, .{});
+    return self.countTokens(model, &contents, null, .{});
 }
 
 // --- Embeddings ---

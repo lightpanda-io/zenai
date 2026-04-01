@@ -173,8 +173,6 @@ pub const Blob = struct {
     data: ?[]const u8 = null,
     /// The IANA standard MIME type of the source data.
     mimeType: ?[]const u8 = null,
-    /// Optional display name or filename for the blob.
-    displayName: ?[]const u8 = null,
 };
 
 /// URI-based data pointing to a file in Google Cloud Storage.
