@@ -2,6 +2,14 @@ const std = @import("std");
 
 // --- Enums ---
 
+/// The service tier for the request.
+pub const ServiceTier = enum {
+    unspecified,
+    flex,
+    standard,
+    priority,
+};
+
 /// The harm category that a piece of content may be classified under.
 pub const HarmCategory = enum {
     /// Default value. This value is unused.
@@ -430,6 +438,8 @@ pub const GenerateContentRequest = struct {
     tools: ?[]const Tool = null,
     /// Configuration for tool usage.
     toolConfig: ?ToolConfig = null,
+    /// The service tier to use for the request.
+    serviceTier: ?ServiceTier = null,
 };
 
 // --- Response Types ---
