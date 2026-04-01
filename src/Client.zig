@@ -269,7 +269,7 @@ pub fn generateContentStream(
         .headers = .{
             .content_type = .{ .override = "application/json" },
         },
-        .redirect_behavior = .unhandled,
+        .redirect_behavior = .init(5),
     });
     defer req.deinit();
 
@@ -471,7 +471,7 @@ pub fn uploadFile(
         .headers = .{
             .content_type = .{ .override = "application/json" },
         },
-        .redirect_behavior = .unhandled,
+        .redirect_behavior = .init(5),
     });
     defer req.deinit();
 
@@ -517,7 +517,7 @@ pub fn uploadFile(
         .headers = .{
             .content_type = .{ .override = mime_type },
         },
-        .redirect_behavior = .unhandled,
+        .redirect_behavior = .init(5),
     });
     defer upload_req.deinit();
 
