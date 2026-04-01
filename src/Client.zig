@@ -55,6 +55,10 @@ pub const RequestOptions = struct {
     tools: ?[]const Tool = null,
     /// Configuration for tool usage behavior.
     toolConfig: ?ToolConfig = null,
+    /// Settings for prompt and response sanitization.
+    modelArmorConfig: ?types.ModelArmorConfig = null,
+    /// The service tier to use for the request.
+    serviceTier: ?types.ServiceTier = null,
 };
 
 /// Owns the parsed response and its backing memory.
@@ -181,6 +185,8 @@ pub fn generateContent(
         .safetySettings = options.safetySettings,
         .tools = options.tools,
         .toolConfig = options.toolConfig,
+        .modelArmorConfig = options.modelArmorConfig,
+        .serviceTier = options.serviceTier,
     }, GenerateContentResponse);
 }
 
@@ -229,6 +235,8 @@ pub fn generateContentStream(
         .safetySettings = options.safetySettings,
         .tools = options.tools,
         .toolConfig = options.toolConfig,
+        .modelArmorConfig = options.modelArmorConfig,
+        .serviceTier = options.serviceTier,
     };
     var payload_buf: std.Io.Writer.Allocating = .init(self.allocator);
     defer payload_buf.deinit();

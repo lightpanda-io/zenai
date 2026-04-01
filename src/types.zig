@@ -60,6 +60,36 @@ pub const HarmSeverity = enum {
     HARM_SEVERITY_HIGH,
 };
 
+/// The stage of the underlying model.
+pub const ModelStage = enum {
+    MODEL_STAGE_UNSPECIFIED,
+    UNSTABLE_EXPERIMENTAL,
+    EXPERIMENTAL,
+    PREVIEW,
+    STABLE,
+    LEGACY,
+    DEPRECATED,
+    RETIRED,
+};
+
+/// Current status of the model.
+pub const ModelStatus = struct {
+    /// A message explaining the model status.
+    message: ?[]const u8 = null,
+    /// The stage of the underlying model.
+    modelStage: ?ModelStage = null,
+    /// The time at which the model will be retired.
+    retirementTime: ?[]const u8 = null,
+};
+
+/// The media resolution to use.
+pub const MediaResolution = enum {
+    MEDIA_RESOLUTION_UNSPECIFIED,
+    LOW,
+    MEDIUM,
+    HIGH,
+};
+
 /// The reason why the model stopped generating tokens.
 pub const FinishReason = enum {
     /// The finish reason is unspecified.
@@ -210,6 +240,12 @@ pub const Part = struct {
     codeExecutionResult: ?CodeExecutionResult = null,
     /// If true, marks this part as model reasoning/thinking (not final output).
     thought: ?bool = null,
+    /// An opaque signature for the thought so it can be reused in subsequent requests.
+    thoughtSignature: ?[]const u8 = null,
+    /// Media resolution for the input media.
+    mediaResolution: ?MediaResolution = null,
+    /// Custom metadata associated with the Part.
+    partMetadata: ?std.json.Value = null,
 };
 
 /// Contains the multi-part content of a message.
@@ -368,6 +404,14 @@ pub const ToolConfig = struct {
     functionCallingConfig: ?FunctionCallingConfig = null,
 };
 
+/// Configuration for prompt and response sanitization using the Model Armor service.
+pub const ModelArmorConfig = struct {
+    /// The resource name of the Model Armor template to use for prompt screening.
+    promptTemplateName: ?[]const u8 = null,
+    /// The resource name of the Model Armor template to use for response screening.
+    responseTemplateName: ?[]const u8 = null,
+};
+
 // --- Thinking Config ---
 
 /// Configuration for the model's thinking/reasoning features.
@@ -416,10 +460,14 @@ pub const GenerationConfig = struct {
     cachedContent: ?[]const u8 = null,
     /// Requested response modalities (e.g. "TEXT", "IMAGE", "AUDIO").
     responseModalities: ?[]const []const u8 = null,
-    /// Media resolution for input media (LOW, MEDIUM, HIGH).
-    mediaResolution: ?[]const u8 = null,
+    /// Media resolution for input media.
+    mediaResolution: ?MediaResolution = null,
     /// Whether to include audio timestamps in the response.
     audioTimestamp: ?bool = null,
+    /// Labels with user-defined metadata to break down billed charges.
+    labels: ?std.json.Value = null,
+    /// Output schema of the generated response (alternative to responseSchema).
+    responseJsonSchema: ?std.json.Value = null,
 };
 
 // --- Request ---
@@ -438,6 +486,8 @@ pub const GenerateContentRequest = struct {
     tools: ?[]const Tool = null,
     /// Configuration for tool usage.
     toolConfig: ?ToolConfig = null,
+    /// Settings for prompt and response sanitization using the Model Armor service.
+    modelArmorConfig: ?ModelArmorConfig = null,
     /// The service tier to use for the request.
     serviceTier: ?ServiceTier = null,
 };
@@ -517,7 +567,7 @@ pub const GenerateContentResponse = struct {
     /// Timestamp when the request was made.
     createTime: ?[]const u8 = null,
     /// Current status of the model.
-    modelStatus: ?[]const u8 = null,
+    modelStatus: ?ModelStatus = null,
     /// Content filter results for the prompt (only when candidates were blocked).
     promptFeedback: ?PromptFeedback = null,
 
