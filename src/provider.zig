@@ -545,6 +545,153 @@ pub const Client = union(enum) {
             else => null,
         };
     }
+
+    // --- Agentic tool-use loop ---
+
+    /// Callback interface for executing tool calls.
+    pub const ToolHandler = struct {
+        context: *anyopaque,
+        callFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, tool_name: []const u8, arguments: []const u8) []const u8,
+
+        pub fn call(self: ToolHandler, allocator: std.mem.Allocator, name: []const u8, args: []const u8) []const u8 {
+            return self.callFn(self.context, allocator, name, args);
+        }
+    };
+
+    /// Configuration for the agentic tool-use loop.
+    pub const RunToolsConfig = struct {
+        tools: []const Tool,
+        max_turns: u32 = 20,
+        max_tokens: ?i32 = 4096,
+        tool_choice: ?ToolChoice = .auto,
+        temperature: ?f32 = null,
+    };
+
+    /// Information about a tool call that was executed during the loop.
+    pub const ToolCallInfo = struct {
+        name: []const u8,
+        arguments: []const u8,
+        result: []const u8,
+    };
+
+    /// Result of the agentic tool-use loop.
+    pub const RunToolsResult = struct {
+        text: ?[]const u8 = null,
+        tool_calls_made: []const ToolCallInfo = &.{},
+        arena: std.heap.ArenaAllocator,
+
+        pub fn deinit(self: *RunToolsResult) void {
+            self.arena.deinit();
+        }
+    };
+
+    /// Run an agentic tool-use loop: send messages to the LLM, execute any
+    /// tool calls via the handler, send results back, repeat until the LLM
+    /// responds with text (or max_turns is reached).
+    ///
+    /// The caller owns `messages` — on return it will contain all assistant
+    /// and tool messages appended during the loop. Message data is duped into
+    /// `msg_alloc` so it outlives individual LLM responses.
+    pub fn runTools(
+        self: Client,
+        model: []const u8,
+        messages: *std.ArrayListUnmanaged(Message),
+        msg_alloc: std.mem.Allocator,
+        handler: ToolHandler,
+        config: RunToolsConfig,
+    ) Error!RunToolsResult {
+        var result_arena = std.heap.ArenaAllocator.init(msg_alloc);
+        errdefer result_arena.deinit();
+        const ra = result_arena.allocator();
+
+        var all_tool_calls: std.ArrayListUnmanaged(ToolCallInfo) = .empty;
+
+        var turns: u32 = config.max_turns;
+        while (turns > 0) : (turns -= 1) {
+            var gen_result = try self.generateContent(model, messages.items, .{
+                .tools = config.tools,
+                .max_tokens = config.max_tokens,
+                .tool_choice = config.tool_choice,
+                .temperature = config.temperature,
+            });
+            defer gen_result.deinit();
+
+            // Handle tool calls
+            if (gen_result.tool_calls) |tool_calls| {
+                // Append assistant message with tool calls
+                const duped_calls = try dupeToolCallSlice(msg_alloc, tool_calls);
+                try messages.append(msg_alloc, .{
+                    .role = .assistant,
+                    .content = if (gen_result.text) |t| try msg_alloc.dupe(u8, t) else null,
+                    .tool_calls = duped_calls,
+                });
+
+                // Execute each tool call
+                var tool_results: std.ArrayListUnmanaged(ToolResult) = .empty;
+                for (tool_calls) |tc| {
+                    var tool_arena = std.heap.ArenaAllocator.init(msg_alloc);
+                    defer tool_arena.deinit();
+
+                    const tool_result = handler.call(tool_arena.allocator(), tc.name, tc.arguments);
+
+                    try tool_results.append(msg_alloc, .{
+                        .id = try msg_alloc.dupe(u8, tc.id),
+                        .name = try msg_alloc.dupe(u8, tc.name),
+                        .content = try msg_alloc.dupe(u8, tool_result),
+                    });
+
+                    try all_tool_calls.append(ra, .{
+                        .name = try ra.dupe(u8, tc.name),
+                        .arguments = try ra.dupe(u8, tc.arguments),
+                        .result = try ra.dupe(u8, tool_result),
+                    });
+                }
+
+                // Append tool results message
+                try messages.append(msg_alloc, .{
+                    .role = .tool,
+                    .tool_results = try tool_results.toOwnedSlice(msg_alloc),
+                });
+
+                continue;
+            }
+
+            // Text response — we're done
+            const text = if (gen_result.text) |t| try msg_alloc.dupe(u8, t) else null;
+
+            if (text != null) {
+                try messages.append(msg_alloc, .{
+                    .role = .assistant,
+                    .content = text,
+                });
+            }
+
+            return .{
+                .text = text,
+                .tool_calls_made = all_tool_calls.toOwnedSlice(ra) catch &.{},
+                .arena = result_arena,
+            };
+        }
+
+        // Max turns exhausted
+        return .{
+            .text = null,
+            .tool_calls_made = all_tool_calls.toOwnedSlice(ra) catch &.{},
+            .arena = result_arena,
+        };
+    }
+
+    fn dupeToolCallSlice(alloc: std.mem.Allocator, calls: []const ToolCall) ![]const ToolCall {
+        const duped = try alloc.alloc(ToolCall, calls.len);
+        for (calls, 0..) |tc, i| {
+            duped[i] = .{
+                .id = try alloc.dupe(u8, tc.id),
+                .name = try alloc.dupe(u8, tc.name),
+                .arguments = try alloc.dupe(u8, tc.arguments),
+            };
+        }
+        return duped;
+    }
 };
 
 // --- Conversion helpers ---
