@@ -600,7 +600,7 @@ pub const Client = union(enum) {
         handler: ToolHandler,
         config: RunToolsConfig,
     ) Error!RunToolsResult {
-        var result_arena = std.heap.ArenaAllocator.init(msg_alloc);
+        var result_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         errdefer result_arena.deinit();
         const ra = result_arena.allocator();
 
@@ -629,7 +629,7 @@ pub const Client = union(enum) {
                 // Execute each tool call
                 var tool_results: std.ArrayListUnmanaged(ToolResult) = .empty;
                 for (tool_calls) |tc| {
-                    var tool_arena = std.heap.ArenaAllocator.init(msg_alloc);
+                    var tool_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                     defer tool_arena.deinit();
 
                     const tool_result = handler.call(tool_arena.allocator(), tc.name, tc.arguments);
