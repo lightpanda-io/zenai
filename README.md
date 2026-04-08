@@ -279,9 +279,12 @@ std.debug.print("{s}\n", .{result.text orelse ""});
 Drop down to provider-specific APIs when needed:
 
 ```zig
-if (ai.asGemini()) |g| {
-    // Use Gemini-specific features like cached content, file uploads, etc.
-    var cached = try g.createCachedContent("gemini-2.5-flash", .{ ... });
+switch (ai) {
+    .gemini => |g| {
+        // Use Gemini-specific features like cached content, file uploads, etc.
+        var cached = try g.createCachedContent("gemini-2.5-flash", .{ ... });
+    },
+    else => {},
 }
 ```
 

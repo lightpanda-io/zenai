@@ -149,7 +149,7 @@ pub const EmbedResult = struct {
 
 /// Unified AI client. Comptime-dispatched tagged union — no vtable, no runtime overhead.
 /// Use this when you want to swap providers with minimal code changes.
-/// For provider-specific features, use `asGemini()` / `asOpenAI()` to drop down.
+/// For provider-specific features, switch on the union tag directly.
 pub const Client = union(enum) {
     gemini: *gemini_mod,
     openai: *openai_mod,
@@ -523,30 +523,6 @@ pub const Client = union(enum) {
                 return error.ApiError;
             },
         }
-    }
-
-    /// Drop down to the Gemini-specific client.
-    pub fn asGemini(self: Client) ?*gemini_mod {
-        return switch (self) {
-            .gemini => |g| g,
-            else => null,
-        };
-    }
-
-    /// Drop down to the OpenAI-specific client.
-    pub fn asOpenAI(self: Client) ?*openai_mod {
-        return switch (self) {
-            .openai, .ollama => |o| o,
-            else => null,
-        };
-    }
-
-    /// Drop down to the Anthropic-specific client.
-    pub fn asAnthropic(self: Client) ?*anthropic_mod {
-        return switch (self) {
-            .anthropic => |a| a,
-            else => null,
-        };
     }
 
     // --- Agentic tool-use loop ---
@@ -1148,13 +1124,4 @@ test "GenerateResult deinit with no backing response" {
     result.text = "test";
     result.finish_reason = .stop;
     result.deinit(); // Should not crash
-}
-
-test "Client tagged union escape hatches" {
-    var gemini_client = gemini_mod.init(std.testing.allocator, "test-key", .{});
-    defer gemini_client.deinit();
-
-    const ai: Client = .{ .gemini = &gemini_client };
-    try std.testing.expect(ai.asGemini() != null);
-    try std.testing.expect(ai.asOpenAI() == null);
 }
