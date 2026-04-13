@@ -1,4 +1,5 @@
 const std = @import("std");
+const http = @import("http.zig");
 const gemini_mod = @import("gemini/Client.zig");
 const openai_mod = @import("openai/Client.zig");
 const anthropic_mod = @import("anthropic/Client.zig");
@@ -211,14 +212,10 @@ pub const Client = union(enum) {
                             var tool_calls: std.ArrayList(ToolCall) = .empty;
                             for (content.parts) |p| {
                                 if (p.functionCall) |fc| {
-                                    var args_str: []const u8 = "";
-                                    if (fc.args) |args_val| {
-                                        args_str = blk: {
-                                            var aw: std.Io.Writer.Allocating = .init(result.arena.allocator());
-                                            try std.json.Stringify.value(args_val, .{}, &aw.writer);
-                                            break :blk aw.written();
-                                        };
-                                    }
+                                    const args_str: []const u8 = if (fc.args) |args_val|
+                                        try http.jsonValueToString(result.arena.allocator(), args_val)
+                                    else
+                                        "";
                                     try tool_calls.append(result.arena.allocator(), .{
                                         .id = if (fc.id) |id| try result.arena.allocator().dupe(u8, id) else "",
                                         .name = if (fc.name) |n| try result.arena.allocator().dupe(u8, n) else "",
@@ -282,10 +279,10 @@ pub const Client = union(enum) {
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
 
-                const separated = try separateSystemMessages(req_alloc, messages);
+                const system_text = try extractSystemText(req_alloc, messages);
                 const ant_messages = try messagesToAnthropicMessages(req_alloc, messages);
 
-                const system_blocks: ?[]const anthropic_types.TextBlock = if (separated.system_text) |sys|
+                const system_blocks: ?[]const anthropic_types.TextBlock = if (system_text) |sys|
                     @as([]const anthropic_types.TextBlock, &.{.{ .text = sys }})
                 else
                     null;
@@ -312,18 +309,14 @@ pub const Client = union(enum) {
                 result.usage = mapAnthropicUsage(response.value);
 
                 if (response.value.content) |blocks| {
-                    var tool_calls = std.ArrayList(ToolCall){};
+                    var tool_calls: std.ArrayList(ToolCall) = .empty;
                     for (blocks) |block| {
                         if (block.type) |t| {
                             if (std.mem.eql(u8, t, "tool_use")) {
-                                var args_str: []const u8 = "";
-                                if (block.input) |input_val| {
-                                    args_str = blk: {
-                                        var aw: std.Io.Writer.Allocating = .init(result.arena.allocator());
-                                        try std.json.Stringify.value(input_val, .{}, &aw.writer);
-                                        break :blk aw.written();
-                                    };
-                                }
+                                const args_str: []const u8 = if (block.input) |input_val|
+                                    try http.jsonValueToString(result.arena.allocator(), input_val)
+                                else
+                                    "";
                                 try tool_calls.append(result.arena.allocator(), .{
                                     .id = if (block.id) |id| try result.arena.allocator().dupe(u8, id) else "",
                                     .name = if (block.name) |n| try result.arena.allocator().dupe(u8, n) else "",
@@ -408,10 +401,10 @@ pub const Client = union(enum) {
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
 
-                const separated = separateSystemMessages(req_alloc, messages) catch return error.OutOfMemory;
+                const system_text = extractSystemText(req_alloc, messages) catch return error.OutOfMemory;
                 const ant_messages = messagesToAnthropicMessages(req_alloc, messages) catch return error.OutOfMemory;
 
-                const system_blocks: ?[]const anthropic_types.TextBlock = if (separated.system_text) |sys|
+                const system_blocks: ?[]const anthropic_types.TextBlock = if (system_text) |sys|
                     @as([]const anthropic_types.TextBlock, &.{.{ .text = sys }})
                 else
                     null;
@@ -429,16 +422,7 @@ pub const Client = union(enum) {
                                 result.finish_reason = mapAnthropicStopReason(reason);
                             }
                         }
-                        if (event.usage) |usage| {
-                            result.usage = .{
-                                .prompt_tokens = usage.input_tokens,
-                                .completion_tokens = usage.output_tokens,
-                                .total_tokens = if (usage.input_tokens != null and usage.output_tokens != null)
-                                    usage.input_tokens.? + usage.output_tokens.?
-                                else
-                                    null,
-                            };
-                        }
+                        result.usage = convertAnthropicUsage(event.usage);
                         ctx.user_cb(ctx.user_ctx, result);
                     }
                 };
@@ -641,31 +625,32 @@ pub const Client = union(enum) {
 
 // --- Conversion helpers ---
 
+/// Extract and concatenate all system messages into a single text string.
+fn extractSystemText(allocator: std.mem.Allocator, messages: []const Message) !?[]const u8 {
+    var sys_parts: std.ArrayList([]const u8) = .empty;
+    defer sys_parts.deinit(allocator);
+    for (messages) |msg| {
+        if (msg.role == .system) {
+            if (msg.content) |c| try sys_parts.append(allocator, c);
+        }
+    }
+    if (sys_parts.items.len == 0) return null;
+    if (sys_parts.items.len == 1) return sys_parts.items[0];
+    return try std.mem.join(allocator, "\n\n", sys_parts.items);
+}
+
 const SeparatedMessages = struct {
     contents: []gemini_types.Content,
     system_text: ?[]const u8,
 };
 
 fn separateSystemMessages(allocator: std.mem.Allocator, messages: []const Message) !SeparatedMessages {
-    // Collect all system message texts
-    var sys_parts: std.ArrayList([]const u8) = .empty;
-    defer sys_parts.deinit(allocator);
+    const system_text = try extractSystemText(allocator, messages);
+
     var non_system_count: usize = 0;
     for (messages) |msg| {
-        if (msg.role == .system) {
-            if (msg.content) |c| try sys_parts.append(allocator, c);
-        } else {
-            non_system_count += 1;
-        }
+        if (msg.role != .system) non_system_count += 1;
     }
-
-    // Concatenate all system messages with "\n\n"
-    const system_text: ?[]const u8 = if (sys_parts.items.len == 0)
-        null
-    else if (sys_parts.items.len == 1)
-        sys_parts.items[0] // borrow directly, no allocation
-    else
-        try std.mem.join(allocator, "\n\n", sys_parts.items);
 
     const contents = try allocator.alloc(gemini_types.Content, non_system_count);
     var idx: usize = 0;
@@ -1067,7 +1052,11 @@ fn mapAnthropicFinishReason(response: anthropic_types.MessageResponse) FinishRea
 }
 
 fn mapAnthropicUsage(response: anthropic_types.MessageResponse) Usage {
-    const usage = response.usage orelse return .{};
+    return convertAnthropicUsage(response.usage);
+}
+
+fn convertAnthropicUsage(usage_opt: ?anthropic_types.Usage) Usage {
+    const usage = usage_opt orelse return .{};
     return .{
         .prompt_tokens = usage.input_tokens,
         .completion_tokens = usage.output_tokens,

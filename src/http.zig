@@ -48,6 +48,13 @@ pub fn dupeJsonValue(a: std.mem.Allocator, value: std.json.Value) std.mem.Alloca
     };
 }
 
+/// Serialize a `std.json.Value` to a JSON string, allocated with `a`.
+pub fn jsonValueToString(a: std.mem.Allocator, val: std.json.Value) std.mem.Allocator.Error![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    std.json.Stringify.value(val, .{}, &aw.writer) catch return error.OutOfMemory;
+    return aw.written();
+}
+
 pub fn appendListParams(allocator: std.mem.Allocator, base_url: []const u8, options: ListOptions) ![]u8 {
     if (options.pageSize == null and options.pageToken == null) {
         return allocator.dupe(u8, base_url);

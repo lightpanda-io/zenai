@@ -99,7 +99,6 @@ pub fn sendStream(
     }
 
     var collected_content = std.ArrayListUnmanaged(u8).empty;
-    var is_valid = true;
 
     errdefer self.history.shrinkRetainingCapacity(self.history.items.len - user_messages.len);
 
@@ -107,13 +106,9 @@ pub fn sendStream(
         user_ctx: @TypeOf(context),
         user_cb: *const fn (@TypeOf(context), ChatCompletionResponse) void,
         content: *std.ArrayListUnmanaged(u8),
-        valid: *bool,
         alloc: std.mem.Allocator,
 
         fn handle(s: *const @This(), response: ChatCompletionResponse) void {
-            if (!validateResponse(response)) {
-                s.valid.* = false;
-            }
             if (response.choices) |choices| {
                 if (choices.len > 0) {
                     if (choices[0].delta) |delta| {
@@ -130,7 +125,6 @@ pub fn sendStream(
         .user_ctx = context,
         .user_cb = callback,
         .content = &collected_content,
-        .valid = &is_valid,
         .alloc = arena_alloc,
     };
 
@@ -145,7 +139,7 @@ pub fn sendStream(
         return err;
     };
 
-    if (is_valid and collected_content.items.len > 0) {
+    if (collected_content.items.len > 0) {
         self.history.append(self.client.allocator, Message{
             .role = .assistant,
             .content = collected_content.items,

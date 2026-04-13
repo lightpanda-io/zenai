@@ -100,20 +100,15 @@ pub fn sendStream(
     self.history.append(self.client.allocator, Content{ .role = "user", .parts = owned }) catch return error.OutOfMemory;
 
     var collected_parts: std.ArrayListUnmanaged(Part) = .empty;
-    var is_valid = true;
     errdefer _ = self.history.pop();
 
     const StreamCtx = struct {
         user_ctx: @TypeOf(context),
         user_cb: *const fn (@TypeOf(context), GenerateContentResponse) void,
         parts: *std.ArrayListUnmanaged(Part),
-        valid: *bool,
         alloc: std.mem.Allocator,
 
         fn handle(s: *const @This(), response: GenerateContentResponse) void {
-            if (!validateResponse(response)) {
-                s.valid.* = false;
-            }
             if (response.candidates) |candidates| {
                 if (candidates.len > 0) {
                     if (candidates[0].content) |content| {
@@ -128,7 +123,6 @@ pub fn sendStream(
         .user_ctx = context,
         .user_cb = callback,
         .parts = &collected_parts,
-        .valid = &is_valid,
         .alloc = arena_alloc,
     };
 
@@ -144,7 +138,7 @@ pub fn sendStream(
         return err;
     };
 
-    if (is_valid and collected_parts.items.len > 0) {
+    if (collected_parts.items.len > 0) {
         const model_parts = arena_alloc.dupe(Part, collected_parts.items) catch return error.OutOfMemory;
         self.history.append(self.client.allocator, Content{ .role = "model", .parts = model_parts }) catch return error.OutOfMemory;
     } else {
