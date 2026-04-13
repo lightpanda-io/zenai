@@ -162,6 +162,12 @@ pub const Client = union(enum) {
     pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError;
     pub const StreamError = gemini_mod.StreamError || openai_mod.StreamError || anthropic_mod.StreamError;
 
+    fn clientAllocator(self: Client) std.mem.Allocator {
+        return switch (self) {
+            inline else => |c| c.allocator,
+        };
+    }
+
     /// Generate content from a list of messages.
     pub fn generateContent(
         self: Client,
@@ -184,16 +190,7 @@ pub const Client = union(enum) {
 
                 const tools = if (config.tools) |t| try mapGeminiTools(req_alloc, t) else null;
 
-                var response = try g.generateContent(model, contents, gemini_types.GenerationConfig{
-                    .temperature = config.temperature,
-                    .maxOutputTokens = config.max_tokens,
-                    .topP = config.top_p,
-                    .stopSequences = config.stop,
-                    .frequencyPenalty = config.frequency_penalty,
-                    .presencePenalty = config.presence_penalty,
-                    .seed = config.seed,
-                    .responseMimeType = mapResponseFormatToGemini(config.response_format),
-                }, .{
+                var response = try g.generateContent(model, contents, mapGeminiGenerationConfig(config), .{
                     .systemInstruction = sys_instruction,
                     .tools = tools,
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
@@ -246,18 +243,7 @@ pub const Client = union(enum) {
                 const oai_messages = try messagesToOpenAIMessages(req_alloc, messages);
                 const tools = if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
 
-                var response = try o.chatCompletion(model, oai_messages, .{
-                    .temperature = config.temperature,
-                    .max_tokens = config.max_tokens,
-                    .top_p = config.top_p,
-                    .stop = config.stop,
-                    .frequency_penalty = config.frequency_penalty,
-                    .presence_penalty = config.presence_penalty,
-                    .seed = config.seed,
-                    .tools = tools,
-                    .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
-                    .response_format = mapResponseFormatToOpenAI(config.response_format),
-                });
+                var response = try o.chatCompletion(model, oai_messages, mapOpenAICompletionConfig(config, tools));
                 defer response.deinit();
 
                 var result = GenerateResult.init(o.allocator);
@@ -390,16 +376,7 @@ pub const Client = union(enum) {
                     }
                 };
 
-                try g.generateContentStream(model, contents, gemini_types.GenerationConfig{
-                    .temperature = config.temperature,
-                    .maxOutputTokens = config.max_tokens,
-                    .topP = config.top_p,
-                    .stopSequences = config.stop,
-                    .frequencyPenalty = config.frequency_penalty,
-                    .presencePenalty = config.presence_penalty,
-                    .seed = config.seed,
-                    .responseMimeType = mapResponseFormatToGemini(config.response_format),
-                }, .{
+                try g.generateContentStream(model, contents, mapGeminiGenerationConfig(config), .{
                     .systemInstruction = sys_instruction,
                     .tools = tools,
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
@@ -424,18 +401,7 @@ pub const Client = union(enum) {
                     }
                 };
 
-                try o.chatCompletionStream(model, oai_messages, .{
-                    .temperature = config.temperature,
-                    .max_tokens = config.max_tokens,
-                    .top_p = config.top_p,
-                    .stop = config.stop,
-                    .frequency_penalty = config.frequency_penalty,
-                    .presence_penalty = config.presence_penalty,
-                    .seed = config.seed,
-                    .tools = tools,
-                    .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
-                    .response_format = mapResponseFormatToOpenAI(config.response_format),
-                }, .{ .user_ctx = context, .user_cb = callback, .alloc = o.allocator }, &Wrapper.wrap);
+                try o.chatCompletionStream(model, oai_messages, mapOpenAICompletionConfig(config, tools), .{ .user_ctx = context, .user_cb = callback, .alloc = o.allocator }, &Wrapper.wrap);
             },
             .anthropic => |a| {
                 var req_arena = std.heap.ArenaAllocator.init(a.allocator);
@@ -458,13 +424,11 @@ pub const Client = union(enum) {
                         var result = GenerateResult.init(ctx.alloc);
                         defer result.deinit();
                         result.text = text_content;
-                        // Extract finish reason from message_delta events
                         if (event.delta) |delta| {
                             if (delta.stop_reason) |reason| {
                                 result.finish_reason = mapAnthropicStopReason(reason);
                             }
                         }
-                        // Extract usage from message_delta events
                         if (event.usage) |usage| {
                             result.usage = .{
                                 .prompt_tokens = usage.input_tokens,
@@ -584,7 +548,7 @@ pub const Client = union(enum) {
         handler: ToolHandler,
         config: RunToolsConfig,
     ) Error!RunToolsResult {
-        var result_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var result_arena = std.heap.ArenaAllocator.init(self.clientAllocator());
         errdefer result_arena.deinit();
         const ra = result_arena.allocator();
 
@@ -600,9 +564,7 @@ pub const Client = union(enum) {
             });
             defer gen_result.deinit();
 
-            // Handle tool calls
             if (gen_result.tool_calls) |tool_calls| {
-                // Append assistant message with tool calls
                 const duped_calls = try dupeToolCallSlice(data_alloc, tool_calls);
                 try messages.append(list_alloc, .{
                     .role = .assistant,
@@ -610,10 +572,9 @@ pub const Client = union(enum) {
                     .tool_calls = duped_calls,
                 });
 
-                // Execute each tool call
                 var tool_results: std.ArrayListUnmanaged(ToolResult) = .empty;
                 for (tool_calls) |tc| {
-                    var tool_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                    var tool_arena = std.heap.ArenaAllocator.init(self.clientAllocator());
                     defer tool_arena.deinit();
 
                     const tool_result = handler.call(tool_arena.allocator(), tc.name, tc.arguments);
@@ -632,7 +593,6 @@ pub const Client = union(enum) {
                     });
                 }
 
-                // Append tool results message
                 try messages.append(list_alloc, .{
                     .role = .tool,
                     .tool_results = try tool_results.toOwnedSlice(data_alloc),
@@ -641,7 +601,6 @@ pub const Client = union(enum) {
                 continue;
             }
 
-            // Text response — we're done
             const text = if (gen_result.text) |t| try data_alloc.dupe(u8, t) else null;
 
             if (text != null) {
@@ -1116,6 +1075,34 @@ fn mapAnthropicUsage(response: anthropic_types.MessageResponse) Usage {
             usage.input_tokens.? + usage.output_tokens.?
         else
             null,
+    };
+}
+
+fn mapGeminiGenerationConfig(config: GenerationConfig) gemini_types.GenerationConfig {
+    return .{
+        .temperature = config.temperature,
+        .maxOutputTokens = config.max_tokens,
+        .topP = config.top_p,
+        .stopSequences = config.stop,
+        .frequencyPenalty = config.frequency_penalty,
+        .presencePenalty = config.presence_penalty,
+        .seed = config.seed,
+        .responseMimeType = mapResponseFormatToGemini(config.response_format),
+    };
+}
+
+fn mapOpenAICompletionConfig(config: GenerationConfig, tools: ?[]const openai_types.Tool) openai_mod.ChatCompletionConfig {
+    return .{
+        .temperature = config.temperature,
+        .max_tokens = config.max_tokens,
+        .top_p = config.top_p,
+        .stop = config.stop,
+        .frequency_penalty = config.frequency_penalty,
+        .presence_penalty = config.presence_penalty,
+        .seed = config.seed,
+        .tools = tools,
+        .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
+        .response_format = mapResponseFormatToOpenAI(config.response_format),
     };
 }
 

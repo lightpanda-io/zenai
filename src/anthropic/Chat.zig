@@ -100,26 +100,18 @@ pub fn sendStream(
     self.history.append(self.client.allocator, MessageParam{ .role = .user, .content = owned }) catch return error.OutOfMemory;
 
     var collected_text = std.ArrayListUnmanaged(u8).empty;
-    var is_valid = true;
     errdefer _ = self.history.pop();
 
     const StreamCtx = struct {
         user_ctx: @TypeOf(context),
         user_cb: *const fn (@TypeOf(context), StreamEvent) void,
         text_buf: *std.ArrayListUnmanaged(u8),
-        valid: *bool,
         alloc: std.mem.Allocator,
 
         fn handle(s: *const @This(), event: StreamEvent) void {
             if (event.delta) |delta| {
                 if (delta.text) |t| {
                     s.text_buf.appendSlice(s.alloc, t) catch {};
-                }
-            }
-            // Check for message_delta with stop_reason to validate
-            if (event.type) |t| {
-                if (std.mem.eql(u8, t, "message_delta")) {
-                    // valid unless something went wrong
                 }
             }
             s.user_cb(s.user_ctx, event);
@@ -129,7 +121,6 @@ pub fn sendStream(
         .user_ctx = context,
         .user_cb = callback,
         .text_buf = &collected_text,
-        .valid = &is_valid,
         .alloc = arena_alloc,
     };
 
@@ -145,8 +136,8 @@ pub fn sendStream(
         return err;
     };
 
-    if (is_valid and collected_text.items.len > 0) {
-        const text_block = ContentBlockParam{ .type = "text", .text = collected_text.items };
+    if (collected_text.items.len > 0) {
+        const text_block = ContentBlockParam{ .text = collected_text.items };
         const content = arena_alloc.dupe(ContentBlockParam, &.{text_block}) catch return error.OutOfMemory;
         self.history.append(self.client.allocator, MessageParam{ .role = .assistant, .content = content }) catch return error.OutOfMemory;
     } else {

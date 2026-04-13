@@ -47,8 +47,6 @@ pub fn deinit(self: *Client) void {
     self.http_client.deinit();
 }
 
-/// Owns the parsed response and its backing memory.
-/// Call `deinit()` when done to free all resources.
 pub const Response = http.Response;
 
 pub const ApiError = error{
