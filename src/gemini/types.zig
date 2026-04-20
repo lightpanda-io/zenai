@@ -165,6 +165,21 @@ pub const Language = enum {
     PYTHON,
 };
 
+/// The type of tool in a server-side tool call.
+pub const ToolType = enum {
+    TOOL_TYPE_UNSPECIFIED,
+    /// Google Search web search.
+    GOOGLE_SEARCH_WEB,
+    /// Google Search image search.
+    GOOGLE_SEARCH_IMAGE,
+    /// URL context tool.
+    URL_CONTEXT,
+    /// Google Maps tool.
+    GOOGLE_MAPS,
+    /// File search tool.
+    FILE_SEARCH,
+};
+
 // --- Core Types ---
 
 /// A content blob containing raw bytes of a specific media type (images, audio, video).
@@ -210,6 +225,9 @@ pub const ExecutableCode = struct {
     code: ?[]const u8 = null,
     /// Programming language of the code.
     language: ?Language = null,
+    /// Unique identifier of the `ExecutableCode` part. The server returns the
+    /// matching `CodeExecutionResult` with the same `id`.
+    id: ?[]const u8 = null,
 };
 
 /// Result of executing the `ExecutableCode`.
@@ -218,6 +236,30 @@ pub const CodeExecutionResult = struct {
     outcome: ?Outcome = null,
     /// Contains stdout when successful, stderr or other description otherwise.
     output: ?[]const u8 = null,
+    /// Identifier of the `ExecutableCode` part this result is for.
+    id: ?[]const u8 = null,
+};
+
+/// A predicted server-side tool call returned from the model.
+/// The client is NOT expected to execute this — it is echoed back along with
+/// the corresponding `ToolResponse` in a subsequent turn.
+pub const ToolCall = struct {
+    /// Unique identifier of the tool call.
+    id: ?[]const u8 = null,
+    /// The type of tool that was called.
+    toolType: ?ToolType = null,
+    /// The tool call arguments.
+    args: ?std.json.Value = null,
+};
+
+/// The output from a server-side `ToolCall` execution.
+pub const ToolResponse = struct {
+    /// Identifier of the tool call this response is for.
+    id: ?[]const u8 = null,
+    /// The type of tool that was called.
+    toolType: ?ToolType = null,
+    /// The tool response.
+    response: ?std.json.Value = null,
 };
 
 /// A datatype containing media content. Exactly one field within a Part should be set.
@@ -246,6 +288,11 @@ pub const Part = struct {
     mediaResolution: ?MediaResolution = null,
     /// Custom metadata associated with the Part.
     partMetadata: ?std.json.Value = null,
+    /// Server-side tool call predicted by the model. The client echoes this
+    /// back along with the corresponding `toolResponse` in a subsequent turn.
+    toolCall: ?ToolCall = null,
+    /// Output from a server-side `toolCall` execution.
+    toolResponse: ?ToolResponse = null,
 };
 
 /// Contains the multi-part content of a message.
@@ -402,6 +449,9 @@ pub const FunctionCallingConfig = struct {
 pub const ToolConfig = struct {
     /// Function calling config.
     functionCallingConfig: ?FunctionCallingConfig = null,
+    /// If true, the response includes the server-side tool calls and responses
+    /// within `Content`, letting clients observe the server's tool invocations.
+    includeServerSideToolInvocations: ?bool = null,
 };
 
 /// Configuration for prompt and response sanitization using the Model Armor service.
@@ -570,6 +620,9 @@ pub const GroundingSupport = struct {
     confidenceScores: ?[]const f64 = null,
     /// Content of the grounding support segment.
     segment: ?Segment = null,
+    /// Indices into the `renderedParts` field of the `GroundingMetadata`,
+    /// specifying which rendered parts are associated with this support.
+    renderedParts: ?[]const i32 = null,
 };
 
 /// A segment of content.

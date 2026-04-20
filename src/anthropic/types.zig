@@ -140,12 +140,23 @@ pub const MessageRequest = struct {
     thinking: ?ThinkingConfig = null,
     /// Request metadata.
     metadata: ?Metadata = null,
+    /// Top-level cache control — applies an ephemeral cache_control marker to
+    /// the last cacheable block in the request (automatic caching).
+    cache_control: ?CacheControlEphemeral = null,
 };
 
 /// Request metadata.
 pub const Metadata = struct {
     /// An external identifier for the user making the request.
     user_id: ?[]const u8 = null,
+};
+
+/// Ephemeral cache control breakpoint.
+pub const CacheControlEphemeral = struct {
+    /// Always "ephemeral".
+    type: []const u8 = "ephemeral",
+    /// Time-to-live for the cache breakpoint: "5m" or "1h". Defaults to "5m".
+    ttl: ?[]const u8 = null,
 };
 
 // --- Response ---
