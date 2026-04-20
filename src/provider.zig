@@ -57,13 +57,61 @@ pub const ContentPart = union(enum) {
     image: ImageData,
 };
 
-/// Inline image data.
+/// Inline media data. Despite the name, this carries any inline payload —
+/// images, audio, and PDFs — because the wire format (e.g. Gemini
+/// `inlineData`) accepts any mime type. `mime_type` drives provider dispatch.
 pub const ImageData = struct {
-    /// Base64-encoded image bytes.
+    /// Base64-encoded bytes.
     data: []const u8,
-    /// MIME type, e.g. "image/png", "image/jpeg".
+    /// MIME type, e.g. "image/png", "audio/mp3", "application/pdf".
     mime_type: []const u8,
 };
+
+/// Return a MIME type string suitable for `ImageData.mime_type`, inferred
+/// from a file path's extension. Returns `null` for unknown extensions —
+/// callers should surface a clear error rather than guess. The mapping
+/// covers the common inputs accepted by multimodal models (images, audio,
+/// PDF, plain text).
+pub fn inferInlineMimeType(path: []const u8) ?[]const u8 {
+    const ext = std.fs.path.extension(path);
+    const table = [_]struct { ext: []const u8, mime: []const u8 }{
+        .{ .ext = ".png", .mime = "image/png" },
+        .{ .ext = ".jpg", .mime = "image/jpeg" },
+        .{ .ext = ".jpeg", .mime = "image/jpeg" },
+        .{ .ext = ".gif", .mime = "image/gif" },
+        .{ .ext = ".webp", .mime = "image/webp" },
+        .{ .ext = ".heic", .mime = "image/heic" },
+        .{ .ext = ".heif", .mime = "image/heif" },
+        .{ .ext = ".mp3", .mime = "audio/mp3" },
+        .{ .ext = ".wav", .mime = "audio/wav" },
+        .{ .ext = ".ogg", .mime = "audio/ogg" },
+        .{ .ext = ".m4a", .mime = "audio/mp4" },
+        .{ .ext = ".flac", .mime = "audio/flac" },
+        .{ .ext = ".pdf", .mime = "application/pdf" },
+        .{ .ext = ".txt", .mime = "text/plain" },
+        .{ .ext = ".md", .mime = "text/plain" },
+        .{ .ext = ".py", .mime = "text/plain" },
+        .{ .ext = ".js", .mime = "text/plain" },
+        .{ .ext = ".ts", .mime = "text/plain" },
+        .{ .ext = ".json", .mime = "text/plain" },
+        .{ .ext = ".csv", .mime = "text/plain" },
+        .{ .ext = ".html", .mime = "text/plain" },
+        .{ .ext = ".xml", .mime = "text/plain" },
+    };
+    for (table) |e| if (std.ascii.eqlIgnoreCase(ext, e.ext)) return e.mime;
+    return null;
+}
+
+test "inferInlineMimeType: extension mapping" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("image/png", inferInlineMimeType("a/b/foo.png").?);
+    try testing.expectEqualStrings("image/jpeg", inferInlineMimeType("FOO.JPG").?);
+    try testing.expectEqualStrings("application/pdf", inferInlineMimeType("paper.pdf").?);
+    try testing.expectEqualStrings("audio/mp3", inferInlineMimeType("x.mp3").?);
+    try testing.expectEqualStrings("text/plain", inferInlineMimeType("src.py").?);
+    try testing.expectEqual(@as(?[]const u8, null), inferInlineMimeType("archive.zip"));
+    try testing.expectEqual(@as(?[]const u8, null), inferInlineMimeType("noext"));
+}
 
 /// A message role, normalized across providers.
 pub const Role = enum {
