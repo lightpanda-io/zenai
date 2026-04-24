@@ -29,6 +29,9 @@ pub const ToolResult = struct {
     id: []const u8,
     name: []const u8, // Required specifically by Gemini
     content: []const u8, // String representation of the result
+    /// Signals that the tool call failed. Propagated to Anthropic's native
+    /// `is_error` wire field; providers without an equivalent ignore it.
+    is_error: bool = false,
     /// Gemini thought signature — echoed from the corresponding ToolCall.
     thought_signature: ?[]const u8 = null,
 };
@@ -535,9 +538,17 @@ pub const Client = union(enum) {
     /// Callback interface for executing tool calls.
     pub const ToolHandler = struct {
         context: *anyopaque,
-        callFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, tool_name: []const u8, arguments: []const u8) []const u8,
+        callFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, tool_name: []const u8, arguments: []const u8) Result,
 
-        pub fn call(self: ToolHandler, allocator: std.mem.Allocator, name: []const u8, args: []const u8) []const u8 {
+        /// What the tool callback returns: the string content the model should
+        /// see, plus whether the call errored. `is_error` is the authoritative
+        /// failure signal — the content may legitimately describe an error.
+        pub const Result = struct {
+            content: []const u8,
+            is_error: bool = false,
+        };
+
+        pub fn call(self: ToolHandler, allocator: std.mem.Allocator, name: []const u8, args: []const u8) Result {
             return self.callFn(self.context, allocator, name, args);
         }
     };
@@ -561,6 +572,7 @@ pub const Client = union(enum) {
         name: []const u8,
         arguments: []const u8,
         result: []const u8,
+        is_error: bool = false,
     };
 
     /// Result of the agentic tool-use loop.
@@ -628,19 +640,21 @@ pub const Client = union(enum) {
                     var tool_arena = std.heap.ArenaAllocator.init(self.clientAllocator());
                     defer tool_arena.deinit();
 
-                    const tool_result = handler.call(tool_arena.allocator(), tc.name, tc.arguments);
+                    const handler_result = handler.call(tool_arena.allocator(), tc.name, tc.arguments);
 
                     try tool_results.append(data_alloc, .{
                         .id = try data_alloc.dupe(u8, tc.id),
                         .name = try data_alloc.dupe(u8, tc.name),
-                        .content = try data_alloc.dupe(u8, tool_result),
+                        .content = try data_alloc.dupe(u8, handler_result.content),
+                        .is_error = handler_result.is_error,
                         .thought_signature = if (tc.thought_signature) |ts| try data_alloc.dupe(u8, ts) else null,
                     });
 
                     try all_tool_calls.append(ra, .{
                         .name = try ra.dupe(u8, tc.name),
                         .arguments = try ra.dupe(u8, tc.arguments),
-                        .result = try ra.dupe(u8, tool_result),
+                        .result = try ra.dupe(u8, handler_result.content),
+                        .is_error = handler_result.is_error,
                     });
                 }
 
@@ -907,6 +921,7 @@ fn messagesToAnthropicMessages(allocator: std.mem.Allocator, messages: []const M
                     .type = "tool_result",
                     .tool_use_id = res.id,
                     .content = res.content,
+                    .is_error = if (res.is_error) true else null,
                 });
             }
         }
