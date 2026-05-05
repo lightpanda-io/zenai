@@ -852,6 +852,46 @@ pub const Client = union(enum) {
     }
 };
 
+/// Tag of `Client`. Equivalent to `std.meta.Tag(Client)` but named so callers
+/// can refer to "the provider" without leaking the union construction.
+pub const ProviderKind = std.meta.Tag(Client);
+
+/// Look up the API key for `kind` from the conventional env vars. Returns
+/// `null` when the relevant env var is not set. Ollama does not require a
+/// key; we still return the literal `"ollama"` so downstream OpenAI-shaped
+/// clients clear their non-empty-key check.
+pub fn envApiKey(kind: ProviderKind) ?[:0]const u8 {
+    return switch (kind) {
+        .anthropic => std.posix.getenv("ANTHROPIC_API_KEY"),
+        .openai => std.posix.getenv("OPENAI_API_KEY"),
+        .gemini => std.posix.getenv("GOOGLE_API_KEY") orelse std.posix.getenv("GEMINI_API_KEY"),
+        .ollama => "ollama",
+    };
+}
+
+/// Default model name for `kind`. Centralized here so a provider's "current
+/// recommended" model lives next to the provider definition and doesn't drift
+/// across consumers.
+pub fn defaultModel(kind: ProviderKind) []const u8 {
+    return switch (kind) {
+        .anthropic => "claude-haiku-4-5-20251001",
+        .openai => "gpt-5.4-nano-2026-03-17",
+        .gemini => "gemini-3.1-flash-lite-preview",
+        .ollama => "gemma4",
+    };
+}
+
+test "envApiKey: ollama returns placeholder regardless of env" {
+    try std.testing.expectEqualStrings("ollama", envApiKey(.ollama).?);
+}
+
+test "defaultModel: every provider has one" {
+    inline for (@typeInfo(ProviderKind).@"enum".fields) |f| {
+        const m = defaultModel(@field(ProviderKind, f.name));
+        try std.testing.expect(m.len > 0);
+    }
+}
+
 // --- Conversion helpers ---
 
 /// Extract and concatenate all system messages into a single text string.
