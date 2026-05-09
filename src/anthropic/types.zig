@@ -277,6 +277,28 @@ pub const StreamEvent = struct {
     usage: ?Usage = null,
 };
 
+// --- Models ---
+
+/// An available Anthropic model.
+pub const Model = struct {
+    /// Object type (always "model").
+    type: ?[]const u8 = null,
+    /// Model identifier (e.g. "claude-haiku-4-5-20251001").
+    id: ?[]const u8 = null,
+    /// Human-readable name.
+    display_name: ?[]const u8 = null,
+    /// ISO 8601 creation timestamp.
+    created_at: ?[]const u8 = null,
+};
+
+/// Response from the list models endpoint.
+pub const ListModelsResponse = struct {
+    data: ?[]const Model = null,
+    has_more: ?bool = null,
+    first_id: ?[]const u8 = null,
+    last_id: ?[]const u8 = null,
+};
+
 // --- Error Types ---
 
 /// API error response wrapper.

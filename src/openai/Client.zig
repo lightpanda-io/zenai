@@ -344,9 +344,74 @@ pub fn getModel(self: *Client, model: []const u8) ApiError!Response(types.Model)
     return self.fetchGet(url, types.Model);
 }
 
+/// Whether `m` looks like a chat/text-generation model.
+///
+/// OpenAI's `/v1/models` exposes no modality metadata, so this is a
+/// name-based heuristic: the id must start with a known chat family prefix
+/// (gpt-, chatgpt-, o1, o3, o4) and must not contain a substring marking a
+/// non-chat variant (embedding, image, audio, realtime, transcribe, tts,
+/// moderation). The list will need updating as OpenAI introduces new
+/// families or non-chat variants.
+pub fn isChatModel(m: types.Model) bool {
+    const id = m.id orelse return false;
+
+    const chat_prefixes = [_][]const u8{ "gpt-", "chatgpt-", "o1", "o3", "o4" };
+    var matches_prefix = false;
+    for (chat_prefixes) |p| {
+        if (std.mem.startsWith(u8, id, p)) {
+            matches_prefix = true;
+            break;
+        }
+    }
+    if (!matches_prefix) return false;
+
+    const non_chat_substrings = [_][]const u8{
+        "embedding", "image", "audio", "realtime", "transcribe", "tts", "moderation",
+    };
+    for (non_chat_substrings) |s| {
+        if (std.mem.indexOf(u8, id, s) != null) return false;
+    }
+    return true;
+}
+
 test "Client init and deinit" {
     var client = Client.init(std.testing.allocator, "test-key", .{});
     defer client.deinit();
     try std.testing.expectEqualStrings("test-key", client.api_key);
     try std.testing.expectEqualStrings("https://api.openai.com/v1", client.base_url);
+}
+
+test "isChatModel keeps chat families" {
+    const T = struct {
+        fn m(id: []const u8) types.Model {
+            return .{ .id = id };
+        }
+    };
+    try std.testing.expect(isChatModel(T.m("gpt-4o")));
+    try std.testing.expect(isChatModel(T.m("gpt-4o-mini")));
+    try std.testing.expect(isChatModel(T.m("gpt-5")));
+    try std.testing.expect(isChatModel(T.m("o1-mini")));
+    try std.testing.expect(isChatModel(T.m("o3")));
+    try std.testing.expect(isChatModel(T.m("o4-mini")));
+    try std.testing.expect(isChatModel(T.m("chatgpt-4o-latest")));
+}
+
+test "isChatModel drops non-chat" {
+    const T = struct {
+        fn m(id: []const u8) types.Model {
+            return .{ .id = id };
+        }
+    };
+    try std.testing.expect(!isChatModel(T.m("text-embedding-3-small")));
+    try std.testing.expect(!isChatModel(T.m("dall-e-3")));
+    try std.testing.expect(!isChatModel(T.m("whisper-1")));
+    try std.testing.expect(!isChatModel(T.m("tts-1")));
+    try std.testing.expect(!isChatModel(T.m("omni-moderation-latest")));
+    try std.testing.expect(!isChatModel(T.m("babbage-002")));
+    try std.testing.expect(!isChatModel(T.m("davinci-002")));
+    try std.testing.expect(!isChatModel(T.m("gpt-image-1")));
+    try std.testing.expect(!isChatModel(T.m("gpt-4o-audio-preview")));
+    try std.testing.expect(!isChatModel(T.m("gpt-4o-realtime-preview")));
+    try std.testing.expect(!isChatModel(T.m("gpt-4o-transcribe")));
+    try std.testing.expect(!isChatModel(T.m("gpt-4o-mini-tts")));
 }

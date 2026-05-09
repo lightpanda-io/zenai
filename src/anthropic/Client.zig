@@ -86,6 +86,15 @@ pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
     }
 }
 
+fn fetchGet(self: *Client, url: []const u8, comptime T: type) ApiError!Response(T) {
+    const auth = self.authHeaders();
+    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, .{
+        .location = .{ .url = url },
+        .method = .GET,
+        .extra_headers = &auth,
+    }, T, self);
+}
+
 fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) ApiError!Response(T) {
     var payload_buf: std.Io.Writer.Allocating = .init(self.allocator);
     defer payload_buf.deinit();
@@ -280,10 +289,33 @@ pub fn createMessageStreamFromText(
     return self.createMessageStream(model, &messages, max_tokens, config, context, callback);
 }
 
+// --- Models ---
+
+/// List available models.
+pub fn listModels(self: *Client) ApiError!Response(types.ListModelsResponse) {
+    if (self.api_key.len == 0) return error.MissingApiKey;
+    const url = try std.fmt.allocPrint(self.allocator, "{s}/models", .{self.base_url});
+    defer self.allocator.free(url);
+    return self.fetchGet(url, types.ListModelsResponse);
+}
+
+/// Whether `m` is a chat model. Anthropic only ships Claude (chat-only),
+/// so this is unconditionally true. Provided for API symmetry with the
+/// other providers' `isChatModel` predicates.
+pub fn isChatModel(_: types.Model) bool {
+    return true;
+}
+
 test "Client init and deinit" {
     var client = Client.init(std.testing.allocator, "test-key", .{});
     defer client.deinit();
     try std.testing.expectEqualStrings("test-key", client.api_key);
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1", client.base_url);
     try std.testing.expectEqualStrings("2023-06-01", client.api_version);
+}
+
+test "listModels: missing api key" {
+    var client = Client.init(std.testing.allocator, "", .{});
+    defer client.deinit();
+    try std.testing.expectError(error.MissingApiKey, client.listModels());
 }

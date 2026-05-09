@@ -288,6 +288,24 @@ pub fn getModel(self: *Client, model: []const u8) !Response(types.Model) {
     return self.fetchGet(url, types.Model);
 }
 
+/// Whether `m` is a chat/text-generation model — i.e. it advertises
+/// `generateContent` in `supportedGenerationMethods`. Drops embeddings
+/// (embedContent), veo/imagen (predict), and aqa (generateAnswer).
+///
+/// Multimodal models that can also do images (e.g. `gemini-2.5-flash-image`,
+/// "nano banana") are kept, since they support `generateContent` and can
+/// read and generate text. Music-only (lyria) and speech-only (tts) variants
+/// also pass this filter — Google's API doesn't distinguish output modality
+/// from generation method, so the signal isn't fine-grained enough to drop
+/// them without resorting to name heuristics.
+pub fn isChatModel(m: types.Model) bool {
+    const methods = m.supportedGenerationMethods orelse return false;
+    for (methods) |meth| {
+        if (std.mem.eql(u8, meth, "generateContent")) return true;
+    }
+    return false;
+}
+
 /// List available models. Use `ListOptions` to paginate through results.
 pub fn listModels(self: *Client, options: ListOptions) !Response(types.ListModelsResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
@@ -712,4 +730,46 @@ test "Client init and deinit" {
     defer client.deinit();
     try std.testing.expectEqualStrings("test-key", client.api_key);
     try std.testing.expectEqualStrings("https://generativelanguage.googleapis.com", client.base_url);
+}
+
+test "isChatModel keeps text/chat models" {
+    const T = struct {
+        fn m(name: []const u8, methods: []const []const u8) types.Model {
+            return .{ .name = name, .supportedGenerationMethods = methods };
+        }
+    };
+    const generate = [_][]const u8{ "generateContent", "countTokens" };
+    try std.testing.expect(isChatModel(T.m("models/gemini-2.5-flash", &generate)));
+    try std.testing.expect(isChatModel(T.m("models/gemini-2.5-pro", &generate)));
+    try std.testing.expect(isChatModel(T.m("models/gemma-4-31b-it", &generate)));
+    try std.testing.expect(isChatModel(T.m("models/deep-research-preview-04-2026", &generate)));
+}
+
+test "isChatModel drops non-generateContent methods" {
+    const T = struct {
+        fn m(name: []const u8, methods: []const []const u8) types.Model {
+            return .{ .name = name, .supportedGenerationMethods = methods };
+        }
+    };
+    const embed = [_][]const u8{"embedContent"};
+    const predict = [_][]const u8{"predict"};
+    const generate_answer = [_][]const u8{"generateAnswer"};
+
+    try std.testing.expect(!isChatModel(T.m("models/gemini-embedding-001", &embed)));
+    try std.testing.expect(!isChatModel(T.m("models/imagen-4.0-generate-001", &predict)));
+    try std.testing.expect(!isChatModel(T.m("models/veo-3.0-generate-001", &predict)));
+    try std.testing.expect(!isChatModel(T.m("models/aqa", &generate_answer)));
+}
+
+test "isChatModel keeps multimodal text+image variants" {
+    const T = struct {
+        fn m(name: []const u8, methods: []const []const u8) types.Model {
+            return .{ .name = name, .supportedGenerationMethods = methods };
+        }
+    };
+    const generate = [_][]const u8{"generateContent"};
+    // These can read and generate text, so they're agent-capable even
+    // though they also handle images.
+    try std.testing.expect(isChatModel(T.m("models/gemini-2.5-flash-image", &generate)));
+    try std.testing.expect(isChatModel(T.m("models/nano-banana-pro-preview", &generate)));
 }
