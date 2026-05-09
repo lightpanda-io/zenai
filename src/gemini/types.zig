@@ -604,6 +604,8 @@ pub const GroundingChunkRetrievedContext = struct {
     text: ?[]const u8 = null,
     /// Page number of the retrieved context. Not supported on Vertex AI.
     pageNumber: ?i32 = null,
+    /// Media ID. Not supported on Vertex AI.
+    mediaId: ?[]const u8 = null,
 };
 
 /// Grounding chunk — a reference to a source used to ground the response.
