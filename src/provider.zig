@@ -763,7 +763,7 @@ pub const Client = union(enum) {
             defer gen_result.deinit();
 
             if (gen_result.tool_calls) |tool_calls| {
-                const duped_calls = try dupeToolCallSlice(data_alloc, tool_calls);
+                const duped_calls = try dupeToolCalls(data_alloc, tool_calls);
                 try messages.append(list_alloc, .{
                     .role = .assistant,
                     .content = if (gen_result.text) |t| try data_alloc.dupe(u8, t) else null,
@@ -836,28 +836,14 @@ pub const Client = union(enum) {
         };
     }
 
-    fn dupeToolCallSlice(alloc: std.mem.Allocator, calls: []const ToolCall) ![]const ToolCall {
-        const duped = try alloc.alloc(ToolCall, calls.len);
-        for (calls, 0..) |tc, i| {
-            duped[i] = .{
-                .id = try alloc.dupe(u8, tc.id),
-                .name = try alloc.dupe(u8, tc.name),
-                .arguments = if (tc.arguments) |v| try http.dupeJsonValue(alloc, v) else null,
-                .thought_signature = if (tc.thought_signature) |ts| try alloc.dupe(u8, ts) else null,
-            };
-        }
-        return duped;
-    }
 };
 
-/// Tag of `Client`. Equivalent to `std.meta.Tag(Client)` but named so callers
-/// can refer to "the provider" without leaking the union construction.
+/// Provider tag used in switches and helper APIs.
 pub const ProviderKind = std.meta.Tag(Client);
 
-/// Look up the API key for `kind` from the conventional env vars. Returns
-/// `null` when the relevant env var is not set. Ollama does not require a
-/// key; we still return the literal `"ollama"` so downstream OpenAI-shaped
-/// clients clear their non-empty-key check.
+/// Look up the API key for `kind` from the conventional env var(s). Ollama
+/// has no key; returns the literal `"ollama"` so OpenAI-shaped clients
+/// clear their non-empty-key check.
 pub fn envApiKey(kind: ProviderKind) ?[:0]const u8 {
     return switch (kind) {
         .anthropic => std.posix.getenv("ANTHROPIC_API_KEY"),
@@ -867,9 +853,7 @@ pub fn envApiKey(kind: ProviderKind) ?[:0]const u8 {
     };
 }
 
-/// Default model name for `kind`. Centralized here so a provider's "current
-/// recommended" model lives next to the provider definition and doesn't drift
-/// across consumers.
+/// Recommended default model for `kind`.
 pub fn defaultModel(kind: ProviderKind) []const u8 {
     return switch (kind) {
         .anthropic => "claude-haiku-4-5-20251001",
@@ -879,15 +863,9 @@ pub fn defaultModel(kind: ProviderKind) []const u8 {
     };
 }
 
-/// Fetch the chat-capable model IDs for `kind` and return them sorted in
-/// `arena`. Hides the per-provider `listModels` shape, the
-/// per-provider `isChatModel` filter, and Gemini's `models/` prefix from
-/// callers who only want a list of usable model strings.
-///
-/// `allocator` is used by the underlying HTTP client (for the duration of
-/// the call). `arena` is where the returned slice and its strings are
-/// allocated; caller controls its lifetime. `base_url_override` only
-/// affects providers that take one (openai, ollama).
+/// Fetch chat-capable model IDs for `kind`, allocated in `arena`. Ordering
+/// is provider-defined — sort at the call site if needed. `base_url_override`
+/// is only honored for openai/ollama.
 pub fn listChatModelIds(
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -949,13 +927,7 @@ pub fn listChatModelIds(
         },
     }
 
-    std.mem.sort([]const u8, ids.items, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lessThan);
-
-    return ids.items;
+    return ids.toOwnedSlice(arena);
 }
 
 test "envApiKey: ollama returns placeholder regardless of env" {
