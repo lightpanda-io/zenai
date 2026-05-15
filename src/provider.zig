@@ -708,6 +708,25 @@ pub const Client = union(enum) {
         temperature: ?f32 = null,
         /// See `GenerationConfig.thinking_budget`. Forwarded per-turn.
         thinking_budget: ?i32 = null,
+        /// Polled before each turn, between the LLM response and tool
+        /// execution, and after each tool call. Returning true stops the
+        /// loop with `cancelled = true` in the result. The in-flight LLM
+        /// HTTP request still runs to completion before the check fires
+        /// (the loop owns iteration, not the HTTP layer).
+        cancel: ?CancelHook = null,
+
+        pub fn cancelRequested(self: RunToolsConfig) bool {
+            return if (self.cancel) |c| c.check() else false;
+        }
+    };
+
+    pub const CancelHook = struct {
+        context: *anyopaque,
+        checkFn: *const fn (context: *anyopaque) bool,
+
+        pub fn check(self: CancelHook) bool {
+            return self.checkFn(self.context);
+        }
     };
 
     /// Information about a tool call that was executed during the loop.
@@ -722,6 +741,7 @@ pub const Client = union(enum) {
     pub const RunToolsResult = struct {
         text: ?[]const u8 = null,
         tool_calls_made: []const ToolCallInfo = &.{},
+        cancelled: bool = false,
         arena: std.heap.ArenaAllocator,
 
         pub fn deinit(self: *RunToolsResult) void {
@@ -752,7 +772,12 @@ pub const Client = union(enum) {
         var all_tool_calls: std.ArrayListUnmanaged(ToolCallInfo) = .empty;
 
         var turns: u32 = config.max_turns;
+        var cancelled = false;
         while (turns > 0) : (turns -= 1) {
+            if (config.cancelRequested()) {
+                cancelled = true;
+                break;
+            }
             var gen_result = try self.generateContent(model, messages.items, .{
                 .tools = config.tools,
                 .max_tokens = config.max_tokens,
@@ -769,6 +794,11 @@ pub const Client = union(enum) {
                     .content = if (gen_result.text) |t| try data_alloc.dupe(u8, t) else null,
                     .tool_calls = duped_calls,
                 });
+
+                if (config.cancelRequested()) {
+                    cancelled = true;
+                    break;
+                }
 
                 var tool_results: std.ArrayListUnmanaged(ToolResult) = .empty;
                 var limit_reached = false;
@@ -799,6 +829,11 @@ pub const Client = union(enum) {
                         .result = try ra.dupe(u8, handler_result.content),
                         .is_error = handler_result.is_error,
                     });
+
+                    if (config.cancelRequested()) {
+                        cancelled = true;
+                        break;
+                    }
                 }
 
                 if (tool_results.items.len > 0) {
@@ -808,7 +843,7 @@ pub const Client = union(enum) {
                     });
                 }
 
-                if (limit_reached) break;
+                if (cancelled or limit_reached) break;
                 continue;
             }
 
@@ -828,10 +863,10 @@ pub const Client = union(enum) {
             };
         }
 
-        // Max turns exhausted
         return .{
             .text = null,
             .tool_calls_made = all_tool_calls.toOwnedSlice(ra) catch &.{},
+            .cancelled = cancelled,
             .arena = result_arena,
         };
     }
