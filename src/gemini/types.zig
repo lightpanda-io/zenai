@@ -462,6 +462,20 @@ pub const ModelArmorConfig = struct {
     responseTemplateName: ?[]const u8 = null,
 };
 
+/// Thinking level for the model's reasoning features.
+pub const ThinkingLevel = enum {
+    /// Thinking level is unspecified.
+    THINKING_LEVEL_UNSPECIFIED,
+    /// Minimal thinking level.
+    MINIMAL,
+    /// Low thinking level.
+    LOW,
+    /// Medium thinking level.
+    MEDIUM,
+    /// High thinking level.
+    HIGH,
+};
+
 // --- Thinking Config ---
 
 /// Configuration for the model's thinking/reasoning features.
@@ -470,6 +484,8 @@ pub const ThinkingConfig = struct {
     includeThoughts: ?bool = null,
     /// Budget in tokens for model thinking. Set to 0 to disable thinking.
     thinkingBudget: ?i32 = null,
+    /// Thinking level for model reasoning. Replaces `thinkingBudget` for Gemini 3.5+.
+    thinkingLevel: ?ThinkingLevel = null,
 };
 
 // --- Generation Config ---
@@ -1137,4 +1153,19 @@ test "Schema serializes with enum type" {
     const json = buf.written();
     try std.testing.expect(std.mem.indexOf(u8, json, "OBJECT") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "A person") != null);
+}
+
+test "ThinkingConfig serializes correctly with thinkingLevel" {
+    const config = ThinkingConfig{
+        .thinkingBudget = 1000,
+        .thinkingLevel = .HIGH,
+    };
+    var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buf.deinit();
+    try std.json.Stringify.value(config, .{ .emit_null_optional_fields = false }, &buf.writer);
+    const json = buf.written();
+    try std.testing.expect(std.mem.indexOf(u8, json, "thinkingBudget") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "1000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "thinkingLevel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "HIGH") != null);
 }

@@ -282,6 +282,14 @@ test "dupeToolResults: preserves is_error flag" {
     try std.testing.expect(out[1].is_error);
 }
 
+/// Categorical effort level for model reasoning.
+pub const ThinkingLevel = enum {
+    minimal,
+    low,
+    medium,
+    high,
+};
+
 /// Minimal generation config — the intersection of what both providers support.
 pub const GenerationConfig = struct {
     temperature: ?f32 = null,
@@ -299,6 +307,10 @@ pub const GenerationConfig = struct {
     /// disables thinking). Ignored by OpenAI/Ollama. Null means use the
     /// provider default.
     thinking_budget: ?i32 = null,
+    /// Per-turn effort level for model reasoning. Provider-specific: Gemini
+    /// 3.5+ thinking models use it for their `thinkingConfig.thinkingLevel`.
+    /// Ignored by OpenAI/Ollama. Null means use the provider default.
+    thinking_level: ?ThinkingLevel = null,
 };
 
 /// Unified finish reason.
@@ -1407,10 +1419,22 @@ fn mapGeminiGenerationConfig(config: GenerationConfig) gemini_types.GenerationCo
         .presencePenalty = config.presence_penalty,
         .seed = config.seed,
         .responseMimeType = mapResponseFormatToGemini(config.response_format),
-        .thinkingConfig = if (config.thinking_budget) |tb|
-            gemini_types.ThinkingConfig{ .thinkingBudget = tb }
+        .thinkingConfig = if (config.thinking_budget != null or config.thinking_level != null)
+            gemini_types.ThinkingConfig{
+                .thinkingBudget = config.thinking_budget,
+                .thinkingLevel = if (config.thinking_level) |tl| mapThinkingLevelToGemini(tl) else null,
+            }
         else
             null,
+    };
+}
+
+fn mapThinkingLevelToGemini(level: ThinkingLevel) gemini_types.ThinkingLevel {
+    return switch (level) {
+        .minimal => .MINIMAL,
+        .low => .LOW,
+        .medium => .MEDIUM,
+        .high => .HIGH,
     };
 }
 
