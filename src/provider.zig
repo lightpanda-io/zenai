@@ -498,15 +498,17 @@ pub const Client = union(enum) {
                     null;
 
                 const tools = if (config.tools) |t| try mapAnthropicTools(req_alloc, t) else null;
+                const thinking = if (config.thinking_level) |tl| mapThinkingLevelToAnthropic(tl) else null;
+                const max_tokens = anthropicMaxTokens(config.max_tokens orelse 4096, thinking);
 
-                var response = try a.createMessage(model, ant_messages, config.max_tokens orelse 4096, .{
+                var response = try a.createMessage(model, ant_messages, max_tokens, .{
                     .system = system_blocks,
                     .temperature = config.temperature,
                     .top_p = config.top_p,
                     .stop_sequences = config.stop,
                     .tools = tools,
                     .tool_choice = mapToolChoiceToAnthropic(config.tool_choice),
-                    .thinking = if (config.thinking_level) |tl| mapThinkingLevelToAnthropic(tl) else null,
+                    .thinking = thinking,
                     // Anthropic has no native JSON mode; response_format is ignored.
                 });
                 defer response.deinit();
@@ -617,6 +619,8 @@ pub const Client = union(enum) {
                     null;
 
                 const tools = if (config.tools) mapAnthropicTools(req_alloc, config.tools.?) catch return error.OutOfMemory else null;
+                const thinking = if (config.thinking_level) |tl| mapThinkingLevelToAnthropic(tl) else null;
+                const max_tokens = anthropicMaxTokens(config.max_tokens orelse 4096, thinking);
 
                 const Wrapper = struct {
                     fn wrap(ctx: struct { user_ctx: @TypeOf(context), user_cb: *const fn (@TypeOf(context), GenerateResult) void, alloc: std.mem.Allocator }, event: anthropic_types.StreamEvent) void {
@@ -634,14 +638,14 @@ pub const Client = union(enum) {
                     }
                 };
 
-                try a.createMessageStream(model, ant_messages, config.max_tokens orelse 4096, .{
+                try a.createMessageStream(model, ant_messages, max_tokens, .{
                     .system = system_blocks,
                     .temperature = config.temperature,
                     .top_p = config.top_p,
                     .stop_sequences = config.stop,
                     .tools = tools,
                     .tool_choice = mapToolChoiceToAnthropic(config.tool_choice),
-                    .thinking = if (config.thinking_level) |tl| mapThinkingLevelToAnthropic(tl) else null,
+                    .thinking = thinking,
                     // Anthropic has no native JSON mode; response_format is ignored.
                 }, .{ .user_ctx = context, .user_cb = callback, .alloc = a.allocator }, &Wrapper.wrap);
             },
@@ -1478,6 +1482,16 @@ fn mapOpenAICompletionConfig(config: GenerationConfig, tools: ?[]const openai_ty
     };
 }
 
+/// Anthropic returns HTTP 400 when `max_tokens <= thinking.budget_tokens`.
+/// Bump `max_tokens` past the budget so the model still has room for output
+/// after reasoning; caller-supplied values that already clear the budget are
+/// left alone.
+fn anthropicMaxTokens(max_tokens: i32, thinking: ?anthropic_types.ThinkingConfig) i32 {
+    const t = thinking orelse return max_tokens;
+    const budget = t.budget_tokens orelse return max_tokens;
+    return @max(max_tokens, budget +| 4096);
+}
+
 fn mapThinkingLevelToAnthropic(level: ThinkingLevel) ?anthropic_types.ThinkingConfig {
     return switch (level) {
         .none => null,
@@ -1513,4 +1527,32 @@ test "GenerateResult deinit with no backing response" {
     result.text = "test";
     result.finish_reason = .stop;
     result.deinit(); // Should not crash
+}
+
+test "anthropicMaxTokens leaves request unchanged without thinking" {
+    try std.testing.expectEqual(@as(i32, 4096), anthropicMaxTokens(4096, null));
+    try std.testing.expectEqual(
+        @as(i32, 4096),
+        anthropicMaxTokens(4096, .{ .type = "disabled" }),
+    );
+}
+
+test "anthropicMaxTokens raises max_tokens above thinking budget" {
+    // medium budget (4096) with default max_tokens (4096) would 400.
+    try std.testing.expectEqual(
+        @as(i32, 8192),
+        anthropicMaxTokens(4096, .{ .type = "enabled", .budget_tokens = 4096 }),
+    );
+    // xhigh budget (32768) requires substantial output headroom.
+    try std.testing.expectEqual(
+        @as(i32, 36864),
+        anthropicMaxTokens(4096, .{ .type = "enabled", .budget_tokens = 32768 }),
+    );
+}
+
+test "anthropicMaxTokens respects caller-supplied max_tokens when already large" {
+    try std.testing.expectEqual(
+        @as(i32, 64000),
+        anthropicMaxTokens(64000, .{ .type = "enabled", .budget_tokens = 4096 }),
+    );
 }
