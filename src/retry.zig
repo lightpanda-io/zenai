@@ -20,6 +20,18 @@ pub const RetryPolicy = struct {
 
     /// No retry — return errors immediately on the first attempt.
     pub const disabled: RetryPolicy = .{ .max_attempts = 1 };
+
+    /// Aggressive retry tuned for long-running agents that can afford to
+    /// wait out per-minute rate-limit windows. Total possible wait is
+    /// ~2+4+8+16+60+60 = 150 s across 5 retries, enough to ride out an
+    /// Anthropic TPM window twice. Use when the calling context is
+    /// already long-running (per-task timeouts in the minutes) and a
+    /// transient 429 is cheaper to wait out than to surface.
+    pub const long_running: RetryPolicy = .{
+        .max_attempts = 6,
+        .initial_backoff_ms = 2000,
+        .max_backoff_ms = 60_000,
+    };
 };
 
 /// HTTP status codes that are considered transient and worth retrying.
