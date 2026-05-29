@@ -331,7 +331,23 @@ pub const Usage = struct {
     /// at the standard input rate and don't report it separately, so this
     /// field stays null on those providers.
     cache_creation_tokens: ?i32 = null,
+
+    /// Sum `other` into `self`, treating null as 0 — the result is non-null
+    /// for any field that either operand reported. Used by agentic loops to
+    /// accumulate per-turn usage into a per-task total.
+    pub fn add(self: *Usage, other: Usage) void {
+        self.prompt_tokens = addOpt(self.prompt_tokens, other.prompt_tokens);
+        self.completion_tokens = addOpt(self.completion_tokens, other.completion_tokens);
+        self.total_tokens = addOpt(self.total_tokens, other.total_tokens);
+        self.cached_tokens = addOpt(self.cached_tokens, other.cached_tokens);
+        self.cache_creation_tokens = addOpt(self.cache_creation_tokens, other.cache_creation_tokens);
+    }
 };
+
+fn addOpt(a: ?i32, b: ?i32) ?i32 {
+    if (a == null and b == null) return null;
+    return (a orelse 0) + (b orelse 0);
+}
 
 /// Unified generation result.
 pub const GenerateResult = struct {
@@ -764,6 +780,9 @@ pub const Client = union(enum) {
         text: ?[]const u8 = null,
         tool_calls_made: []const ToolCallInfo = &.{},
         cancelled: bool = false,
+        /// Sum of per-turn `Usage` across every model call in this runTools
+        /// invocation (including tool-call turns that produced no text).
+        usage: Usage = .{},
         arena: std.heap.ArenaAllocator,
 
         pub fn deinit(self: *RunToolsResult) void {
@@ -792,6 +811,7 @@ pub const Client = union(enum) {
         const ra = result_arena.allocator();
 
         var all_tool_calls: std.ArrayListUnmanaged(ToolCallInfo) = .empty;
+        var total_usage: Usage = .{};
 
         var turns: u32 = config.max_turns;
         var cancelled = false;
@@ -808,6 +828,7 @@ pub const Client = union(enum) {
                 .thinking_level = config.thinking_level,
             });
             defer gen_result.deinit();
+            total_usage.add(gen_result.usage);
 
             if (gen_result.tool_calls) |tool_calls| {
                 const duped_calls = try dupeToolCalls(data_alloc, tool_calls);
@@ -881,6 +902,7 @@ pub const Client = union(enum) {
             return .{
                 .text = text,
                 .tool_calls_made = all_tool_calls.toOwnedSlice(ra) catch &.{},
+                .usage = total_usage,
                 .arena = result_arena,
             };
         }
@@ -888,6 +910,7 @@ pub const Client = union(enum) {
         return .{
             .text = null,
             .tool_calls_made = all_tool_calls.toOwnedSlice(ra) catch &.{},
+            .usage = total_usage,
             .cancelled = cancelled,
             .arena = result_arena,
         };
