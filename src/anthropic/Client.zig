@@ -157,6 +157,12 @@ pub fn createMessage(
         .tools = config.tools,
         .tool_choice = config.tool_choice,
         .thinking = config.thinking,
+        // Apply an ephemeral cache_control marker to the last cacheable block
+        // (default 5-minute TTL). For agent loops this caches the system
+        // prompt + tool definitions across turns, dropping repeated-prefix
+        // input cost to ~$0.30/M (10× discount). Setting this top-level field
+        // is server-side automatic and harmless when the prefix is short.
+        .cache_control = .{},
     }, MessageResponse);
 }
 
@@ -211,6 +217,8 @@ pub fn createMessageStream(
         .tools = config.tools,
         .tool_choice = config.tool_choice,
         .thinking = config.thinking,
+        // See createMessage above for cache_control rationale.
+        .cache_control = .{},
     };
     var payload_buf: std.Io.Writer.Allocating = .init(self.allocator);
     defer payload_buf.deinit();
