@@ -390,9 +390,9 @@ pub const EmbedResult = struct {
 /// Use this when you want to swap providers with minimal code changes.
 /// For provider-specific features, switch on the union tag directly.
 pub const Client = union(enum) {
+    anthropic: *anthropic_mod,
     gemini: *gemini_mod,
     openai: *openai_mod,
-    anthropic: *anthropic_mod,
     ollama: *openai_mod,
 
     pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError;
@@ -950,10 +950,21 @@ pub const Credentials = struct {
     key: [:0]const u8,
 };
 
-/// Default order for env-driven provider detection. Ollama is excluded —
-/// it has no env key (envApiKey returns a placeholder). Pass an explicit
-/// candidate slice to `detectKeys` to override.
-pub const default_candidates: []const Tag = &.{ .anthropic, .openai, .gemini };
+/// Env-detectable providers, in enum order. Ollama is excluded — it has no env
+/// key (envApiKey returns a placeholder), so it must be selected explicitly.
+/// Pass an explicit candidate slice to `detectKeys` to override.
+pub const default_candidates: []const Tag = blk: {
+    const all = std.enums.values(Tag);
+    var arr: [all.len]Tag = undefined;
+    var n: usize = 0;
+    for (all) |t| {
+        if (t == .ollama) continue;
+        arr[n] = t;
+        n += 1;
+    }
+    const out = arr[0..n].*;
+    break :blk &out;
+};
 
 /// Scan `candidates` and fill `buf` with a `Credentials` entry for each
 /// provider that has a key in env, preserving candidate order. Returns the
