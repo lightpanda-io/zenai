@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = @import("json.zig");
+const retry = @import("retry.zig");
 const gemini_mod = @import("gemini/Client.zig");
 const openai_mod = @import("openai/Client.zig");
 const anthropic_mod = @import("anthropic/Client.zig");
@@ -402,6 +403,43 @@ pub const Client = union(enum) {
         return switch (self) {
             inline else => |c| c.allocator,
         };
+    }
+
+    pub const InitOptions = struct {
+        /// Overrides the provider's default base URL. Ollama falls back to
+        /// `ollama_default_base_url` when null; the others use their own.
+        base_url: ?[:0]const u8 = null,
+        retry_policy: retry.RetryPolicy = .{},
+    };
+
+    /// Construct the per-provider client for `credentials`; the caller owns it
+    /// and must release it with `deinit`.
+    pub fn init(allocator: std.mem.Allocator, credentials: Credentials, options: InitOptions) !Client {
+        return switch (credentials.provider) {
+            inline else => |tag| blk: {
+                const ClientPtr = @FieldType(Client, @tagName(tag));
+                const Impl = @typeInfo(ClientPtr).pointer.child;
+                const client = try allocator.create(Impl);
+                errdefer allocator.destroy(client);
+                const base_url: ?[:0]const u8 = options.base_url orelse
+                    if (tag == .ollama) ollama_default_base_url else null;
+                client.* = Impl.init(allocator, credentials.key, if (base_url) |u|
+                    .{ .base_url = u, .retry_policy = options.retry_policy }
+                else
+                    .{ .retry_policy = options.retry_policy });
+                break :blk @unionInit(Client, @tagName(tag), client);
+            },
+        };
+    }
+
+    /// Free the per-provider client allocated by `init`.
+    pub fn deinit(self: Client, allocator: std.mem.Allocator) void {
+        switch (self) {
+            inline else => |client| {
+                client.deinit();
+                allocator.destroy(client);
+            },
+        }
     }
 
     /// Generate content from a list of messages.
@@ -943,6 +981,19 @@ pub fn envVarName(tag: Tag) []const u8 {
     };
 }
 
+/// OpenAI-compatible endpoint a local Ollama serves by default.
+pub const ollama_default_base_url = "http://localhost:11434/v1";
+
+/// Recommended default chat model for `tag` when the user hasn't picked one.
+pub fn defaultModel(tag: Tag) []const u8 {
+    return switch (tag) {
+        .anthropic => "claude-sonnet-4-6",
+        .openai => "gpt-5.5",
+        .gemini => "gemini-3.5-flash",
+        .ollama => "gemma4",
+    };
+}
+
 /// A provider tag paired with the env-resolved key that authenticates it.
 /// The two travel together: a tag is only meaningful with its key.
 pub const Credentials = struct {
@@ -1014,7 +1065,7 @@ pub fn listChatModelIds(
             const opts: openai_mod.InitOptions = if (base_url_override) |u|
                 .{ .base_url = u }
             else
-                .{ .base_url = "http://localhost:11434/v1" };
+                .{ .base_url = ollama_default_base_url };
             var client = openai_mod.init(allocator, api_key, opts);
             defer client.deinit();
             var resp = try client.listModels();
