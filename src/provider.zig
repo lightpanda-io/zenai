@@ -990,7 +990,7 @@ pub fn defaultModel(tag: Tag) []const u8 {
         .anthropic => "claude-sonnet-4-6",
         .openai => "gpt-5.5",
         .gemini => "gemini-3.5-flash",
-        .ollama => "gemma4",
+        .ollama => "qwen3.5:9b",
     };
 }
 
