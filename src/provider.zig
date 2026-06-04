@@ -1183,7 +1183,13 @@ pub fn listChatModelIds(
         },
     }
 
-    return ids.toOwnedSlice(arena);
+    const result = try ids.toOwnedSlice(arena);
+    std.mem.sort([]const u8, result, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    return result;
 }
 
 test "envApiKey: ollama returns placeholder regardless of env" {
