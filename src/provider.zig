@@ -1,6 +1,7 @@
 const std = @import("std");
 const json = @import("json.zig");
 const retry = @import("retry.zig");
+const http = @import("http.zig");
 const gemini_mod = @import("gemini/Client.zig");
 const openai_mod = @import("openai/Client.zig");
 const anthropic_mod = @import("anthropic/Client.zig");
@@ -439,6 +440,14 @@ pub const Client = union(enum) {
                 client.deinit();
                 allocator.destroy(client);
             },
+        }
+    }
+
+    /// Install a cross-thread interrupt so a SIGINT can abort an in-flight
+    /// request mid-read instead of waiting for the model's full response.
+    pub fn setInterrupt(self: Client, it: *http.Interrupt) void {
+        switch (self) {
+            inline else => |client| client.interrupt = it,
         }
     }
 

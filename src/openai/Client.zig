@@ -24,6 +24,8 @@ retry_policy: RetryPolicy,
 /// The most recent API error detail, if any. Set on `error.ApiError`.
 last_error: ?types.ApiErrorDetail = null,
 last_error_status: ?u10 = null,
+/// Set by the host so a SIGINT can abort an in-flight request mid-read.
+interrupt: ?*http.Interrupt = null,
 
 /// Options for customizing the API endpoint.
 pub const InitOptions = struct {
@@ -235,6 +237,12 @@ pub fn chatCompletionStream(
     });
     defer req.deinit();
 
+    // Let a SIGINT abort the blocking SSE read; poison the connection on any
+    // failed/aborted exchange so it isn't pooled with unknown framing.
+    var guard = http.armInterrupt(self.interrupt, &req);
+    defer guard.deinit();
+    errdefer guard.poison();
+
     req.transfer_encoding = .{ .content_length = payload.len };
     var bw = try req.sendBodyUnflushed(&.{});
     try bw.writer.writeAll(payload);
@@ -257,7 +265,10 @@ pub fn chatCompletionStream(
     while (true) {
         const line = reader.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => return error.InvalidSseData,
-            error.ReadFailed => return,
+            error.ReadFailed => {
+                guard.poison();
+                return;
+            },
         } orelse return;
 
         const trimmed = std.mem.trimRight(u8, line, "\r");
