@@ -8,6 +8,7 @@ const anthropic_mod = @import("anthropic/Client.zig");
 const gemini_types = @import("gemini/types.zig");
 const openai_types = @import("openai/types.zig");
 const anthropic_types = @import("anthropic/types.zig");
+const ollama_native = @import("openai/ollama.zig");
 
 // --- Types ---
 
@@ -563,47 +564,61 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
+            // Native `/api/chat` so `num_ctx` can be sized — see `openai/ollama.zig`.
             .ollama => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
 
-                const oai_messages = try messagesToOpenAIMessages(req_alloc, messages);
-                const tools = if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
+                const native_messages = try messagesToOllamaMessages(req_alloc, messages);
+                // Native `/api/chat` has no tool_choice; honor `.none` by
+                // withholding the tools entirely (the only enforceable case).
+                const suppress_tools = if (config.tool_choice) |tc| tc == .none else false;
+                const tools = if (!suppress_tools) blk: {
+                    break :blk if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
+                } else null;
 
-                var response = try o.chatCompletion(model, oai_messages, mapOpenAICompletionConfig(config, tools));
+                const format: ?[]const u8 = if (config.response_format) |rf|
+                    (if (rf == .json) "json" else null)
+                else
+                    null;
+
+                var response = try ollama_native.chat(o, model, native_messages, tools, mapOllamaThink(config.thinking_level), format, .{
+                    .num_predict = config.max_tokens,
+                    .temperature = config.temperature,
+                    .top_p = config.top_p,
+                    .seed = config.seed,
+                    .stop = config.stop,
+                    .frequency_penalty = config.frequency_penalty,
+                    .presence_penalty = config.presence_penalty,
+                });
                 defer response.deinit();
 
                 var result = GenerateResult.init(o.allocator);
                 errdefer result.deinit();
-                if (response.value.text()) |t| {
-                    result.text = try result.arena.allocator().dupe(u8, t);
-                }
-                result.finish_reason = mapOpenAIFinishReason(response.value);
-                result.usage = mapOpenAIUsage(response.value);
+                const ra = result.arena.allocator();
 
-                if (response.value.choices) |choices| {
-                    if (choices.len > 0) {
-                        if (choices[0].message) |msg| {
-                            if (msg.tool_calls) |calls| {
-                                var tool_calls: std.ArrayList(ToolCall) = .empty;
-                                for (calls) |call| {
-                                    if (call.function) |f| {
-                                        const args_val: ?std.json.Value = if (f.arguments) |a|
-                                            (std.json.parseFromSliceLeaky(std.json.Value, result.arena.allocator(), a, .{}) catch null)
-                                        else
-                                            null;
-                                        try tool_calls.append(result.arena.allocator(), .{
-                                            .id = if (call.id) |id| try result.arena.allocator().dupe(u8, id) else "",
-                                            .name = if (f.name) |n| try result.arena.allocator().dupe(u8, n) else "",
-                                            .arguments = args_val,
-                                        });
-                                    }
-                                }
-                                if (tool_calls.items.len > 0) {
-                                    result.tool_calls = try tool_calls.toOwnedSlice(result.arena.allocator());
-                                }
+                result.finish_reason = mapOllamaFinishReason(response.value);
+                result.usage = mapOllamaUsage(response.value);
+
+                if (response.value.message) |msg| {
+                    if (msg.content) |c| {
+                        if (c.len > 0) result.text = try ra.dupe(u8, c);
+                    }
+                    if (msg.tool_calls) |calls| {
+                        var tool_calls: std.ArrayList(ToolCall) = .empty;
+                        for (calls) |call| {
+                            if (call.function) |f| {
+                                try tool_calls.append(ra, .{
+                                    .id = if (call.id) |id| try ra.dupe(u8, id) else "",
+                                    .name = if (f.name) |n| try ra.dupe(u8, n) else "",
+                                    // Dupe args (an object) into the result arena.
+                                    .arguments = if (f.arguments) |v| try json.dupeValue(ra, v) else null,
+                                });
                             }
+                        }
+                        if (tool_calls.items.len > 0) {
+                            result.tool_calls = try tool_calls.toOwnedSlice(ra);
                         }
                     }
                 }
@@ -709,7 +724,7 @@ pub const Client = union(enum) {
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
                 }, .{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Wrapper.wrap);
             },
-            .openai, .ollama => |o| {
+            .openai => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
@@ -729,6 +744,16 @@ pub const Client = union(enum) {
                 };
 
                 try o.chatCompletionStream(model, oai_messages, mapOpenAICompletionConfig(config, tools), .{ .user_ctx = context, .user_cb = callback, .alloc = o.allocator }, &Wrapper.wrap);
+            },
+            // The native chat (which sets `num_ctx`) is non-streaming, so emit
+            // the full result in one callback rather than truncate via `/v1` SSE.
+            .ollama => {
+                var result = self.generateContent(model, messages, config) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.ApiError,
+                };
+                defer result.deinit();
+                callback(context, result);
             },
             .anthropic => |a| {
                 var req_arena = std.heap.ArenaAllocator.init(a.allocator);
@@ -1271,6 +1296,16 @@ fn separateSystemMessages(allocator: std.mem.Allocator, messages: []const Messag
     return .{ .contents = contents, .system_text = system_text };
 }
 
+/// First text part of a message, or its plain `content` when it has no parts.
+fn messageText(msg: Message) ?[]const u8 {
+    const parts = msg.parts orelse return msg.content;
+    for (parts) |cp| switch (cp) {
+        .text => |t| return t,
+        .image => {},
+    };
+    return null;
+}
+
 fn messagesToOpenAIMessages(allocator: std.mem.Allocator, messages: []const Message) ![]openai_types.Message {
     var out: std.ArrayList(openai_types.Message) = .empty;
 
@@ -1313,16 +1348,6 @@ fn messagesToOpenAIMessages(allocator: std.mem.Allocator, messages: []const Mess
             oai_tool_calls = oai_calls;
         }
 
-        const text_content: ?[]const u8 = if (msg.parts) |content_parts| blk: {
-            for (content_parts) |cp| {
-                switch (cp) {
-                    .text => |t| break :blk t,
-                    .image => {},
-                }
-            }
-            break :blk null;
-        } else msg.content;
-
         try out.append(allocator, .{
             .role = switch (msg.role) {
                 .system => .system,
@@ -1330,8 +1355,58 @@ fn messagesToOpenAIMessages(allocator: std.mem.Allocator, messages: []const Mess
                 .assistant => .assistant,
                 .tool => unreachable,
             },
-            .content = text_content,
+            .content = messageText(msg),
             .tool_calls = oai_tool_calls,
+        });
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Like `messagesToOpenAIMessages`, but keeps tool-call arguments as objects
+/// (not stringified) and answers tool results with `tool_name` (Ollama matches
+/// by name, not id).
+fn messagesToOllamaMessages(allocator: std.mem.Allocator, messages: []const Message) ![]ollama_native.Message {
+    var out: std.ArrayList(ollama_native.Message) = .empty;
+
+    for (messages) |msg| {
+        if (msg.role == .tool) {
+            if (msg.tool_results) |results| {
+                for (results) |res| {
+                    try out.append(allocator, .{
+                        .role = "tool",
+                        .content = res.content,
+                        .tool_name = res.name,
+                    });
+                }
+            } else {
+                try out.append(allocator, .{ .role = "tool", .content = msg.content });
+            }
+            continue;
+        }
+
+        var native_tool_calls: ?[]const ollama_native.ToolCall = null;
+        if (msg.tool_calls) |calls| {
+            const arr = try allocator.alloc(ollama_native.ToolCall, calls.len);
+            for (calls, 0..) |call, i| {
+                arr[i] = .{
+                    .id = if (call.id.len > 0) call.id else null,
+                    .type = "function",
+                    .function = .{ .name = call.name, .arguments = call.arguments },
+                };
+            }
+            native_tool_calls = arr;
+        }
+
+        try out.append(allocator, .{
+            .role = switch (msg.role) {
+                .system => "system",
+                .user => "user",
+                .assistant => "assistant",
+                .tool => unreachable,
+            },
+            .content = messageText(msg),
+            .tool_calls = native_tool_calls,
         });
     }
 
@@ -1675,6 +1750,39 @@ fn mapOpenAIUsage(response: openai_types.ChatCompletionResponse) Usage {
         .completion_tokens = usage.completion_tokens,
         .total_tokens = usage.total_tokens,
         .cached_tokens = if (usage.prompt_tokens_details) |d| d.cached_tokens else null,
+    };
+}
+
+/// Ollama's native `think` is a boolean toggle; map any requested level to on,
+/// `.none` to an explicit off, and an unset level to the model default (null).
+fn mapOllamaThink(level: ?ThinkingLevel) ?bool {
+    const l = level orelse return null;
+    return l != .none;
+}
+
+fn mapOllamaFinishReason(response: ollama_native.ChatResponse) FinishReason {
+    // A tool call wins over done_reason ("stop").
+    if (response.message) |m| {
+        if (m.tool_calls) |tc| {
+            if (tc.len > 0) return .tool_call;
+        }
+    }
+    const reason = response.done_reason orelse return .unknown;
+    if (std.mem.eql(u8, reason, "stop")) return .stop;
+    if (std.mem.eql(u8, reason, "length")) return .max_tokens;
+    return .unknown;
+}
+
+fn mapOllamaUsage(response: ollama_native.ChatResponse) Usage {
+    const prompt = response.prompt_eval_count;
+    const completion = response.eval_count;
+    return .{
+        .prompt_tokens = prompt,
+        .completion_tokens = completion,
+        .total_tokens = if (prompt != null or completion != null)
+            (prompt orelse 0) + (completion orelse 0)
+        else
+            null,
     };
 }
 

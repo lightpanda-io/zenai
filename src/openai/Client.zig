@@ -30,6 +30,10 @@ last_error_status: ?u10 = null,
 interrupt: ?*http.Interrupt = null,
 /// Cached `Bearer <api_key>` header value, built on first request.
 authorization: ?[]const u8 = null,
+/// Per-model cache of the Ollama context window (see `ollama.zig`), so the
+/// `/api/show` lookup runs once per model. `model` is owned by `allocator`;
+/// `len` is null when the lookup missed (cached so it isn't retried).
+ollama_ctx: ?struct { model: []const u8, len: ?i32 } = null,
 
 /// Options for customizing the API endpoint.
 pub const InitOptions = struct {
@@ -62,6 +66,7 @@ pub fn init(allocator: std.mem.Allocator, api_key: []const u8, options: InitOpti
 /// Release all resources held by the client, including HTTP connections.
 pub fn deinit(self: *Client) void {
     if (self.authorization) |a| self.allocator.free(a);
+    if (self.ollama_ctx) |c| self.allocator.free(c.model);
     self.http_client.deinit();
 }
 

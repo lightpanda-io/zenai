@@ -8,6 +8,8 @@ pub const openai = struct {
     pub const Client = @import("openai/Client.zig");
     pub const Chat = @import("openai/Chat.zig");
     pub const types = @import("openai/types.zig");
+    /// Native Ollama `/api/chat` (so `num_ctx` can be set).
+    pub const ollama = @import("openai/ollama.zig");
 };
 
 pub const anthropic = struct {
@@ -40,6 +42,7 @@ test {
     _ = openai.Client;
     _ = openai.Chat;
     _ = openai.types;
+    _ = openai.ollama;
     _ = anthropic.Client;
     _ = anthropic.Chat;
     _ = anthropic.types;
