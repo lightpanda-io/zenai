@@ -231,6 +231,125 @@ pub const ChatCompletionResponse = struct {
     }
 };
 
+// --- Responses API ---
+//
+// The Responses endpoint (`POST /responses`) is OpenAI's successor to chat
+// completions. gpt-5.x rejects function tools combined with reasoning on
+// `/chat/completions` and requires this endpoint instead. The conversation is
+// a flat list of typed `input` items rather than role-tagged messages, and the
+// model replies with a list of typed `output` items.
+
+/// A function tool exposed to the model. Flat shape — unlike chat completions,
+/// the function fields are not nested under a `function` object.
+pub const ResponseTool = struct {
+    type: []const u8 = "function",
+    name: []const u8,
+    description: ?[]const u8 = null,
+    parameters: ?std.json.Value = null,
+    strict: ?bool = null,
+};
+
+/// Reasoning controls for reasoning-capable models.
+pub const ResponseReasoning = struct {
+    effort: ReasoningEffort,
+};
+
+/// One item in the request `input` list. The `type` selects which fields are
+/// meaningful: a `message` carries `role`/`content`; a `function_call` carries
+/// `call_id`/`name`/`arguments`; a `function_call_output` carries
+/// `call_id`/`output`.
+pub const ResponseInputItem = struct {
+    type: []const u8,
+    role: ?[]const u8 = null,
+    content: ?[]const u8 = null,
+    call_id: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    arguments: ?[]const u8 = null,
+    output: ?[]const u8 = null,
+};
+
+/// Request body for the responses endpoint.
+pub const ResponsesRequest = struct {
+    model: []const u8,
+    input: []const ResponseInputItem,
+    tools: ?[]const ResponseTool = null,
+    tool_choice: ?[]const u8 = null,
+    reasoning: ?ResponseReasoning = null,
+    max_output_tokens: ?i32 = null,
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    stream: ?bool = null,
+};
+
+/// A content block within an output `message` item. `output_text` blocks carry
+/// the visible answer in `text`.
+pub const ResponseOutputContent = struct {
+    type: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+};
+
+/// One item in the response `output` list. `reasoning` items are summaries we
+/// ignore; `message` items carry `content`; `function_call` items carry a tool
+/// call to dispatch.
+pub const ResponseOutputItem = struct {
+    type: ?[]const u8 = null,
+    id: ?[]const u8 = null,
+    role: ?[]const u8 = null,
+    content: ?[]const ResponseOutputContent = null,
+    call_id: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    arguments: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+};
+
+pub const ResponseInputTokensDetails = struct {
+    cached_tokens: ?i32 = null,
+};
+
+pub const ResponseOutputTokensDetails = struct {
+    reasoning_tokens: ?i32 = null,
+};
+
+/// Token usage for the responses endpoint. Field names differ from chat
+/// completions (`input_tokens`/`output_tokens` rather than
+/// `prompt_tokens`/`completion_tokens`).
+pub const ResponsesUsage = struct {
+    input_tokens: ?i32 = null,
+    output_tokens: ?i32 = null,
+    total_tokens: ?i32 = null,
+    input_tokens_details: ?ResponseInputTokensDetails = null,
+    output_tokens_details: ?ResponseOutputTokensDetails = null,
+};
+
+/// Why a response stopped short of completion. `reason` is `max_output_tokens`
+/// or `content_filter`.
+pub const IncompleteDetails = struct {
+    reason: ?[]const u8 = null,
+};
+
+/// Response from the responses endpoint.
+pub const ResponsesResponse = struct {
+    id: ?[]const u8 = null,
+    object: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+    output: ?[]const ResponseOutputItem = null,
+    usage: ?ResponsesUsage = null,
+    incomplete_details: ?IncompleteDetails = null,
+
+    /// First `output_text` across the output items, or null if the model
+    /// returned only tool calls / reasoning.
+    pub fn text(self: ResponsesResponse) ?[]const u8 {
+        const items = self.output orelse return null;
+        for (items) |item| {
+            const t = item.type orelse continue;
+            if (!std.mem.eql(u8, t, "message")) continue;
+            const content = item.content orelse continue;
+            for (content) |c| if (c.text) |txt| return txt;
+        }
+        return null;
+    }
+};
+
 // --- Embeddings ---
 
 /// Request body for the embeddings endpoint.
@@ -376,6 +495,45 @@ test "FinishReason parses from JSON" {
     );
     defer parsed.deinit();
     try std.testing.expect(parsed.value.choices.?[0].finish_reason.? == .length);
+}
+
+test "ResponsesResponse extracts text and tool calls" {
+    const json =
+        \\{"id":"resp_1","status":"completed","output":[{"type":"reasoning","id":"rs_1","summary":[]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"goto","arguments":"{\"url\":\"https://news.ycombinator.com\"}"},{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Done."}]}],"usage":{"input_tokens":42,"output_tokens":7,"total_tokens":49,"input_tokens_details":{"cached_tokens":10}}}
+    ;
+    const parsed = try std.json.parseFromSlice(
+        ResponsesResponse,
+        std.testing.allocator,
+        json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("Done.", parsed.value.text().?);
+    const items = parsed.value.output.?;
+    try std.testing.expectEqualStrings("function_call", items[1].type.?);
+    try std.testing.expectEqualStrings("call_1", items[1].call_id.?);
+    try std.testing.expectEqualStrings("goto", items[1].name.?);
+    try std.testing.expectEqual(@as(i32, 10), parsed.value.usage.?.input_tokens_details.?.cached_tokens.?);
+}
+
+test "ResponsesRequest serializes flat tools and reasoning" {
+    const input = [_]ResponseInputItem{.{ .type = "message", .role = "user", .content = "hi" }};
+    const tools = [_]ResponseTool{.{ .name = "goto", .description = "navigate" }};
+    const req = ResponsesRequest{
+        .model = "gpt-5.5",
+        .input = &input,
+        .tools = &tools,
+        .reasoning = .{ .effort = .medium },
+        .max_output_tokens = 4096,
+    };
+    var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buf.deinit();
+    try std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &buf.writer);
+    const json = buf.written();
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"max_output_tokens\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"effort\":\"medium\"") != null);
+    // Flat function tool: name is a sibling of type, not nested under "function".
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function\",\"name\":\"goto\"") != null);
 }
 
 test "Role serializes correctly" {

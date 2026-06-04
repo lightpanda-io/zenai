@@ -8,6 +8,8 @@ pub const RetryPolicy = retry.RetryPolicy;
 const Message = types.Message;
 const ChatCompletionRequest = types.ChatCompletionRequest;
 const ChatCompletionResponse = types.ChatCompletionResponse;
+const ResponsesRequest = types.ResponsesRequest;
+const ResponsesResponse = types.ResponsesResponse;
 
 /// OpenAI API client. Provides access to chat completions, embeddings,
 /// and model management.
@@ -184,6 +186,19 @@ pub fn chatCompletionFromText(
 ) ApiError!Response(ChatCompletionResponse) {
     const messages = [_]Message{.{ .role = .user, .content = prompt }};
     return self.chatCompletion(model, &messages, config);
+}
+
+// --- Responses ---
+
+/// Create a model response via the Responses API (`POST /responses`).
+/// Required over `chatCompletion` for gpt-5.x, which rejects function tools
+/// combined with reasoning on the chat completions endpoint.
+pub fn createResponse(self: *Client, request: ResponsesRequest) ApiError!Response(ResponsesResponse) {
+    if (self.api_key.len == 0) return error.MissingApiKey;
+    const url = try std.fmt.allocPrint(self.allocator, "{s}/responses", .{self.base_url});
+    defer self.allocator.free(url);
+
+    return self.fetchPost(url, request, ResponsesResponse);
 }
 
 // --- Streaming ---

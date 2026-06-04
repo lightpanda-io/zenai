@@ -510,7 +510,60 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
-            .openai, .ollama => |o| {
+            .openai => |o| {
+                var req_arena = std.heap.ArenaAllocator.init(o.allocator);
+                defer req_arena.deinit();
+                const req_alloc = req_arena.allocator();
+
+                const input = try messagesToOpenAIResponsesInput(req_alloc, messages);
+                const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
+
+                var response = try o.createResponse(.{
+                    .model = model,
+                    .input = input,
+                    .tools = tools,
+                    .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
+                    .reasoning = if (config.thinking_level) |tl|
+                        .{ .effort = mapThinkingLevelToOpenAI(tl) }
+                    else
+                        null,
+                    .max_output_tokens = config.max_tokens,
+                    .temperature = config.temperature,
+                });
+                defer response.deinit();
+
+                var result = GenerateResult.init(o.allocator);
+                errdefer result.deinit();
+                const ga = result.arena.allocator();
+
+                if (response.value.text()) |t| {
+                    result.text = try ga.dupe(u8, t);
+                }
+                result.finish_reason = mapOpenAIResponsesFinishReason(response.value);
+                result.usage = mapOpenAIResponsesUsage(response.value);
+
+                if (response.value.output) |items| {
+                    var tool_calls: std.ArrayList(ToolCall) = .empty;
+                    for (items) |item| {
+                        const item_type = item.type orelse continue;
+                        if (!std.mem.eql(u8, item_type, "function_call")) continue;
+                        const args_val: ?std.json.Value = if (item.arguments) |a|
+                            (std.json.parseFromSliceLeaky(std.json.Value, ga, a, .{}) catch null)
+                        else
+                            null;
+                        try tool_calls.append(ga, .{
+                            .id = if (item.call_id) |id| try ga.dupe(u8, id) else "",
+                            .name = if (item.name) |n| try ga.dupe(u8, n) else "",
+                            .arguments = args_val,
+                        });
+                    }
+                    if (tool_calls.items.len > 0) {
+                        result.tool_calls = try tool_calls.toOwnedSlice(ga);
+                    }
+                }
+                return result;
+            },
+            .ollama => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
@@ -1348,6 +1401,106 @@ fn mapOpenAITools(allocator: std.mem.Allocator, tools: []const Tool) ![]openai_t
     return out;
 }
 
+/// Flatten the normalized conversation into Responses-API `input` items: each
+/// assistant tool call becomes a `function_call` item and each tool result a
+/// `function_call_output` item, rather than the role-tagged messages chat
+/// completions uses.
+fn messagesToOpenAIResponsesInput(allocator: std.mem.Allocator, messages: []const Message) ![]openai_types.ResponseInputItem {
+    var out: std.ArrayList(openai_types.ResponseInputItem) = .empty;
+
+    for (messages) |msg| {
+        if (msg.role == .tool) {
+            if (msg.tool_results) |results| {
+                for (results) |res| {
+                    try out.append(allocator, .{
+                        .type = "function_call_output",
+                        .call_id = res.id,
+                        .output = res.content,
+                    });
+                }
+            }
+            continue;
+        }
+
+        const text_content: ?[]const u8 = if (msg.parts) |content_parts| blk: {
+            for (content_parts) |cp| switch (cp) {
+                .text => |t| break :blk t,
+                .image => {},
+            };
+            break :blk null;
+        } else msg.content;
+
+        if (text_content) |c| {
+            try out.append(allocator, .{
+                .type = "message",
+                .role = switch (msg.role) {
+                    .system => "system",
+                    .user => "user",
+                    .assistant => "assistant",
+                    .tool => unreachable,
+                },
+                .content = c,
+            });
+        }
+
+        if (msg.tool_calls) |calls| {
+            for (calls) |call| {
+                // Responses requires a valid JSON string; a no-arg call sends `{}`.
+                const args_str: []const u8 = if (call.arguments) |v|
+                    try json.valueToString(allocator, v)
+                else
+                    "{}";
+                try out.append(allocator, .{
+                    .type = "function_call",
+                    .call_id = call.id,
+                    .name = call.name,
+                    .arguments = args_str,
+                });
+            }
+        }
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn mapOpenAIResponsesTools(allocator: std.mem.Allocator, tools: []const Tool) ![]openai_types.ResponseTool {
+    const out = try allocator.alloc(openai_types.ResponseTool, tools.len);
+    for (tools, 0..) |t, i| {
+        out[i] = .{
+            .name = t.name,
+            .description = t.description,
+            .parameters = t.parameters,
+        };
+    }
+    return out;
+}
+
+fn mapOpenAIResponsesFinishReason(response: openai_types.ResponsesResponse) FinishReason {
+    if (response.output) |items| {
+        for (items) |item| {
+            const t = item.type orelse continue;
+            if (std.mem.eql(u8, t, "function_call")) return .tool_call;
+        }
+    }
+    if (response.incomplete_details) |d| {
+        if (d.reason) |r| {
+            if (std.mem.eql(u8, r, "max_output_tokens")) return .max_tokens;
+            if (std.mem.eql(u8, r, "content_filter")) return .safety;
+        }
+    }
+    return .stop;
+}
+
+fn mapOpenAIResponsesUsage(response: openai_types.ResponsesResponse) Usage {
+    const usage = response.usage orelse return .{};
+    return .{
+        .prompt_tokens = usage.input_tokens,
+        .completion_tokens = usage.output_tokens,
+        .total_tokens = usage.total_tokens,
+        .cached_tokens = if (usage.input_tokens_details) |d| d.cached_tokens else null,
+    };
+}
+
 fn mapAnthropicTools(allocator: std.mem.Allocator, tools: []const Tool) ![]anthropic_types.Tool {
     const out = try allocator.alloc(anthropic_types.Tool, tools.len);
     for (tools, 0..) |t, i| {
@@ -1650,7 +1803,7 @@ fn mapThinkingLevelToAnthropic(level: ThinkingLevel) ?anthropic_types.ThinkingCo
     };
 }
 
-fn mapThinkingLevelToOpenAI(level: ThinkingLevel) ?openai_types.ReasoningEffort {
+fn mapThinkingLevelToOpenAI(level: ThinkingLevel) openai_types.ReasoningEffort {
     return switch (level) {
         .none => .none,
         .minimal => .minimal,
