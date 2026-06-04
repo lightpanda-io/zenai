@@ -102,8 +102,9 @@ pub const ChatCompletionRequest = struct {
     messages: []const Message,
     /// Sampling temperature (0.0-2.0).
     temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
-    max_tokens: ?i32 = null,
+    /// Upper bound on generated tokens (visible output + reasoning). Replaces
+    /// the deprecated `max_tokens`, which o-series and gpt-5 models reject.
+    max_completion_tokens: ?i32 = null,
     /// Nucleus sampling threshold (0.0-1.0).
     top_p: ?f32 = null,
     /// Frequency penalty (-2.0 to 2.0).
