@@ -322,12 +322,17 @@ pub const FinishReason = enum {
 
 /// Token usage statistics.
 pub const Usage = struct {
+    /// Fresh (cache-excluded) input tokens, billed at full price. The mappers
+    /// normalize every provider to this meaning: Anthropic already reports it
+    /// (input_tokens excludes cache), while OpenAI and Gemini fold the cached
+    /// subset into their prompt count, so `freshPrompt` subtracts it out.
     prompt_tokens: ?i32 = null,
     completion_tokens: ?i32 = null,
     total_tokens: ?i32 = null,
     /// Prompt tokens served from a cache (Anthropic: cache_read_input_tokens;
     /// OpenAI: prompt_tokens_details.cached_tokens; Gemini:
-    /// cachedContentTokenCount). Billed at the provider's cached rate.
+    /// cachedContentTokenCount). Billed at the provider's cached rate, and
+    /// disjoint from `prompt_tokens` (see above).
     cached_tokens: ?i32 = null,
     /// Tokens written to a fresh cache entry. Anthropic-specific
     /// (cache_creation_input_tokens). OpenAI and Gemini bill cache creation
@@ -345,7 +350,32 @@ pub const Usage = struct {
         self.cached_tokens = addOpt(self.cached_tokens, other.cached_tokens);
         self.cache_creation_tokens = addOpt(self.cache_creation_tokens, other.cache_creation_tokens);
     }
+
+    /// Total input tokens billed: the three disjoint buckets summed — fresh
+    /// (`prompt_tokens`) + cache reads (`cached_tokens`) + cache writes
+    /// (`cache_creation_tokens`).
+    pub fn inputTokens(self: Usage) i32 {
+        return (self.prompt_tokens orelse 0) +
+            (self.cached_tokens orelse 0) +
+            (self.cache_creation_tokens orelse 0);
+    }
+
+    /// Percentage of input tokens served from cache, 0 when there was no input.
+    /// Widened to i64 for the multiply since input can exceed i32 max / 100.
+    pub fn cacheHitPercent(self: Usage) i32 {
+        const input = self.inputTokens();
+        if (input == 0) return 0;
+        return @intCast(@divTrunc(@as(i64, self.cached_tokens orelse 0) * 100, input));
+    }
 };
+
+/// OpenAI and Gemini report `prompt` as the full input with `cached` as a
+/// subset of it; subtract so `Usage.prompt_tokens` means fresh input on every
+/// provider (Anthropic already excludes cache from its prompt count).
+fn freshPrompt(prompt: ?i32, cached: ?i32) ?i32 {
+    const p = prompt orelse return null;
+    return p - (cached orelse 0);
+}
 
 fn addOpt(a: ?i32, b: ?i32) ?i32 {
     if (a == null and b == null) return null;
@@ -1574,11 +1604,12 @@ fn mapOpenAIResponsesFinishReason(response: openai_types.ResponsesResponse) Fini
 
 fn mapOpenAIResponsesUsage(response: openai_types.ResponsesResponse) Usage {
     const usage = response.usage orelse return .{};
+    const cached = if (usage.input_tokens_details) |d| d.cached_tokens else null;
     return .{
-        .prompt_tokens = usage.input_tokens,
+        .prompt_tokens = freshPrompt(usage.input_tokens, cached),
         .completion_tokens = usage.output_tokens,
         .total_tokens = usage.total_tokens,
-        .cached_tokens = if (usage.input_tokens_details) |d| d.cached_tokens else null,
+        .cached_tokens = cached,
     };
 }
 
@@ -1742,7 +1773,7 @@ fn mapOpenAIFinishReason(response: openai_types.ChatCompletionResponse) FinishRe
 fn mapGeminiUsage(response: gemini_types.GenerateContentResponse) Usage {
     const meta = response.usageMetadata orelse return .{};
     return .{
-        .prompt_tokens = meta.promptTokenCount,
+        .prompt_tokens = freshPrompt(meta.promptTokenCount, meta.cachedContentTokenCount),
         .completion_tokens = meta.candidatesTokenCount,
         .total_tokens = meta.totalTokenCount,
         .cached_tokens = meta.cachedContentTokenCount,
@@ -1751,11 +1782,12 @@ fn mapGeminiUsage(response: gemini_types.GenerateContentResponse) Usage {
 
 fn mapOpenAIUsage(response: openai_types.ChatCompletionResponse) Usage {
     const usage = response.usage orelse return .{};
+    const cached = if (usage.prompt_tokens_details) |d| d.cached_tokens else null;
     return .{
-        .prompt_tokens = usage.prompt_tokens,
+        .prompt_tokens = freshPrompt(usage.prompt_tokens, cached),
         .completion_tokens = usage.completion_tokens,
         .total_tokens = usage.total_tokens,
-        .cached_tokens = if (usage.prompt_tokens_details) |d| d.cached_tokens else null,
+        .cached_tokens = cached,
     };
 }
 
