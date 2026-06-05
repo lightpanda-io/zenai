@@ -286,7 +286,7 @@ test "dupeToolResults: preserves is_error flag" {
 }
 
 /// Categorical effort level for model reasoning.
-pub const ThinkingLevel = enum {
+pub const Effort = enum {
     none,
     minimal,
     low,
@@ -308,7 +308,7 @@ pub const GenerationConfig = struct {
     tool_choice: ?ToolChoice = null,
     response_format: ?ResponseFormat = null,
     /// reasoning/thinking effort level.
-    thinking_level: ?ThinkingLevel = null,
+    effort: ?Effort = null,
 };
 
 /// Unified finish reason.
@@ -524,8 +524,8 @@ pub const Client = union(enum) {
                     .input = input,
                     .tools = tools,
                     .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
-                    .reasoning = if (config.thinking_level) |tl|
-                        .{ .effort = mapThinkingLevelToOpenAI(tl) }
+                    .reasoning = if (config.effort) |tl|
+                        .{ .effort = mapEffortToOpenAI(tl) }
                     else
                         null,
                     .max_output_tokens = config.max_tokens,
@@ -583,7 +583,7 @@ pub const Client = union(enum) {
                 else
                     null;
 
-                var response = try ollama_native.chat(o, model, native_messages, tools, mapOllamaThink(config.thinking_level), format, .{
+                var response = try ollama_native.chat(o, model, native_messages, tools, mapOllamaThink(config.effort), format, .{
                     .num_predict = config.max_tokens,
                     .temperature = config.temperature,
                     .top_p = config.top_p,
@@ -638,7 +638,7 @@ pub const Client = union(enum) {
                     null;
 
                 const tools = if (config.tools) |t| try mapAnthropicTools(req_alloc, t) else null;
-                const thinking = if (config.thinking_level) |tl| mapThinkingLevelToAnthropic(tl) else null;
+                const thinking = if (config.effort) |tl| mapEffortToAnthropic(tl) else null;
                 const max_tokens = anthropicMaxTokens(config.max_tokens orelse 4096, thinking);
 
                 var response = try a.createMessage(model, ant_messages, max_tokens, .{
@@ -769,7 +769,7 @@ pub const Client = union(enum) {
                     null;
 
                 const tools = if (config.tools) mapAnthropicTools(req_alloc, config.tools.?) catch return error.OutOfMemory else null;
-                const thinking = if (config.thinking_level) |tl| mapThinkingLevelToAnthropic(tl) else null;
+                const thinking = if (config.effort) |tl| mapEffortToAnthropic(tl) else null;
                 const max_tokens = anthropicMaxTokens(config.max_tokens orelse 4096, thinking);
 
                 const Wrapper = struct {
@@ -869,8 +869,8 @@ pub const Client = union(enum) {
         max_tokens: ?i32 = 4096,
         tool_choice: ?ToolChoice = .auto,
         temperature: ?f32 = null,
-        /// See `GenerationConfig.thinking_level`. Forwarded per-turn.
-        thinking_level: ?ThinkingLevel = null,
+        /// See `GenerationConfig.effort`. Forwarded per-turn.
+        effort: ?Effort = null,
         /// Polled before each turn, between the LLM response and tool
         /// execution, and after each tool call. Returning true stops the
         /// loop with `cancelled = true` in the result. The in-flight LLM
@@ -953,7 +953,7 @@ pub const Client = union(enum) {
                 .max_tokens = config.max_tokens,
                 .tool_choice = config.tool_choice,
                 .temperature = config.temperature,
-                .thinking_level = config.thinking_level,
+                .effort = config.effort,
             });
             defer gen_result.deinit();
             total_usage.add(gen_result.usage);
@@ -1761,7 +1761,7 @@ fn mapOpenAIUsage(response: openai_types.ChatCompletionResponse) Usage {
 
 /// Ollama's native `think` is a boolean toggle; map any requested level to on,
 /// `.none` to an explicit off, and an unset level to the model default (null).
-fn mapOllamaThink(level: ?ThinkingLevel) ?bool {
+fn mapOllamaThink(level: ?Effort) ?bool {
     const l = level orelse return null;
     return l != .none;
 }
@@ -1834,8 +1834,8 @@ fn mapGeminiGenerationConfig(model: []const u8, config: GenerationConfig) gemini
         .presencePenalty = config.presence_penalty,
         .seed = config.seed,
         .responseMimeType = mapResponseFormatToGemini(config.response_format),
-        .thinkingConfig = if (config.thinking_level) |tl|
-            mapThinkingLevelToGeminiConfig(model, tl)
+        .thinkingConfig = if (config.effort) |tl|
+            mapEffortToGeminiConfig(model, tl)
         else
             null,
     };
@@ -1848,14 +1848,14 @@ fn geminiUsesThinkingBudget(model: []const u8) bool {
     return std.mem.indexOf(u8, model, "gemini-2.5") != null;
 }
 
-fn mapThinkingLevelToGeminiConfig(model: []const u8, level: ThinkingLevel) gemini_types.ThinkingConfig {
+fn mapEffortToGeminiConfig(model: []const u8, level: Effort) gemini_types.ThinkingConfig {
     if (geminiUsesThinkingBudget(model)) {
-        return .{ .thinkingBudget = mapThinkingLevelToGeminiBudget(level) };
+        return .{ .thinkingBudget = mapEffortToGeminiBudget(level) };
     }
-    return .{ .thinkingLevel = mapThinkingLevelToGemini(level) };
+    return .{ .thinkingLevel = mapEffortToGemini(level) };
 }
 
-fn mapThinkingLevelToGemini(level: ThinkingLevel) ?gemini_types.ThinkingLevel {
+fn mapEffortToGemini(level: Effort) ?gemini_types.ThinkingLevel {
     return switch (level) {
         .none => null, // Should we disable? Gemini uses ThinkingConfig presence.
         .minimal => .MINIMAL,
@@ -1869,7 +1869,7 @@ fn mapThinkingLevelToGemini(level: ThinkingLevel) ?gemini_types.ThinkingLevel {
 /// Approximate token budgets for the legacy Gemini 2.5 `thinkingBudget` API.
 /// Note: gemini-2.5-pro does not support disabling thinking (min 128 tokens),
 /// so `.none` will fail on that model — accepted tradeoff.
-fn mapThinkingLevelToGeminiBudget(level: ThinkingLevel) i32 {
+fn mapEffortToGeminiBudget(level: Effort) i32 {
     return switch (level) {
         .none => 0,
         .minimal => 512,
@@ -1892,7 +1892,7 @@ fn mapOpenAICompletionConfig(config: GenerationConfig, tools: ?[]const openai_ty
         .tools = tools,
         .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
         .response_format = mapResponseFormatToOpenAI(config.response_format),
-        .reasoning_effort = if (config.thinking_level) |tl| mapThinkingLevelToOpenAI(tl) else null,
+        .reasoning_effort = if (config.effort) |tl| mapEffortToOpenAI(tl) else null,
     };
 }
 
@@ -1906,7 +1906,7 @@ fn anthropicMaxTokens(max_tokens: i32, thinking: ?anthropic_types.ThinkingConfig
     return @max(max_tokens, budget +| 4096);
 }
 
-fn mapThinkingLevelToAnthropic(level: ThinkingLevel) ?anthropic_types.ThinkingConfig {
+fn mapEffortToAnthropic(level: Effort) ?anthropic_types.ThinkingConfig {
     return switch (level) {
         .none => null,
         .minimal => .{ .type = "adaptive" },
@@ -1917,7 +1917,7 @@ fn mapThinkingLevelToAnthropic(level: ThinkingLevel) ?anthropic_types.ThinkingCo
     };
 }
 
-fn mapThinkingLevelToOpenAI(level: ThinkingLevel) openai_types.ReasoningEffort {
+fn mapEffortToOpenAI(level: Effort) openai_types.ReasoningEffort {
     return switch (level) {
         .none => .none,
         .minimal => .minimal,
