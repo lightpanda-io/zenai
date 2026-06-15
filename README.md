@@ -1,6 +1,6 @@
 # zenai
 
-Zig client for AI APIs, supporting [Google Gemini](https://ai.google.dev/gemini-api/docs), [OpenAI](https://platform.openai.com/docs/api-reference), and [Anthropic](https://docs.anthropic.com/en/docs/about-claude/models). Ported from the official [Go Gen AI SDK](https://github.com/googleapis/go-genai), [openai-go](https://github.com/openai/openai-go), and [anthropic-sdk-go](https://github.com/anthropics/anthropic-sdk-go). Also ships an `agent infrastructure` namespace under `zenai.search` — currently [Tavily](https://docs.tavily.com/), with room for sibling providers.
+Zig client for AI APIs, supporting [Google Gemini](https://ai.google.dev/gemini-api/docs), [OpenAI](https://platform.openai.com/docs/api-reference), and [Anthropic](https://docs.anthropic.com/en/docs/about-claude/models). OpenAI-compatible endpoints — [Ollama](https://github.com/ollama/ollama/blob/main/docs/openai.md) and [Hugging Face Inference](https://huggingface.co/docs/inference-providers/index) — are supported through the OpenAI client. Ported from the official [Go Gen AI SDK](https://github.com/googleapis/go-genai), [openai-go](https://github.com/openai/openai-go), and [anthropic-sdk-go](https://github.com/anthropics/anthropic-sdk-go). Also ships an `agent infrastructure` namespace under `zenai.search` — currently [Tavily](https://docs.tavily.com/), with room for sibling providers.
 
 <img width="1024" height="1024" alt="Meditating panda with incense smoke" src="https://github.com/user-attachments/assets/b9c82960-05ec-4aa1-b171-092ee2126551" />
 
@@ -293,6 +293,13 @@ const ai: zenai.provider.Client = .{ .gemini = &gemini_client };
 // Or:
 // var anthropic_client = zenai.anthropic.Client.init(allocator, anthropic_key, .{});
 // const ai: zenai.provider.Client = .{ .anthropic = &anthropic_client };
+
+// Or Hugging Face (OpenAI-compatible). Token comes from HF_TOKEN. Defaults to the
+// serverless router; pass `.base_url` for a dedicated Inference Endpoint:
+// var hf_client = zenai.huggingface.Client.init(allocator, hf_token, .{
+//     .base_url = "https://router.huggingface.co/v1",
+// });
+// const ai: zenai.provider.Client = .{ .huggingface = &hf_client };
 
 var result = try ai.generateContent("gemini-2.5-flash", &.{
     .{ .role = .user, .content = "What is Zig?" },

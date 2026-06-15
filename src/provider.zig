@@ -427,6 +427,7 @@ pub const Client = union(enum) {
     gemini: *gemini_mod,
     openai: *openai_mod,
     ollama: *openai_mod,
+    huggingface: *openai_mod,
 
     pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError;
     pub const StreamError = gemini_mod.StreamError || openai_mod.StreamError || anthropic_mod.StreamError;
@@ -453,8 +454,11 @@ pub const Client = union(enum) {
                 const Impl = @typeInfo(ClientPtr).pointer.child;
                 const client = try allocator.create(Impl);
                 errdefer allocator.destroy(client);
-                const base_url: ?[:0]const u8 = options.base_url orelse
-                    if (tag == .ollama) ollama_default_base_url else null;
+                const base_url: ?[:0]const u8 = options.base_url orelse switch (tag) {
+                    .ollama => ollama_default_base_url,
+                    .huggingface => huggingface_default_base_url,
+                    else => null,
+                };
                 client.* = Impl.init(allocator, credentials.key, if (base_url) |u|
                     .{ .base_url = u, .retry_policy = options.retry_policy }
                 else
@@ -654,6 +658,55 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
+            // Hugging Face speaks OpenAI-compatible Chat Completions, not the
+            // Responses API the `.openai` arm uses — so it gets its own arm.
+            .huggingface => |o| {
+                var req_arena = std.heap.ArenaAllocator.init(o.allocator);
+                defer req_arena.deinit();
+                const req_alloc = req_arena.allocator();
+
+                const oai_messages = try messagesToOpenAIMessages(req_alloc, messages);
+                const tools = if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
+
+                var response = try o.chatCompletion(model, oai_messages, mapOpenAICompletionConfig(config, tools));
+                defer response.deinit();
+
+                var result = GenerateResult.init(o.allocator);
+                errdefer result.deinit();
+                const ga = result.arena.allocator();
+
+                if (response.value.text()) |t| {
+                    if (t.len > 0) result.text = try ga.dupe(u8, t);
+                }
+                result.finish_reason = mapOpenAIFinishReason(response.value);
+                result.usage = mapOpenAIUsage(response.value);
+
+                extract: {
+                    const choices = response.value.choices orelse break :extract;
+                    if (choices.len == 0) break :extract;
+                    const msg = choices[0].message orelse break :extract;
+                    const calls = msg.tool_calls orelse break :extract;
+
+                    var tool_calls: std.ArrayList(ToolCall) = .empty;
+                    for (calls) |call| {
+                        const f = call.function orelse continue;
+                        // Chat Completions returns arguments as a JSON string.
+                        const args_val: ?std.json.Value = if (f.arguments) |a|
+                            (std.json.parseFromSliceLeaky(std.json.Value, ga, a, .{}) catch null)
+                        else
+                            null;
+                        try tool_calls.append(ga, .{
+                            .id = if (call.id) |id| try ga.dupe(u8, id) else "",
+                            .name = if (f.name) |n| try ga.dupe(u8, n) else "",
+                            .arguments = args_val,
+                        });
+                    }
+                    if (tool_calls.items.len > 0) {
+                        result.tool_calls = try tool_calls.toOwnedSlice(ga);
+                    }
+                }
+                return result;
+            },
             .anthropic => |a| {
                 var req_arena = std.heap.ArenaAllocator.init(a.allocator);
                 defer req_arena.deinit();
@@ -754,7 +807,7 @@ pub const Client = union(enum) {
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
                 }, .{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Wrapper.wrap);
             },
-            .openai => |o| {
+            .openai, .huggingface => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
@@ -850,7 +903,7 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
-            .openai, .ollama => |o| {
+            .openai, .ollama, .huggingface => |o| {
                 var response = try o.embedText(model, text);
                 defer response.deinit();
                 var result = EmbedResult.init(o.allocator);
@@ -1088,6 +1141,7 @@ pub fn envApiKey(tag: Tag) ?[:0]const u8 {
         .openai => std.posix.getenv("OPENAI_API_KEY"),
         .gemini => std.posix.getenv("GOOGLE_API_KEY") orelse std.posix.getenv("GEMINI_API_KEY"),
         .ollama => "ollama",
+        .huggingface => std.posix.getenv("HF_TOKEN"),
     };
 }
 
@@ -1099,11 +1153,16 @@ pub fn envVarName(tag: Tag) []const u8 {
         .openai => "OPENAI_API_KEY",
         .gemini => "GOOGLE_API_KEY/GEMINI_API_KEY",
         .ollama => "<ollama>",
+        .huggingface => "HF_TOKEN",
     };
 }
 
 /// OpenAI-compatible endpoint a local Ollama serves by default.
 pub const ollama_default_base_url = "http://localhost:11434/v1";
+
+/// OpenAI-compatible endpoint of the Hugging Face serverless inference router.
+/// Dedicated Inference Endpoints override this via `base_url`.
+pub const huggingface_default_base_url = "https://router.huggingface.co/v1";
 
 /// Recommended default chat model for `tag` when the user hasn't picked one.
 pub fn defaultModel(tag: Tag) []const u8 {
@@ -1112,6 +1171,7 @@ pub fn defaultModel(tag: Tag) []const u8 {
         .openai => "gpt-5.5",
         .gemini => "gemini-3.5-flash",
         .ollama => "qwen3.5:latest",
+        .huggingface => "Qwen/Qwen3.5-122B-A10B",
     };
 }
 
@@ -1124,6 +1184,8 @@ pub const Credentials = struct {
 
 /// Env-detectable providers, in enum order. Ollama is excluded — its `envApiKey`
 /// is a non-null placeholder, so it must be chosen explicitly, not auto-detected.
+/// Hugging Face stays in: like the other cloud providers it needs a real token
+/// (`HF_TOKEN`), so a set key is a genuine signal of intent.
 pub const default_candidates: []const Tag = blk: {
     const all = std.enums.values(Tag);
     var arr: [all.len]Tag = undefined;
@@ -1147,6 +1209,25 @@ pub fn detectKeys(buf: []Credentials, candidates: []const Tag) []Credentials {
         n += 1;
     };
     return buf[0..n];
+}
+
+/// Append every model ID served by an OpenAI-compatible endpoint at `base_url`
+/// to `ids`. No `isChatModel` filtering — local/HF catalogs don't follow the
+/// OpenAI naming convention it expects.
+fn listOpenAICompatibleModelIds(
+    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    ids: *std.ArrayList([]const u8),
+    api_key: [:0]const u8,
+    base_url: [:0]const u8,
+) !void {
+    var client = openai_mod.init(allocator, api_key, .{ .base_url = base_url });
+    defer client.deinit();
+    var resp = try client.listModels();
+    defer resp.deinit();
+    for (resp.value.data orelse &.{}) |m| {
+        if (m.id) |id| try ids.append(arena, try arena.dupe(u8, id));
+    }
 }
 
 /// Fetch chat-capable model IDs for `tag`, allocated in `arena`. Ordering
@@ -1182,21 +1263,10 @@ pub fn listChatModelIds(
                 if (m.id) |id| try ids.append(arena, try arena.dupe(u8, id));
             }
         },
-        .ollama => {
-            const opts: openai_mod.InitOptions = if (base_url_override) |u|
-                .{ .base_url = u }
-            else
-                .{ .base_url = ollama_default_base_url };
-            var client = openai_mod.init(allocator, api_key, opts);
-            defer client.deinit();
-            var resp = try client.listModels();
-            defer resp.deinit();
-            // Local catalogs don't follow the naming convention isChatModel
-            // expects, so we don't filter.
-            for (resp.value.data orelse &.{}) |m| {
-                if (m.id) |id| try ids.append(arena, try arena.dupe(u8, id));
-            }
-        },
+        // Ollama and Hugging Face both serve OpenAI-compatible catalogs whose IDs
+        // don't follow isChatModel's naming convention, so neither filters.
+        .ollama => try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, base_url_override orelse ollama_default_base_url),
+        .huggingface => try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, base_url_override orelse huggingface_default_base_url),
         .gemini => {
             var client = gemini_mod.init(allocator, api_key, .{});
             defer client.deinit();
@@ -1224,6 +1294,17 @@ pub fn listChatModelIds(
 
 test "envApiKey: ollama returns placeholder regardless of env" {
     try std.testing.expectEqualStrings("ollama", envApiKey(.ollama).?);
+}
+
+test "huggingface: reads HF_TOKEN and has sensible defaults" {
+    try std.testing.expectEqualStrings("HF_TOKEN", envVarName(.huggingface));
+    try std.testing.expect(defaultModel(.huggingface).len > 0);
+    // A real token, so it's auto-detectable like the other cloud providers.
+    var found = false;
+    for (default_candidates) |t| {
+        if (t == .huggingface) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 // --- Conversion helpers ---

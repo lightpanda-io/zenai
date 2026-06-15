@@ -21,6 +21,11 @@ pub const anthropic = struct {
 /// Ollama uses the OpenAI-compatible API with a different default base URL.
 pub const ollama = openai;
 
+/// Hugging Face Inference uses the OpenAI-compatible Chat Completions API with a
+/// different default base URL — the serverless router, or a dedicated Inference
+/// Endpoint passed via `base_url`.
+pub const huggingface = openai;
+
 /// Search providers — separate namespace from the LLM clients above. Tavily
 /// is the first; Brave/Serper/Google CSE could land as siblings here.
 pub const search = struct {
