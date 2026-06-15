@@ -1214,6 +1214,24 @@ pub fn detectKeys(buf: []Credentials, candidates: []const Tag) []Credentials {
     return buf[0..n];
 }
 
+/// True when `url`'s host is a loopback address, where a refused connection is
+/// instant and definitive rather than a transient error worth retrying. Returns
+/// false on an unparseable or host-less URL, defaulting callers to retry.
+fn isLoopbackUrl(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    const raw = switch (uri.host orelse return false) {
+        .raw, .percent_encoded => |h| h,
+    };
+    // std.Uri keeps the brackets around IPv6 literals (e.g. "[::1]").
+    const host = if (std.mem.startsWith(u8, raw, "[") and std.mem.endsWith(u8, raw, "]"))
+        raw[1 .. raw.len - 1]
+    else
+        raw;
+    return std.mem.eql(u8, host, "localhost") or
+        std.mem.eql(u8, host, "::1") or
+        std.mem.startsWith(u8, host, "127.");
+}
+
 /// Append every model ID served by an OpenAI-compatible endpoint at `base_url`
 /// to `ids`. No `isChatModel` filtering — local/HF catalogs don't follow the
 /// OpenAI naming convention it expects.
@@ -1269,10 +1287,15 @@ pub fn listChatModelIds(
         },
         // Ollama and Hugging Face both serve OpenAI-compatible catalogs whose IDs
         // don't follow isChatModel's naming convention, so neither filters.
-        // Ollama runs on localhost where a refused connection means "not
-        // running", not a transient blip — retrying only stalls startup, so
-        // disable it. Hugging Face is remote, so it keeps the default policy.
-        .ollama => try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, base_url_override orelse ollama_default_base_url, .disabled),
+        // A loopback Ollama refuses connections instantly and definitively when
+        // it isn't running, so retrying only stalls startup — disable it there.
+        // A remote Ollama (custom base URL) can blip, so it keeps retry, as does
+        // the always-remote Hugging Face.
+        .ollama => {
+            const url = base_url_override orelse ollama_default_base_url;
+            const policy: retry.RetryPolicy = if (isLoopbackUrl(url)) .disabled else .{};
+            try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, url, policy);
+        },
         .huggingface => try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, base_url_override orelse huggingface_default_base_url, .{}),
         .gemini => {
             var client = gemini_mod.init(allocator, api_key, .{});
@@ -1301,6 +1324,15 @@ pub fn listChatModelIds(
 
 test "envApiKey: ollama returns placeholder regardless of env" {
     try std.testing.expectEqualStrings("ollama", envApiKey(.ollama).?);
+}
+
+test "isLoopbackUrl: loopback hosts disable retry, remote hosts keep it" {
+    try std.testing.expect(isLoopbackUrl(ollama_default_base_url));
+    try std.testing.expect(isLoopbackUrl("http://127.0.0.1:11434/v1"));
+    try std.testing.expect(isLoopbackUrl("http://[::1]:11434/v1"));
+    try std.testing.expect(!isLoopbackUrl("http://ollama.example.com:11434/v1"));
+    try std.testing.expect(!isLoopbackUrl("http://192.168.1.10:11434/v1"));
+    try std.testing.expect(!isLoopbackUrl("not a url"));
 }
 
 test "huggingface: reads HF_TOKEN and has sensible defaults" {
