@@ -1223,8 +1223,9 @@ fn listOpenAICompatibleModelIds(
     ids: *std.ArrayList([]const u8),
     api_key: [:0]const u8,
     base_url: [:0]const u8,
+    retry_policy: retry.RetryPolicy,
 ) !void {
-    var client = openai_mod.init(allocator, api_key, .{ .base_url = base_url });
+    var client = openai_mod.init(allocator, api_key, .{ .base_url = base_url, .retry_policy = retry_policy });
     defer client.deinit();
     var resp = try client.listModels();
     defer resp.deinit();
@@ -1268,8 +1269,11 @@ pub fn listChatModelIds(
         },
         // Ollama and Hugging Face both serve OpenAI-compatible catalogs whose IDs
         // don't follow isChatModel's naming convention, so neither filters.
-        .ollama => try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, base_url_override orelse ollama_default_base_url),
-        .huggingface => try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, base_url_override orelse huggingface_default_base_url),
+        // Ollama runs on localhost where a refused connection means "not
+        // running", not a transient blip — retrying only stalls startup, so
+        // disable it. Hugging Face is remote, so it keeps the default policy.
+        .ollama => try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, base_url_override orelse ollama_default_base_url, .disabled),
+        .huggingface => try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, base_url_override orelse huggingface_default_base_url, .{}),
         .gemini => {
             var client = gemini_mod.init(allocator, api_key, .{});
             defer client.deinit();
