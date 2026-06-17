@@ -61,6 +61,9 @@ pub fn isRetryableFetchError(err: anyerror) bool {
         error.NetworkUnreachable,
         error.TemporaryNameServerFailure,
         error.TlsInitializationFailed,
+        // Pooled keep-alive connection the server closed while idle; retrying
+        // opens a fresh one. Common with local servers (llama.cpp, Ollama).
+        error.HttpConnectionClosing,
         // HTTP chunk truncation is typically a flaky upstream
         error.HttpChunkTruncated,
         => true,
@@ -124,6 +127,7 @@ test "isRetryableFetchError picks known transients" {
     try std.testing.expect(isRetryableFetchError(error.TemporaryNameServerFailure));
     try std.testing.expect(isRetryableFetchError(error.TlsInitializationFailed));
     try std.testing.expect(isRetryableFetchError(error.HttpChunkTruncated));
+    try std.testing.expect(isRetryableFetchError(error.HttpConnectionClosing));
 }
 
 test "isRetryableFetchError rejects permanent errors" {

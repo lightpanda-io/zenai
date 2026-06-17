@@ -323,22 +323,6 @@ pub const ListModelsResponse = struct {
     last_id: ?[]const u8 = null,
 };
 
-// --- Error Types ---
-
-/// API error response wrapper.
-pub const ApiErrorResponse = struct {
-    type: ?[]const u8 = null,
-    @"error": ?ApiErrorDetail = null,
-};
-
-/// Details of an API error.
-pub const ApiErrorDetail = struct {
-    /// Error type (e.g. "invalid_request_error", "authentication_error").
-    type: ?[]const u8 = null,
-    /// Human-readable error message.
-    message: ?[]const u8 = null,
-};
-
 // --- Tests ---
 
 test "MessageRequest serializes to JSON" {

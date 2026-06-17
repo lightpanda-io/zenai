@@ -416,25 +416,6 @@ pub const ListModelsResponse = struct {
     object: ?[]const u8 = null,
 };
 
-// --- Error Types ---
-
-/// API error response wrapper.
-pub const ApiErrorResponse = struct {
-    @"error": ?ApiErrorDetail = null,
-};
-
-/// Details of an API error.
-pub const ApiErrorDetail = struct {
-    /// Human-readable error message.
-    message: ?[]const u8 = null,
-    /// Error type (e.g. "invalid_request_error").
-    type: ?[]const u8 = null,
-    /// Error code.
-    code: ?[]const u8 = null,
-    /// The parameter that caused the error.
-    param: ?[]const u8 = null,
-};
-
 // --- Tests ---
 
 test "ChatCompletionRequest serializes to JSON" {

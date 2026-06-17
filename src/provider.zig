@@ -428,6 +428,7 @@ pub const Client = union(enum) {
     openai: *openai_mod,
     ollama: *openai_mod,
     huggingface: *openai_mod,
+    llama_cpp: *openai_mod,
 
     pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError;
     pub const StreamError = gemini_mod.StreamError || openai_mod.StreamError || anthropic_mod.StreamError;
@@ -460,6 +461,7 @@ pub const Client = union(enum) {
                 const base_url: ?[:0]const u8 = options.base_url orelse switch (tag) {
                     .ollama => ollama_default_base_url,
                     .huggingface => huggingface_default_base_url,
+                    .llama_cpp => llama_cpp_default_base_url,
                     else => null,
                 };
                 var impl_opts: Impl.InitOptions = .{ .retry_policy = options.retry_policy };
@@ -487,6 +489,20 @@ pub const Client = union(enum) {
         switch (self) {
             inline else => |client| client.interrupt = it,
         }
+    }
+
+    /// Status and message from the client's most recent failed request, to
+    /// surface detail past the opaque `error.ApiError`. The message is owned by
+    /// the client and valid until its next request; both null if none failed.
+    pub const LastError = struct {
+        status: ?u10 = null,
+        message: ?[]const u8 = null,
+    };
+
+    pub fn lastError(self: Client) LastError {
+        return switch (self) {
+            inline else => |client| .{ .status = client.last_error_status, .message = client.last_error_message },
+        };
     }
 
     /// Generate content from a list of messages.
@@ -663,7 +679,7 @@ pub const Client = union(enum) {
             },
             // Hugging Face speaks OpenAI-compatible Chat Completions, not the
             // Responses API the `.openai` arm uses — so it gets its own arm.
-            .huggingface => |o| {
+            .huggingface, .llama_cpp => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
@@ -810,7 +826,7 @@ pub const Client = union(enum) {
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
                 }, .{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Wrapper.wrap);
             },
-            .openai, .huggingface => |o| {
+            .openai, .huggingface, .llama_cpp => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
@@ -906,7 +922,7 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
-            .openai, .ollama, .huggingface => |o| {
+            .openai, .ollama, .huggingface, .llama_cpp => |o| {
                 var response = try o.embedText(model, text);
                 defer response.deinit();
                 var result = EmbedResult.init(o.allocator);
@@ -1145,6 +1161,7 @@ pub fn envApiKey(tag: Tag) ?[:0]const u8 {
         .gemini => std.posix.getenv("GOOGLE_API_KEY") orelse std.posix.getenv("GEMINI_API_KEY"),
         .ollama => "ollama",
         .huggingface => std.posix.getenv("HF_TOKEN"),
+        .llama_cpp => "llama.cpp",
     };
 }
 
@@ -1157,6 +1174,7 @@ pub fn envVarName(tag: Tag) []const u8 {
         .gemini => "GOOGLE_API_KEY/GEMINI_API_KEY",
         .ollama => "<ollama>",
         .huggingface => "HF_TOKEN",
+        .llama_cpp => "<llama.cpp>",
     };
 }
 
@@ -1167,6 +1185,9 @@ pub const ollama_default_base_url = "http://localhost:11434/v1";
 /// Dedicated Inference Endpoints override this via `base_url`.
 pub const huggingface_default_base_url = "https://router.huggingface.co/v1";
 
+/// OpenAI-compatible endpoint a local `llama-server` (llama.cpp) serves by default.
+pub const llama_cpp_default_base_url = "http://localhost:8080/v1";
+
 /// Recommended default chat model for `tag` when the user hasn't picked one.
 pub fn defaultModel(tag: Tag) []const u8 {
     return switch (tag) {
@@ -1175,6 +1196,9 @@ pub fn defaultModel(tag: Tag) []const u8 {
         .gemini => "gemini-3.5-flash",
         .ollama => "qwen3.5:latest",
         .huggingface => "Qwen/Qwen3.5-122B-A10B",
+        // No sensible default: the served model is whatever `llama-server` was
+        // launched with. Callers should pick one from `listChatModelIds`.
+        .llama_cpp => "",
     };
 }
 
@@ -1185,16 +1209,15 @@ pub const Credentials = struct {
     key: [:0]const u8,
 };
 
-/// Env-detectable providers, in enum order. Ollama is excluded — its `envApiKey`
-/// is a non-null placeholder, so it must be chosen explicitly, not auto-detected.
-/// Hugging Face stays in: like the other cloud providers it needs a real token
-/// (`HF_TOKEN`), so a set key is a genuine signal of intent.
+/// Env-detectable providers, in enum order. Ollama and llama.cpp are excluded:
+/// their `envApiKey` is a placeholder, so they must be chosen explicitly, not
+/// auto-detected. Hugging Face stays in — it needs a real `HF_TOKEN`.
 pub const default_candidates: []const Tag = blk: {
     const all = std.enums.values(Tag);
     var arr: [all.len]Tag = undefined;
     var n: usize = 0;
     for (all) |t| {
-        if (t == .ollama) continue;
+        if (t == .ollama or t == .llama_cpp) continue;
         arr[n] = t;
         n += 1;
     }
@@ -1297,6 +1320,12 @@ pub fn listChatModelIds(
             try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, url, policy);
         },
         .huggingface => try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, base_url_override orelse huggingface_default_base_url, .{}),
+        // Same loopback-retry tradeoff as Ollama above.
+        .llama_cpp => {
+            const url = base_url_override orelse llama_cpp_default_base_url;
+            const policy: retry.RetryPolicy = if (isLoopbackUrl(url)) .disabled else .{};
+            try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, url, policy);
+        },
         .gemini => {
             var client = gemini_mod.init(allocator, api_key, .{});
             defer client.deinit();
@@ -1344,6 +1373,15 @@ test "huggingface: reads HF_TOKEN and has sensible defaults" {
         if (t == .huggingface) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "llama_cpp: placeholder key, loopback default, excluded from auto-detect" {
+    try std.testing.expectEqualStrings("llama.cpp", envApiKey(.llama_cpp).?);
+    try std.testing.expect(isLoopbackUrl(llama_cpp_default_base_url));
+    // Placeholder key, so it must be live-probed — never env-auto-detected.
+    for (default_candidates) |t| {
+        try std.testing.expect(t != .llama_cpp);
+    }
 }
 
 // --- Conversion helpers ---

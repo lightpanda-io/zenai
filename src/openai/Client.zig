@@ -26,8 +26,9 @@ bill_to: ?[]const u8,
 http_client: std.http.Client,
 /// Retry policy applied to every non-streaming request.
 retry_policy: RetryPolicy,
-/// The most recent API error detail, if any. Set on `error.ApiError`.
-last_error: ?types.ApiErrorDetail = null,
+/// Human-readable message from the most recent API error, owned by the client
+/// and freed on the next failure or `deinit`. Set on `error.ApiError`.
+last_error_message: ?[]u8 = null,
 last_error_status: ?u10 = null,
 /// Set by the host so a SIGINT can abort an in-flight request mid-read.
 interrupt: ?*http.Interrupt = null,
@@ -64,7 +65,7 @@ pub fn init(allocator: std.mem.Allocator, api_key: []const u8, options: InitOpti
         .bill_to = options.bill_to,
         .http_client = .{ .allocator = allocator },
         .retry_policy = options.retry_policy,
-        .last_error = null,
+        .last_error_message = null,
         .last_error_status = null,
     };
 }
@@ -73,6 +74,7 @@ pub fn init(allocator: std.mem.Allocator, api_key: []const u8, options: InitOpti
 pub fn deinit(self: *Client) void {
     if (self.authorization) |a| self.allocator.free(a);
     if (self.ollama_ctx) |c| self.allocator.free(c.model);
+    if (self.last_error_message) |m| self.allocator.free(m);
     self.http_client.deinit();
 }
 
@@ -103,13 +105,13 @@ fn authHeaders(self: *Client, buf: *[4]std.http.Header) ![]const std.http.Header
 
 pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
     self.last_error_status = status_code;
-    self.last_error = null;
+    if (self.last_error_message) |m| {
+        self.allocator.free(m);
+        self.last_error_message = null;
+    }
     if (body.len > 0) {
         std.log.err("OpenAI API error (HTTP {d}): {s}", .{ status_code, body });
-        if (std.json.parseFromSlice(types.ApiErrorResponse, self.allocator, body, .{ .ignore_unknown_fields = true })) |parsed| {
-            self.last_error = parsed.value.@"error";
-            parsed.deinit();
-        } else |_| {}
+        self.last_error_message = http.extractErrorMessage(self.allocator, body);
     }
 }
 

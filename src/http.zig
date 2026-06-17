@@ -188,6 +188,21 @@ fn fetchInterruptible(
     return response.head.status;
 }
 
+/// Extract an owned copy of `error.message` from a provider JSON error body, or
+/// null if absent or unparseable. Caller frees the result with `allocator`.
+///
+/// Parses only `message`: sibling fields vary by provider (e.g. llama.cpp types
+/// `code` as an int where OpenAI uses a string), so a full typed parse would
+/// fail and cost us the message.
+pub fn extractErrorMessage(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
+    const Body = struct { @"error": ?struct { message: ?[]const u8 = null } = null };
+    const parsed = std.json.parseFromSlice(Body, allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    const err = parsed.value.@"error" orelse return null;
+    const msg = err.message orelse return null;
+    return allocator.dupe(u8, msg) catch null;
+}
+
 /// Owns the parsed response and its backing memory.
 /// Call `deinit()` when done to free all resources.
 pub fn Response(comptime T: type) type {

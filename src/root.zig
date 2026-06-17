@@ -26,6 +26,10 @@ pub const ollama = openai;
 /// Endpoint passed via `base_url`.
 pub const huggingface = openai;
 
+/// llama.cpp's `llama-server` uses the OpenAI-compatible Chat Completions API
+/// with a different default base URL (`http://localhost:8080/v1`).
+pub const llama_cpp = openai;
+
 /// Search providers — separate namespace from the LLM clients above. Tavily
 /// is the first; Brave/Serper/Google CSE could land as siblings here.
 pub const search = struct {

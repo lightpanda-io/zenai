@@ -825,23 +825,6 @@ pub const GenerateContentResponse = struct {
     }
 };
 
-// --- Error Types ---
-
-/// API error response wrapper.
-pub const ApiErrorResponse = struct {
-    @"error": ?ApiErrorDetail = null,
-};
-
-/// Details of an API error.
-pub const ApiErrorDetail = struct {
-    /// HTTP status code.
-    code: ?u32 = null,
-    /// Human-readable error message.
-    message: ?[]const u8 = null,
-    /// Error status string (e.g. "INVALID_ARGUMENT").
-    status: ?[]const u8 = null,
-};
-
 // --- Model Info ---
 
 /// A trained machine learning model.
