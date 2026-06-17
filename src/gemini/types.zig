@@ -23,12 +23,8 @@ pub const HarmCategory = union(enum) {
     HARM_CATEGORY_CIVIC_INTEGRITY,
     unknown: []const u8,
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !HarmCategory {
-        return jsonutil.parseStringUnion(HarmCategory, allocator, source, options);
-    }
-    pub fn jsonStringify(self: HarmCategory, jws: anytype) !void {
-        return jsonutil.stringifyStringUnion(self, jws);
-    }
+    pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
+    pub const jsonStringify = jsonutil.StringUnionMethods(@This()).jsonStringify;
 };
 
 /// The threshold for blocking content based on harm probability.
@@ -58,12 +54,8 @@ pub const HarmProbability = union(enum) {
     HIGH,
     unknown: []const u8,
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !HarmProbability {
-        return jsonutil.parseStringUnion(HarmProbability, allocator, source, options);
-    }
-    pub fn jsonStringify(self: HarmProbability, jws: anytype) !void {
-        return jsonutil.stringifyStringUnion(self, jws);
-    }
+    pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
+    pub const jsonStringify = jsonutil.StringUnionMethods(@This()).jsonStringify;
 };
 
 /// The severity level of harmful content. Known values are void tags; any value
@@ -76,12 +68,8 @@ pub const HarmSeverity = union(enum) {
     HARM_SEVERITY_HIGH,
     unknown: []const u8,
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !HarmSeverity {
-        return jsonutil.parseStringUnion(HarmSeverity, allocator, source, options);
-    }
-    pub fn jsonStringify(self: HarmSeverity, jws: anytype) !void {
-        return jsonutil.stringifyStringUnion(self, jws);
-    }
+    pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
+    pub const jsonStringify = jsonutil.StringUnionMethods(@This()).jsonStringify;
 };
 
 /// The stage of the underlying model. Known values are void tags; any value the
@@ -97,12 +85,8 @@ pub const ModelStage = union(enum) {
     RETIRED,
     unknown: []const u8,
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ModelStage {
-        return jsonutil.parseStringUnion(ModelStage, allocator, source, options);
-    }
-    pub fn jsonStringify(self: ModelStage, jws: anytype) !void {
-        return jsonutil.stringifyStringUnion(self, jws);
-    }
+    pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
+    pub const jsonStringify = jsonutil.StringUnionMethods(@This()).jsonStringify;
 };
 
 /// Current status of the model.
@@ -140,12 +124,8 @@ pub const FinishReason = union(enum) {
     MALFORMED_FUNCTION_CALL,
     unknown: []const u8,
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !FinishReason {
-        return jsonutil.parseStringUnion(FinishReason, allocator, source, options);
-    }
-    pub fn jsonStringify(self: FinishReason, jws: anytype) !void {
-        return jsonutil.stringifyStringUnion(self, jws);
-    }
+    pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
+    pub const jsonStringify = jsonutil.StringUnionMethods(@This()).jsonStringify;
 };
 
 /// Function calling mode.
@@ -189,12 +169,8 @@ pub const Outcome = union(enum) {
     OUTCOME_DEADLINE_EXCEEDED,
     unknown: []const u8,
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Outcome {
-        return jsonutil.parseStringUnion(Outcome, allocator, source, options);
-    }
-    pub fn jsonStringify(self: Outcome, jws: anytype) !void {
-        return jsonutil.stringifyStringUnion(self, jws);
-    }
+    pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
+    pub const jsonStringify = jsonutil.StringUnionMethods(@This()).jsonStringify;
 };
 
 /// Programming language for executable code.
@@ -769,12 +745,8 @@ pub const MediaModality = union(enum) {
     DOCUMENT,
     unknown: []const u8,
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !MediaModality {
-        return jsonutil.parseStringUnion(MediaModality, allocator, source, options);
-    }
-    pub fn jsonStringify(self: MediaModality, jws: anytype) !void {
-        return jsonutil.stringifyStringUnion(self, jws);
-    }
+    pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
+    pub const jsonStringify = jsonutil.StringUnionMethods(@This()).jsonStringify;
 };
 
 /// Token count broken down by modality.
@@ -962,12 +934,8 @@ pub const FileState = union(enum) {
     FAILED,
     unknown: []const u8,
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !FileState {
-        return jsonutil.parseStringUnion(FileState, allocator, source, options);
-    }
-    pub fn jsonStringify(self: FileState, jws: anytype) !void {
-        return jsonutil.stringifyStringUnion(self, jws);
-    }
+    pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
+    pub const jsonStringify = jsonutil.StringUnionMethods(@This()).jsonStringify;
 };
 
 /// A file uploaded to the API.

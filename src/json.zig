@@ -36,6 +36,23 @@ pub fn stringifyStringUnion(value: anytype, jws: anytype) !void {
     }
 }
 
+/// Returns a namespace whose `jsonParse`/`jsonStringify` are bound to the
+/// string-backed union `U`, so each such union wires up its JSON hooks in two
+/// name-free lines instead of re-pasting the forwarder bodies:
+///
+///     pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
+///     pub const jsonStringify = jsonutil.StringUnionMethods(@This()).jsonStringify;
+pub fn StringUnionMethods(comptime U: type) type {
+    return struct {
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !U {
+            return parseStringUnion(U, allocator, source, options);
+        }
+        pub fn jsonStringify(self: U, jws: anytype) !void {
+            return stringifyStringUnion(self, jws);
+        }
+    };
+}
+
 /// Deep-copy a `std.json.Value`, duplicating all owned strings and containers.
 pub fn dupeValue(a: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.Error!std.json.Value {
     return switch (value) {

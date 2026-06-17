@@ -21,12 +21,8 @@ pub const FinishReason = union(enum) {
     content_filter,
     unknown: []const u8,
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !FinishReason {
-        return jsonutil.parseStringUnion(FinishReason, allocator, source, options);
-    }
-    pub fn jsonStringify(self: FinishReason, jws: anytype) !void {
-        return jsonutil.stringifyStringUnion(self, jws);
-    }
+    pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
+    pub const jsonStringify = jsonutil.StringUnionMethods(@This()).jsonStringify;
 };
 
 /// The effort level for model reasoning.

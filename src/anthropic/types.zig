@@ -21,12 +21,8 @@ pub const StopReason = union(enum) {
     refusal,
     unknown: []const u8,
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !StopReason {
-        return jsonutil.parseStringUnion(StopReason, allocator, source, options);
-    }
-    pub fn jsonStringify(self: StopReason, jws: anytype) !void {
-        return jsonutil.stringifyStringUnion(self, jws);
-    }
+    pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
+    pub const jsonStringify = jsonutil.StringUnionMethods(@This()).jsonStringify;
 };
 
 // --- Content Blocks ---
@@ -210,12 +206,8 @@ pub const RefusalCategory = union(enum) {
     bio,
     unknown: []const u8,
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !RefusalCategory {
-        return jsonutil.parseStringUnion(RefusalCategory, allocator, source, options);
-    }
-    pub fn jsonStringify(self: RefusalCategory, jws: anytype) !void {
-        return jsonutil.stringifyStringUnion(self, jws);
-    }
+    pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
+    pub const jsonStringify = jsonutil.StringUnionMethods(@This()).jsonStringify;
 };
 
 /// Structured information about a refusal.
