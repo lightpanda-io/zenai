@@ -1,4 +1,5 @@
 const std = @import("std");
+const jsonutil = @import("../json.zig");
 
 // --- Enums ---
 
@@ -10,12 +11,22 @@ pub const Role = enum {
     tool,
 };
 
-/// The reason why the model stopped generating tokens.
-pub const FinishReason = enum {
+/// The reason why the model stopped generating tokens. Known values are void
+/// tags; any value the API adds later is preserved in `unknown` rather than
+/// failing the parse.
+pub const FinishReason = union(enum) {
     stop,
     length,
     tool_calls,
     content_filter,
+    unknown: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !FinishReason {
+        return jsonutil.parseStringUnion(FinishReason, allocator, source, options);
+    }
+    pub fn jsonStringify(self: FinishReason, jws: anytype) !void {
+        return jsonutil.stringifyStringUnion(self, jws);
+    }
 };
 
 /// The effort level for model reasoning.
@@ -475,7 +486,7 @@ test "FinishReason parses from JSON" {
         .{ .ignore_unknown_fields = true },
     );
     defer parsed.deinit();
-    try std.testing.expect(parsed.value.choices.?[0].finish_reason.? == .length);
+    try std.testing.expect(std.meta.activeTag(parsed.value.choices.?[0].finish_reason.?) == .length);
 }
 
 test "ResponsesResponse extracts text and tool calls" {

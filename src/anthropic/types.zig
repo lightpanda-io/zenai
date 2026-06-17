@@ -1,4 +1,5 @@
 const std = @import("std");
+const jsonutil = @import("../json.zig");
 
 // --- Enums ---
 
@@ -8,14 +9,24 @@ pub const Role = enum {
     assistant,
 };
 
-/// The reason the model stopped generating.
-pub const StopReason = enum {
+/// The reason the model stopped generating. Known values are void tags; any
+/// value the API adds later is preserved in `unknown` rather than failing the
+/// parse.
+pub const StopReason = union(enum) {
     end_turn,
     max_tokens,
     stop_sequence,
     tool_use,
     pause_turn,
     refusal,
+    unknown: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !StopReason {
+        return jsonutil.parseStringUnion(StopReason, allocator, source, options);
+    }
+    pub fn jsonStringify(self: StopReason, jws: anytype) !void {
+        return jsonutil.stringifyStringUnion(self, jws);
+    }
 };
 
 // --- Content Blocks ---
@@ -191,10 +202,20 @@ pub const Usage = struct {
     cache_read_input_tokens: ?i32 = null,
 };
 
-/// Policy category that triggered a refusal.
-pub const RefusalCategory = enum {
+/// Policy category that triggered a refusal. Known values are void tags; any
+/// value the API adds later is preserved in `unknown` rather than failing the
+/// parse.
+pub const RefusalCategory = union(enum) {
     cyber,
     bio,
+    unknown: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !RefusalCategory {
+        return jsonutil.parseStringUnion(RefusalCategory, allocator, source, options);
+    }
+    pub fn jsonStringify(self: RefusalCategory, jws: anytype) !void {
+        return jsonutil.stringifyStringUnion(self, jws);
+    }
 };
 
 /// Structured information about a refusal.
@@ -402,7 +423,21 @@ test "StopReason parses from JSON" {
         .{ .ignore_unknown_fields = true },
     );
     defer parsed.deinit();
-    try std.testing.expect(parsed.value.stop_reason.? == .max_tokens);
+    try std.testing.expect(std.meta.activeTag(parsed.value.stop_reason.?) == .max_tokens);
+}
+
+test "StopReason preserves unknown values" {
+    const json =
+        \\{"id":"msg_123","type":"message","role":"assistant","content":[{"type":"text","text":"x"}],"stop_reason":"model_context_window_exceeded","usage":{"input_tokens":10,"output_tokens":5}}
+    ;
+    const parsed = try std.json.parseFromSlice(
+        MessageResponse,
+        std.testing.allocator,
+        json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("model_context_window_exceeded", parsed.value.stop_reason.?.unknown);
 }
 
 test "Usage parses output_tokens_details" {

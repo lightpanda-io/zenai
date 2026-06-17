@@ -1,4 +1,5 @@
 const std = @import("std");
+const jsonutil = @import("../json.zig");
 
 // --- Enums ---
 
@@ -10,20 +11,24 @@ pub const ServiceTier = enum {
     priority,
 };
 
-/// The harm category that a piece of content may be classified under.
-pub const HarmCategory = enum {
-    /// Default value. This value is unused.
+/// The harm category that a piece of content may be classified under. Known
+/// values are void tags; any value the API adds later is preserved in
+/// `unknown` rather than failing the parse.
+pub const HarmCategory = union(enum) {
     HARM_CATEGORY_UNSPECIFIED,
-    /// Abusive, threatening, or content intended to bully, torment, or ridicule.
     HARM_CATEGORY_HARASSMENT,
-    /// Content that promotes violence or incites hatred against individuals or groups.
     HARM_CATEGORY_HATE_SPEECH,
-    /// Content that contains sexually explicit material.
     HARM_CATEGORY_SEXUALLY_EXPLICIT,
-    /// Content that promotes, facilitates, or enables dangerous activities.
     HARM_CATEGORY_DANGEROUS_CONTENT,
-    /// The harm category is civic integrity.
     HARM_CATEGORY_CIVIC_INTEGRITY,
+    unknown: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !HarmCategory {
+        return jsonutil.parseStringUnion(HarmCategory, allocator, source, options);
+    }
+    pub fn jsonStringify(self: HarmCategory, jws: anytype) !void {
+        return jsonutil.stringifyStringUnion(self, jws);
+    }
 };
 
 /// The threshold for blocking content based on harm probability.
@@ -42,26 +47,46 @@ pub const HarmBlockThreshold = enum {
     OFF,
 };
 
-/// The probability level of harmful content.
-pub const HarmProbability = enum {
+/// The probability level of harmful content. Known values are void tags; any
+/// value the API adds later is preserved in `unknown` rather than failing the
+/// parse.
+pub const HarmProbability = union(enum) {
     HARM_PROBABILITY_UNSPECIFIED,
     NEGLIGIBLE,
     LOW,
     MEDIUM,
     HIGH,
+    unknown: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !HarmProbability {
+        return jsonutil.parseStringUnion(HarmProbability, allocator, source, options);
+    }
+    pub fn jsonStringify(self: HarmProbability, jws: anytype) !void {
+        return jsonutil.stringifyStringUnion(self, jws);
+    }
 };
 
-/// The severity level of harmful content.
-pub const HarmSeverity = enum {
+/// The severity level of harmful content. Known values are void tags; any value
+/// the API adds later is preserved in `unknown` rather than failing the parse.
+pub const HarmSeverity = union(enum) {
     HARM_SEVERITY_UNSPECIFIED,
     HARM_SEVERITY_NEGLIGIBLE,
     HARM_SEVERITY_LOW,
     HARM_SEVERITY_MEDIUM,
     HARM_SEVERITY_HIGH,
+    unknown: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !HarmSeverity {
+        return jsonutil.parseStringUnion(HarmSeverity, allocator, source, options);
+    }
+    pub fn jsonStringify(self: HarmSeverity, jws: anytype) !void {
+        return jsonutil.stringifyStringUnion(self, jws);
+    }
 };
 
-/// The stage of the underlying model.
-pub const ModelStage = enum {
+/// The stage of the underlying model. Known values are void tags; any value the
+/// API adds later is preserved in `unknown` rather than failing the parse.
+pub const ModelStage = union(enum) {
     MODEL_STAGE_UNSPECIFIED,
     UNSTABLE_EXPERIMENTAL,
     EXPERIMENTAL,
@@ -70,6 +95,14 @@ pub const ModelStage = enum {
     LEGACY,
     DEPRECATED,
     RETIRED,
+    unknown: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ModelStage {
+        return jsonutil.parseStringUnion(ModelStage, allocator, source, options);
+    }
+    pub fn jsonStringify(self: ModelStage, jws: anytype) !void {
+        return jsonutil.stringifyStringUnion(self, jws);
+    }
 };
 
 /// Current status of the model.
@@ -90,30 +123,29 @@ pub const MediaResolution = enum {
     HIGH,
 };
 
-/// The reason why the model stopped generating tokens.
-pub const FinishReason = enum {
-    /// The finish reason is unspecified.
+/// The reason why the model stopped generating tokens. Known values are void
+/// tags; any value the API adds later is preserved in `unknown` rather than
+/// failing the parse.
+pub const FinishReason = union(enum) {
     FINISH_REASON_UNSPECIFIED,
-    /// Token generation reached a natural stopping point or a configured stop sequence.
     STOP,
-    /// Token generation reached the configured maximum output tokens.
     MAX_TOKENS,
-    /// Token generation stopped because the content potentially contains safety violations.
     SAFETY,
-    /// Token generation stopped because of potential recitation.
     RECITATION,
-    /// Token generation stopped because of using an unsupported language.
     LANGUAGE,
-    /// All other reasons that stopped the token generation.
     OTHER,
-    /// Token generation stopped because the content contains forbidden terms.
     BLOCKLIST,
-    /// Token generation stopped for potentially containing prohibited content.
     PROHIBITED_CONTENT,
-    /// Token generation stopped because the content potentially contains Sensitive PII.
-    SPII,
-    /// Token generation stopped due to a malformed function call.
+    SPII, // Sensitive PII
     MALFORMED_FUNCTION_CALL,
+    unknown: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !FinishReason {
+        return jsonutil.parseStringUnion(FinishReason, allocator, source, options);
+    }
+    pub fn jsonStringify(self: FinishReason, jws: anytype) !void {
+        return jsonutil.stringifyStringUnion(self, jws);
+    }
 };
 
 /// Function calling mode.
@@ -148,15 +180,21 @@ pub const SchemaType = enum {
     OBJECT,
 };
 
-/// Outcome of code execution.
-pub const Outcome = enum {
+/// Outcome of code execution. Known values are void tags; any value the API
+/// adds later is preserved in `unknown` rather than failing the parse.
+pub const Outcome = union(enum) {
     OUTCOME_UNSPECIFIED,
-    /// Code execution completed successfully.
     OUTCOME_OK,
-    /// Code execution failed.
     OUTCOME_FAILED,
-    /// Code execution ran for too long and was cancelled.
     OUTCOME_DEADLINE_EXCEEDED,
+    unknown: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Outcome {
+        return jsonutil.parseStringUnion(Outcome, allocator, source, options);
+    }
+    pub fn jsonStringify(self: Outcome, jws: anytype) !void {
+        return jsonutil.stringifyStringUnion(self, jws);
+    }
 };
 
 /// Programming language for executable code.
@@ -720,13 +758,23 @@ pub const Modality = enum {
 };
 
 /// Media modality type (superset of Modality, used in token count breakdowns).
-pub const MediaModality = enum {
+/// Known values are void tags; any value the API adds later is preserved in
+/// `unknown` rather than failing the parse.
+pub const MediaModality = union(enum) {
     MODALITY_UNSPECIFIED,
     TEXT,
     IMAGE,
     VIDEO,
     AUDIO,
     DOCUMENT,
+    unknown: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !MediaModality {
+        return jsonutil.parseStringUnion(MediaModality, allocator, source, options);
+    }
+    pub fn jsonStringify(self: MediaModality, jws: anytype) !void {
+        return jsonutil.stringifyStringUnion(self, jws);
+    }
 };
 
 /// Token count broken down by modality.
@@ -905,15 +953,21 @@ pub const EmbedContentResponse = struct {
 
 // --- Files ---
 
-/// Processing state of an uploaded file.
-pub const FileState = enum {
+/// Processing state of an uploaded file. Known values are void tags; any value
+/// the API adds later is preserved in `unknown` rather than failing the parse.
+pub const FileState = union(enum) {
     STATE_UNSPECIFIED,
-    /// The file is being processed and is not yet ready.
     PROCESSING,
-    /// The file is processed and ready to use.
     ACTIVE,
-    /// The file failed to process.
     FAILED,
+    unknown: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !FileState {
+        return jsonutil.parseStringUnion(FileState, allocator, source, options);
+    }
+    pub fn jsonStringify(self: FileState, jws: anytype) !void {
+        return jsonutil.stringifyStringUnion(self, jws);
+    }
 };
 
 /// A file uploaded to the API.
@@ -1093,8 +1147,8 @@ test "GenerateContentResponse parses safety ratings" {
     );
     defer parsed.deinit();
     const ratings = parsed.value.candidates.?[0].safetyRatings.?;
-    try std.testing.expect(ratings[0].category.? == .HARM_CATEGORY_HARASSMENT);
-    try std.testing.expect(ratings[0].probability.? == .NEGLIGIBLE);
+    try std.testing.expect(std.meta.activeTag(ratings[0].category.?) == .HARM_CATEGORY_HARASSMENT);
+    try std.testing.expect(std.meta.activeTag(ratings[0].probability.?) == .NEGLIGIBLE);
 }
 
 test "GenerateContentResponse parses function call" {
@@ -1123,7 +1177,21 @@ test "FinishReason parses from JSON" {
         .{ .ignore_unknown_fields = true },
     );
     defer parsed.deinit();
-    try std.testing.expect(parsed.value.candidates.?[0].finishReason.? == .MAX_TOKENS);
+    try std.testing.expect(std.meta.activeTag(parsed.value.candidates.?[0].finishReason.?) == .MAX_TOKENS);
+}
+
+test "FinishReason preserves unknown values" {
+    const json_str =
+        \\{"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"UNEXPECTED_TOOL_CALL"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(
+        GenerateContentResponse,
+        std.testing.allocator,
+        json_str,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("UNEXPECTED_TOOL_CALL", parsed.value.candidates.?[0].finishReason.?.unknown);
 }
 
 test "Schema serializes with enum type" {

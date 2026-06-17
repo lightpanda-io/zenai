@@ -1950,6 +1950,7 @@ fn mapOpenAIFinishReason(response: openai_types.ChatCompletionResponse) FinishRe
         .length => .max_tokens,
         .tool_calls => .tool_call,
         .content_filter => .safety,
+        .unknown => .unknown,
     };
 }
 
@@ -2013,6 +2014,7 @@ fn mapAnthropicStopReason(reason: anthropic_types.StopReason) FinishReason {
         .max_tokens, .pause_turn => .max_tokens,
         .tool_use => .tool_call,
         .refusal => .safety,
+        .unknown => .unknown,
     };
 }
 

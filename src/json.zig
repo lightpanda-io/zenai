@@ -1,5 +1,41 @@
 const std = @import("std");
 
+/// Parse a JSON string into tagged union `U`, whose known wire values are void
+/// tags and whose catch-all is `unknown: []const u8`. An unrecognized value is
+/// duped into `allocator` and preserved instead of failing the parse, matching
+/// the Go SDKs' string-backed enums. Pair with `stringifyStringUnion`.
+pub fn parseStringUnion(
+    comptime U: type,
+    allocator: std.mem.Allocator,
+    source: anytype,
+    options: std.json.ParseOptions,
+) !U {
+    comptime if (!@hasField(U, "unknown"))
+        @compileError(@typeName(U) ++ " needs an `unknown: []const u8` field for parseStringUnion");
+    const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+    defer switch (token) {
+        .allocated_string => |s| allocator.free(s),
+        else => {},
+    };
+    const slice = switch (token) {
+        inline .string, .allocated_string => |s| s,
+        else => return error.UnexpectedToken,
+    };
+    inline for (@typeInfo(U).@"union".fields) |f| {
+        if (f.type == void and std.mem.eql(u8, f.name, slice)) return @unionInit(U, f.name, {});
+    }
+    return .{ .unknown = try allocator.dupe(u8, slice) };
+}
+
+/// Serialize a `parseStringUnion`-style union to its wire string: the tag name
+/// for a known value, or the raw payload for `unknown`.
+pub fn stringifyStringUnion(value: anytype, jws: anytype) !void {
+    switch (value) {
+        .unknown => |s| try jws.write(s),
+        else => try jws.write(@tagName(value)),
+    }
+}
+
 /// Deep-copy a `std.json.Value`, duplicating all owned strings and containers.
 pub fn dupeValue(a: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.Error!std.json.Value {
     return switch (value) {
