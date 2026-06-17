@@ -30,6 +30,11 @@ pub const huggingface = openai;
 /// with a different default base URL (`http://localhost:8080/v1`).
 pub const llama_cpp = openai;
 
+/// Vercel AI Gateway and Mistral both use the OpenAI-compatible Chat Completions
+/// API with their own default base URLs.
+pub const vercel = openai;
+pub const mistral = openai;
+
 /// Search providers — separate namespace from the LLM clients above. Tavily
 /// is the first; Brave/Serper/Google CSE could land as siblings here.
 pub const search = struct {

@@ -429,6 +429,8 @@ pub const Client = union(enum) {
     ollama: *openai_mod,
     huggingface: *openai_mod,
     llama_cpp: *openai_mod,
+    vercel: *openai_mod,
+    mistral: *openai_mod,
 
     pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError;
     pub const StreamError = gemini_mod.StreamError || openai_mod.StreamError || anthropic_mod.StreamError;
@@ -458,12 +460,8 @@ pub const Client = union(enum) {
                 const Impl = @typeInfo(ClientPtr).pointer.child;
                 const client = try allocator.create(Impl);
                 errdefer allocator.destroy(client);
-                const base_url: ?[:0]const u8 = options.base_url orelse switch (tag) {
-                    .ollama => ollama_default_base_url,
-                    .huggingface => huggingface_default_base_url,
-                    .llama_cpp => llama_cpp_default_base_url,
-                    else => null,
-                };
+                const base_url: ?[:0]const u8 = options.base_url orelse
+                    if (openAiPreset(tag)) |p| p.base_url else null;
                 var impl_opts: Impl.InitOptions = .{ .retry_policy = options.retry_policy };
                 if (base_url) |u| impl_opts.base_url = u;
                 if (@hasField(Impl.InitOptions, "bill_to")) impl_opts.bill_to = options.bill_to;
@@ -679,7 +677,7 @@ pub const Client = union(enum) {
             },
             // Hugging Face speaks OpenAI-compatible Chat Completions, not the
             // Responses API the `.openai` arm uses — so it gets its own arm.
-            .huggingface, .llama_cpp => |o| {
+            .huggingface, .llama_cpp, .vercel, .mistral => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
@@ -826,7 +824,7 @@ pub const Client = union(enum) {
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
                 }, .{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Wrapper.wrap);
             },
-            .openai, .huggingface, .llama_cpp => |o| {
+            .openai, .huggingface, .llama_cpp, .vercel, .mistral => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
@@ -922,7 +920,7 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
-            .openai, .ollama, .huggingface, .llama_cpp => |o| {
+            .openai, .ollama, .huggingface, .llama_cpp, .vercel, .mistral => |o| {
                 var response = try o.embedText(model, text);
                 defer response.deinit();
                 var result = EmbedResult.init(o.allocator);
@@ -1151,54 +1149,71 @@ pub const Client = union(enum) {
 /// Provider tag used in switches and helper APIs.
 pub const Tag = std.meta.Tag(Client);
 
-/// Look up the API key for `tag` from the conventional env var(s). Ollama
-/// has no key; returns the literal `"ollama"` so OpenAI-shaped clients
-/// clear their non-empty-key check.
+/// Config for the OpenAI-compatible providers, which share the `*openai_mod`
+/// client and differ only in these fields. `openAiPreset` returns null for the
+/// ones with bespoke config (native openai, anthropic, gemini).
+const OpenAiPreset = struct {
+    base_url: [:0]const u8,
+    /// Env var holding the key; null for keyless local servers.
+    env_var: ?[:0]const u8 = null,
+    /// Placeholder key for keyless local servers, so the client's key check passes.
+    placeholder_key: ?[:0]const u8 = null,
+    default_model: []const u8,
+    /// Local server: loopback-aware list retry, and excluded from auto-detection.
+    local: bool = false,
+};
+
+fn openAiPreset(tag: Tag) ?OpenAiPreset {
+    return switch (tag) {
+        .ollama => .{ .base_url = "http://localhost:11434/v1", .placeholder_key = "ollama", .default_model = "qwen3.5:latest", .local = true },
+        .huggingface => .{ .base_url = "https://router.huggingface.co/v1", .env_var = "HF_TOKEN", .default_model = "Qwen/Qwen3.5-122B-A10B" },
+        // Empty default: the served model is whatever `llama-server` loaded.
+        .llama_cpp => .{ .base_url = "http://localhost:8080/v1", .placeholder_key = "llama.cpp", .default_model = "", .local = true },
+        .vercel => .{ .base_url = "https://ai-gateway.vercel.sh/v1", .env_var = "AI_GATEWAY_API_KEY", .default_model = "openai/gpt-5.5" },
+        .mistral => .{ .base_url = "https://api.mistral.ai/v1", .env_var = "MISTRAL_API_KEY", .default_model = "mistral-large-latest" },
+        .anthropic, .gemini, .openai => null,
+    };
+}
+
+/// Look up the API key for `tag` from the conventional env var(s). Keyless local
+/// servers return a placeholder so OpenAI-shaped clients clear their key check.
 pub fn envApiKey(tag: Tag) ?[:0]const u8 {
+    if (openAiPreset(tag)) |p| {
+        if (p.env_var) |v| return std.posix.getenv(v);
+        return p.placeholder_key;
+    }
     return switch (tag) {
         .anthropic => std.posix.getenv("ANTHROPIC_API_KEY"),
         .openai => std.posix.getenv("OPENAI_API_KEY"),
         .gemini => std.posix.getenv("GOOGLE_API_KEY") orelse std.posix.getenv("GEMINI_API_KEY"),
-        .ollama => "ollama",
-        .huggingface => std.posix.getenv("HF_TOKEN"),
-        .llama_cpp => "llama.cpp",
+        else => unreachable,
     };
 }
 
-/// Human-readable name of the env var(s) read by `envApiKey`, for diagnostics.
-/// Gemini reads either of two names, joined with `/`. Ollama has none.
+/// Human-readable env var name(s) read by `envApiKey`, for diagnostics. Gemini
+/// joins its two names with `/`; keyless local servers have none.
 pub fn envVarName(tag: Tag) []const u8 {
+    if (openAiPreset(tag)) |p| return p.env_var orelse @tagName(tag);
     return switch (tag) {
         .anthropic => "ANTHROPIC_API_KEY",
         .openai => "OPENAI_API_KEY",
         .gemini => "GOOGLE_API_KEY/GEMINI_API_KEY",
-        .ollama => "<ollama>",
-        .huggingface => "HF_TOKEN",
-        .llama_cpp => "<llama.cpp>",
+        else => unreachable,
     };
 }
 
-/// OpenAI-compatible endpoint a local Ollama serves by default.
-pub const ollama_default_base_url = "http://localhost:11434/v1";
-
-/// OpenAI-compatible endpoint of the Hugging Face serverless inference router.
-/// Dedicated Inference Endpoints override this via `base_url`.
-pub const huggingface_default_base_url = "https://router.huggingface.co/v1";
-
-/// OpenAI-compatible endpoint a local `llama-server` (llama.cpp) serves by default.
-pub const llama_cpp_default_base_url = "http://localhost:8080/v1";
+pub const ollama_default_base_url = openAiPreset(.ollama).?.base_url;
+pub const huggingface_default_base_url = openAiPreset(.huggingface).?.base_url;
+pub const llama_cpp_default_base_url = openAiPreset(.llama_cpp).?.base_url;
 
 /// Recommended default chat model for `tag` when the user hasn't picked one.
 pub fn defaultModel(tag: Tag) []const u8 {
+    if (openAiPreset(tag)) |p| return p.default_model;
     return switch (tag) {
         .anthropic => "claude-sonnet-4-6",
         .openai => "gpt-5.5",
         .gemini => "gemini-3.5-flash",
-        .ollama => "qwen3.5:latest",
-        .huggingface => "Qwen/Qwen3.5-122B-A10B",
-        // No sensible default: the served model is whatever `llama-server` was
-        // launched with. Callers should pick one from `listChatModelIds`.
-        .llama_cpp => "",
+        else => unreachable,
     };
 }
 
@@ -1209,15 +1224,14 @@ pub const Credentials = struct {
     key: [:0]const u8,
 };
 
-/// Env-detectable providers, in enum order. Ollama and llama.cpp are excluded:
-/// their `envApiKey` is a placeholder, so they must be chosen explicitly, not
-/// auto-detected. Hugging Face stays in — it needs a real `HF_TOKEN`.
+/// Env-detectable providers, in enum order. Keyless local servers (preset
+/// `local`) are excluded — their `envApiKey` is a placeholder, not a real key.
 pub const default_candidates: []const Tag = blk: {
     const all = std.enums.values(Tag);
     var arr: [all.len]Tag = undefined;
     var n: usize = 0;
     for (all) |t| {
-        if (t == .ollama or t == .llama_cpp) continue;
+        if (openAiPreset(t)) |p| if (p.local) continue;
         arr[n] = t;
         n += 1;
     }
@@ -1277,7 +1291,7 @@ fn listOpenAICompatibleModelIds(
 
 /// Fetch chat-capable model IDs for `tag`, allocated in `arena`. Ordering
 /// is provider-defined — sort at the call site if needed. `base_url_override`
-/// is only honored for openai/ollama.
+/// is honored for `openai` and every preset (OpenAI-compatible) provider.
 pub fn listChatModelIds(
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -1287,7 +1301,13 @@ pub fn listChatModelIds(
 ) ![][]const u8 {
     var ids: std.ArrayList([]const u8) = .empty;
 
-    switch (tag) {
+    // Preset catalogs don't follow isChatModel's naming, so none filters. A
+    // not-running loopback server refuses instantly — disable retry there.
+    if (openAiPreset(tag)) |p| {
+        const url = base_url_override orelse p.base_url;
+        const policy: retry.RetryPolicy = if (p.local and isLoopbackUrl(url)) .disabled else .{};
+        try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, url, policy);
+    } else switch (tag) {
         .anthropic => {
             var client = anthropic_mod.init(allocator, api_key, .{});
             defer client.deinit();
@@ -1308,24 +1328,6 @@ pub fn listChatModelIds(
                 if (m.id) |id| try ids.append(arena, try arena.dupe(u8, id));
             }
         },
-        // Ollama and Hugging Face both serve OpenAI-compatible catalogs whose IDs
-        // don't follow isChatModel's naming convention, so neither filters.
-        // A loopback Ollama refuses connections instantly and definitively when
-        // it isn't running, so retrying only stalls startup — disable it there.
-        // A remote Ollama (custom base URL) can blip, so it keeps retry, as does
-        // the always-remote Hugging Face.
-        .ollama => {
-            const url = base_url_override orelse ollama_default_base_url;
-            const policy: retry.RetryPolicy = if (isLoopbackUrl(url)) .disabled else .{};
-            try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, url, policy);
-        },
-        .huggingface => try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, base_url_override orelse huggingface_default_base_url, .{}),
-        // Same loopback-retry tradeoff as Ollama above.
-        .llama_cpp => {
-            const url = base_url_override orelse llama_cpp_default_base_url;
-            const policy: retry.RetryPolicy = if (isLoopbackUrl(url)) .disabled else .{};
-            try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, url, policy);
-        },
         .gemini => {
             var client = gemini_mod.init(allocator, api_key, .{});
             defer client.deinit();
@@ -1340,6 +1342,7 @@ pub fn listChatModelIds(
                 try ids.append(arena, try arena.dupe(u8, stripped));
             }
         },
+        else => unreachable,
     }
 
     const result = try ids.toOwnedSlice(arena);
@@ -1382,6 +1385,21 @@ test "llama_cpp: placeholder key, loopback default, excluded from auto-detect" {
     for (default_candidates) |t| {
         try std.testing.expect(t != .llama_cpp);
     }
+}
+
+test "vercel/mistral: real-key cloud presets, auto-detectable" {
+    try std.testing.expectEqualStrings("AI_GATEWAY_API_KEY", openAiPreset(.vercel).?.env_var.?);
+    try std.testing.expectEqualStrings("MISTRAL_API_KEY", openAiPreset(.mistral).?.env_var.?);
+    try std.testing.expect(defaultModel(.vercel).len > 0 and defaultModel(.mistral).len > 0);
+    // Real keys, so both join env auto-detection; the keyless local servers don't.
+    var saw_vercel = false;
+    var saw_mistral = false;
+    for (default_candidates) |t| {
+        if (t == .vercel) saw_vercel = true;
+        if (t == .mistral) saw_mistral = true;
+        try std.testing.expect(t != .ollama and t != .llama_cpp);
+    }
+    try std.testing.expect(saw_vercel and saw_mistral);
 }
 
 // --- Conversion helpers ---
