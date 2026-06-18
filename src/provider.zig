@@ -1217,6 +1217,16 @@ pub fn defaultModel(tag: Tag) []const u8 {
     };
 }
 
+/// Default effort for `tag`, or null to defer to the caller's own default.
+/// `.none` for Mistral: its default model rejects `reasoning_effort` (Magistral
+/// reasoning models accept it).
+pub fn defaultEffort(tag: Tag) ?Effort {
+    return switch (tag) {
+        .mistral => .none,
+        else => null,
+    };
+}
+
 /// A provider tag paired with the env-resolved key that authenticates it.
 /// The two travel together: a tag is only meaningful with its key.
 pub const Credentials = struct {
@@ -1400,6 +1410,12 @@ test "vercel/mistral: real-key cloud presets, auto-detectable" {
         try std.testing.expect(t != .ollama and t != .llama_cpp);
     }
     try std.testing.expect(saw_vercel and saw_mistral);
+}
+
+test "defaultEffort: none for Mistral, unset elsewhere" {
+    try std.testing.expectEqual(@as(?Effort, .none), defaultEffort(.mistral));
+    try std.testing.expectEqual(@as(?Effort, null), defaultEffort(.anthropic));
+    try std.testing.expectEqual(@as(?Effort, null), defaultEffort(.openai));
 }
 
 test "reasoning_effort: omitted for none/null effort, sent otherwise" {
