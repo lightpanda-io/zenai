@@ -336,6 +336,9 @@ pub fn generateContentStream(
         .extra_headers = &auth,
         .headers = .{
             .content_type = .{ .override = "application/json" },
+            // Read the SSE stream as plain text: the raw reader does not
+            // decompress, so a gzip'd body would arrive as unparseable bytes.
+            .accept_encoding = .{ .override = "identity" },
         },
         .redirect_behavior = .init(5),
     });

@@ -49,6 +49,10 @@ pub const FunctionCall = struct {
 pub const ToolCall = struct {
     /// The unique ID of this tool call.
     id: ?[]const u8 = null,
+    /// Position of this tool call within the assistant message. Streaming
+    /// deltas carry it so argument fragments can be correlated across chunks;
+    /// omitted (null) in requests.
+    index: ?i32 = null,
     /// The type of tool (always "function").
     type: ?[]const u8 = null,
     /// The function call details.
@@ -99,6 +103,12 @@ pub const ResponseFormat = struct {
     type: ?[]const u8 = null,
 };
 
+/// Streaming-only request options.
+pub const StreamOptions = struct {
+    /// Emit a final chunk carrying token usage after the stream completes.
+    include_usage: ?bool = null,
+};
+
 // --- Request ---
 
 /// Request body for the chat completions endpoint.
@@ -122,6 +132,8 @@ pub const ChatCompletionRequest = struct {
     stop: ?[]const []const u8 = null,
     /// Whether to stream the response.
     stream: ?bool = null,
+    /// Streaming-only options (e.g. request a final usage chunk).
+    stream_options: ?StreamOptions = null,
     /// Tools the model may call.
     tools: ?[]const Tool = null,
     /// Controls which tool is called ("none", "auto", "required").
@@ -355,6 +367,18 @@ pub const ResponsesResponse = struct {
         }
         return null;
     }
+};
+
+/// A streaming event from the responses endpoint. The `type` field selects
+/// which of the other fields is populated: `response.output_text.delta` carries
+/// an incremental `delta`; `response.output_item.done` carries a complete
+/// `item` (a `function_call` item has its full `arguments`); `response.completed`
+/// / `response.incomplete` carry the terminal `response` with usage and status.
+pub const ResponseStreamEvent = struct {
+    type: ?[]const u8 = null,
+    delta: ?[]const u8 = null,
+    item: ?ResponseOutputItem = null,
+    response: ?ResponsesResponse = null,
 };
 
 // --- Embeddings ---
