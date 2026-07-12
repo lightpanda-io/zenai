@@ -316,7 +316,6 @@ pub const StreamAccumulator = struct {
                 });
             };
         }
-        // The terminal chunk carries the finish reason and token counts.
         if (chunk.done orelse false) {
             if (chunk.done_reason) |dr| self.done_reason = try self.arena.dupe(u8, dr);
             self.prompt_eval_count = chunk.prompt_eval_count;
@@ -408,7 +407,6 @@ test "StreamAccumulator reassembles content, forwards deltas, captures usage" {
     acc.onChunk(.{ .message = .{ .role = "assistant", .content = "" }, .done = true, .done_reason = "stop", .prompt_eval_count = 12, .eval_count = 3 });
 
     try std.testing.expect(acc.err == null);
-    // Deltas were forwarded live, in order.
     try std.testing.expectEqualStrings("Hello", sink.buf.items);
     const resp = acc.response();
     try std.testing.expectEqualStrings("Hello", resp.message.?.content.?);

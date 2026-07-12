@@ -215,9 +215,34 @@ pub const SseError = error{
     std.Io.Writer.Error || std.Io.Reader.DelimiterError ||
     std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error || std.Uri.ParseError;
 
-/// POST `payload` and stream the Server-Sent Events response, invoking
-/// `callback` with each parsed `data:` event of type `EventT` until the stream
-/// ends.
+/// What a `streamLines` framer decides to do with one transport line.
+const LineFrame = union(enum) {
+    skip,
+    stop,
+    parse: []const u8,
+};
+
+fn frameSse(line: []const u8) LineFrame {
+    if (line.len == 0) return .skip;
+    // `event:` lines carry only the type, which the data JSON repeats.
+    if (std.mem.startsWith(u8, line, "event: ")) return .skip;
+    if (!std.mem.startsWith(u8, line, "data: ")) return .skip;
+    const json_data = line["data: ".len..];
+    // OpenAI terminates with a `[DONE]` sentinel; others just EOF.
+    if (std.mem.eql(u8, json_data, "[DONE]")) return .stop;
+    return .{ .parse = json_data };
+}
+
+fn frameNdjson(line: []const u8) LineFrame {
+    if (line.len == 0) return .skip;
+    return .{ .parse = line };
+}
+
+/// Shared transport for line-delimited streaming POST responses: opens the
+/// request, arms the interrupt around the blocking read, checks status, then
+/// runs each `\n`-delimited, `\r`-trimmed line through `frame` — skipping,
+/// stopping, or parsing it as `EventT` and handing the value to `callback` —
+/// until the body ends. `streamSse`/`streamNdjson` differ only in `frame`.
 ///
 /// Requests `identity` encoding: the line reader does not decompress, so a
 /// gzip'd body would arrive as unparseable bytes. `error_handler` is the
@@ -225,7 +250,7 @@ pub const SseError = error{
 /// blocking read so a cross-thread `Interrupt.fire` can abort it, and
 /// `setErrorDetail(status, "")` records a non-2xx status before returning
 /// `error.ApiError` — mirroring `fetchJsonWithRetry`.
-pub fn streamSse(
+fn streamLines(
     allocator: std.mem.Allocator,
     http_client: *std.http.Client,
     url: []const u8,
@@ -235,6 +260,7 @@ pub fn streamSse(
     error_handler: anytype,
     context: anytype,
     callback: *const fn (@TypeOf(context), EventT) void,
+    comptime frame: fn ([]const u8) LineFrame,
 ) SseError!void {
     const interrupt: ?*Interrupt = if (@hasField(@TypeOf(error_handler.*), "interrupt"))
         error_handler.interrupt
@@ -252,7 +278,7 @@ pub fn streamSse(
     });
     defer req.deinit();
 
-    // Let a SIGINT abort the blocking SSE read; poison the connection on any
+    // Let a SIGINT abort the blocking read; poison the connection on any
     // failed/aborted exchange so it isn't pooled with unknown framing.
     var guard = armInterrupt(interrupt, &req);
     defer guard.deinit();
@@ -286,18 +312,14 @@ pub fn streamSse(
             },
         } orelse return;
 
-        const trimmed = std.mem.trimRight(u8, line, "\r");
-        if (trimmed.len == 0) continue;
-        // `event:` lines carry only the type, which the data JSON repeats.
-        if (std.mem.startsWith(u8, trimmed, "event: ")) continue;
-        if (!std.mem.startsWith(u8, trimmed, "data: ")) continue;
-
-        const json_data = trimmed["data: ".len..];
-        // OpenAI terminates with a `[DONE]` sentinel; others just EOF.
-        if (std.mem.eql(u8, json_data, "[DONE]")) return;
+        const json_data = switch (frame(std.mem.trimRight(u8, line, "\r"))) {
+            .skip => continue,
+            .stop => return,
+            .parse => |d| d,
+        };
 
         const parsed = std.json.parseFromSlice(EventT, allocator, json_data, .{ .ignore_unknown_fields = true }) catch |err| {
-            std.log.err("SSE stream: failed to parse chunk: {}", .{err});
+            std.log.err("stream: failed to parse chunk: {}", .{err});
             return error.InvalidSseData;
         };
         defer parsed.deinit();
@@ -305,12 +327,26 @@ pub fn streamSse(
     }
 }
 
-/// POST `payload` and stream a newline-delimited JSON (NDJSON) response,
-/// invoking `callback` with each parsed line of type `EventT` until the body
-/// ends. Ollama's native `/api/chat` streams this way — one JSON object per
-/// line, with no `data:` framing or `[DONE]` sentinel — so it can't reuse
-/// `streamSse`. The transport (interrupt arming, status handling, connection
-/// poisoning) mirrors `streamSse`; keep the two in sync.
+/// POST `payload` and stream the Server-Sent Events response, invoking
+/// `callback` with each parsed `data:` event of type `EventT` until the stream
+/// ends (an `event:` line or `[DONE]` sentinel).
+pub fn streamSse(
+    allocator: std.mem.Allocator,
+    http_client: *std.http.Client,
+    url: []const u8,
+    extra_headers: []const std.http.Header,
+    payload: []const u8,
+    comptime EventT: type,
+    error_handler: anytype,
+    context: anytype,
+    callback: *const fn (@TypeOf(context), EventT) void,
+) SseError!void {
+    return streamLines(allocator, http_client, url, extra_headers, payload, EventT, error_handler, context, callback, frameSse);
+}
+
+/// POST `payload` and stream a newline-delimited JSON (NDJSON) response — one
+/// JSON object per line, no `data:` framing or `[DONE]` sentinel, as Ollama's
+/// native `/api/chat` emits — invoking `callback` with each parsed line.
 pub fn streamNdjson(
     allocator: std.mem.Allocator,
     http_client: *std.http.Client,
@@ -322,64 +358,7 @@ pub fn streamNdjson(
     context: anytype,
     callback: *const fn (@TypeOf(context), EventT) void,
 ) SseError!void {
-    const interrupt: ?*Interrupt = if (@hasField(@TypeOf(error_handler.*), "interrupt"))
-        error_handler.interrupt
-    else
-        null;
-
-    const uri = try std.Uri.parse(url);
-    var req = try http_client.request(.POST, uri, .{
-        .extra_headers = extra_headers,
-        .headers = .{
-            .content_type = .{ .override = "application/json" },
-            .accept_encoding = .{ .override = "identity" },
-        },
-        .redirect_behavior = .init(5),
-    });
-    defer req.deinit();
-
-    var guard = armInterrupt(interrupt, &req);
-    defer guard.deinit();
-    errdefer guard.poison();
-
-    req.transfer_encoding = .{ .content_length = payload.len };
-    var bw = try req.sendBodyUnflushed(&.{});
-    try bw.writer.writeAll(payload);
-    try bw.end();
-    try req.connection.?.flush();
-
-    var redirect_buf: [0]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-
-    const status_code: u10 = @intFromEnum(response.head.status);
-    if (status_code < 200 or status_code >= 300) {
-        error_handler.setErrorDetail(status_code, "");
-        return error.ApiError;
-    }
-
-    const transfer_buf = try allocator.alloc(u8, 256 * 1024);
-    defer allocator.free(transfer_buf);
-    const reader = response.reader(transfer_buf);
-
-    while (true) {
-        const line = reader.takeDelimiter('\n') catch |err| switch (err) {
-            error.StreamTooLong => return error.InvalidSseData,
-            error.ReadFailed => {
-                guard.poison();
-                return;
-            },
-        } orelse return;
-
-        const trimmed = std.mem.trimRight(u8, line, "\r");
-        if (trimmed.len == 0) continue;
-
-        const parsed = std.json.parseFromSlice(EventT, allocator, trimmed, .{ .ignore_unknown_fields = true }) catch |err| {
-            std.log.err("NDJSON stream: failed to parse line: {}", .{err});
-            return error.InvalidSseData;
-        };
-        defer parsed.deinit();
-        callback(context, parsed.value);
-    }
+    return streamLines(allocator, http_client, url, extra_headers, payload, EventT, error_handler, context, callback, frameNdjson);
 }
 
 /// Extract an owned copy of `error.message` from a provider JSON error body, or

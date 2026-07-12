@@ -576,30 +576,9 @@ pub const Client = union(enum) {
             .ollama => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
+                const call = try mapOllamaCall(req_arena.allocator(), messages, config);
 
-                const native_messages = try messagesToOllamaMessages(req_alloc, messages);
-                // Native `/api/chat` has no tool_choice; honor `.none` by
-                // withholding the tools entirely (the only enforceable case).
-                const suppress_tools = if (config.tool_choice) |tc| tc == .none else false;
-                const tools = if (!suppress_tools) blk: {
-                    break :blk if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
-                } else null;
-
-                const format: ?[]const u8 = if (config.response_format) |rf|
-                    (if (rf == .json) "json" else null)
-                else
-                    null;
-
-                var response = try ollama_native.chat(o, model, native_messages, tools, mapOllamaThink(config.effort), format, .{
-                    .num_predict = config.max_tokens,
-                    .temperature = config.temperature,
-                    .top_p = config.top_p,
-                    .seed = config.seed,
-                    .stop = config.stop,
-                    .frequency_penalty = config.frequency_penalty,
-                    .presence_penalty = config.presence_penalty,
-                });
+                var response = try ollama_native.chat(o, model, call.messages, call.tools, call.think, call.format, call.options);
                 defer response.deinit();
 
                 return ollamaResult(o.allocator, response.value);
@@ -884,36 +863,17 @@ pub const Client = union(enum) {
                 if (acc.err) |e| return e;
                 return openAiResponsesResult(o.allocator, try acc.response());
             },
-            // Native `/api/chat` streaming (NDJSON) so `num_ctx` can still be
-            // sized — the OpenAI-compatible `/v1` shim used by the other local
-            // arms defaults to 4096 and silently truncates. Mirrors the buffered
-            // `.ollama` arm's config mapping, then reuses `ollamaResult`.
+            // Native `/api/chat` streaming (NDJSON) keeps the `num_ctx` sizing
+            // that the OpenAI-compatible `/v1` shim (used by the other local
+            // arms) lacks — it defaults to 4096 and silently truncates.
             .ollama => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
-
-                const native_messages = try messagesToOllamaMessages(req_alloc, messages);
-                const suppress_tools = if (config.tool_choice) |tc| tc == .none else false;
-                const tools = if (!suppress_tools) blk: {
-                    break :blk if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
-                } else null;
-
-                const format: ?[]const u8 = if (config.response_format) |rf|
-                    (if (rf == .json) "json" else null)
-                else
-                    null;
+                const call = try mapOllamaCall(req_alloc, messages, config);
 
                 var acc = ollama_native.StreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
-                ollama_native.chatStream(o, model, native_messages, tools, mapOllamaThink(config.effort), format, .{
-                    .num_predict = config.max_tokens,
-                    .temperature = config.temperature,
-                    .top_p = config.top_p,
-                    .seed = config.seed,
-                    .stop = config.stop,
-                    .frequency_penalty = config.frequency_penalty,
-                    .presence_penalty = config.presence_penalty,
-                }, &acc, ollama_native.StreamAccumulator.onChunk) catch |err| switch (err) {
+                ollama_native.chatStream(o, model, call.messages, call.tools, call.think, call.format, call.options, &acc, ollama_native.StreamAccumulator.onChunk) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.ApiError,
                 };
@@ -2127,6 +2087,36 @@ fn mapOllamaUsage(response: ollama_native.ChatResponse) Usage {
     };
 }
 
+/// Native `/api/chat` request inputs mapped from a `GenerationConfig`. Shared by
+/// the buffered and streaming `.ollama` arms.
+const OllamaCall = struct {
+    messages: []ollama_native.Message,
+    tools: ?[]const openai_types.Tool,
+    think: ?bool,
+    format: ?[]const u8,
+    options: ollama_native.Options,
+};
+
+fn mapOllamaCall(allocator: std.mem.Allocator, messages: []const Message, config: GenerationConfig) !OllamaCall {
+    // Native `/api/chat` has no tool_choice; honor `.none` by withholding tools.
+    const suppress_tools = if (config.tool_choice) |tc| tc == .none else false;
+    return .{
+        .messages = try messagesToOllamaMessages(allocator, messages),
+        .tools = if (suppress_tools) null else if (config.tools) |t| try mapOpenAITools(allocator, t) else null,
+        .think = mapOllamaThink(config.effort),
+        .format = if (config.response_format) |rf| (if (rf == .json) "json" else null) else null,
+        .options = .{
+            .num_predict = config.max_tokens,
+            .temperature = config.temperature,
+            .top_p = config.top_p,
+            .seed = config.seed,
+            .stop = config.stop,
+            .frequency_penalty = config.frequency_penalty,
+            .presence_penalty = config.presence_penalty,
+        },
+    };
+}
+
 /// Map a native `/api/chat` `ChatResponse` (buffered or stream-reassembled) into
 /// the unified `GenerateResult`. Shared by the buffered and streaming arms.
 fn ollamaResult(alloc: std.mem.Allocator, response: ollama_native.ChatResponse) Client.Error!GenerateResult {
@@ -2148,7 +2138,6 @@ fn ollamaResult(alloc: std.mem.Allocator, response: ollama_native.ChatResponse) 
                     try tool_calls.append(ra, .{
                         .id = if (call.id) |id| try ra.dupe(u8, id) else "",
                         .name = if (f.name) |n| try ra.dupe(u8, n) else "",
-                        // Dupe args (an object) into the result arena.
                         .arguments = if (f.arguments) |v| try json.dupeValue(ra, v) else null,
                     });
                 }
