@@ -305,6 +305,83 @@ pub fn streamSse(
     }
 }
 
+/// POST `payload` and stream a newline-delimited JSON (NDJSON) response,
+/// invoking `callback` with each parsed line of type `EventT` until the body
+/// ends. Ollama's native `/api/chat` streams this way — one JSON object per
+/// line, with no `data:` framing or `[DONE]` sentinel — so it can't reuse
+/// `streamSse`. The transport (interrupt arming, status handling, connection
+/// poisoning) mirrors `streamSse`; keep the two in sync.
+pub fn streamNdjson(
+    allocator: std.mem.Allocator,
+    http_client: *std.http.Client,
+    url: []const u8,
+    extra_headers: []const std.http.Header,
+    payload: []const u8,
+    comptime EventT: type,
+    error_handler: anytype,
+    context: anytype,
+    callback: *const fn (@TypeOf(context), EventT) void,
+) SseError!void {
+    const interrupt: ?*Interrupt = if (@hasField(@TypeOf(error_handler.*), "interrupt"))
+        error_handler.interrupt
+    else
+        null;
+
+    const uri = try std.Uri.parse(url);
+    var req = try http_client.request(.POST, uri, .{
+        .extra_headers = extra_headers,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .accept_encoding = .{ .override = "identity" },
+        },
+        .redirect_behavior = .init(5),
+    });
+    defer req.deinit();
+
+    var guard = armInterrupt(interrupt, &req);
+    defer guard.deinit();
+    errdefer guard.poison();
+
+    req.transfer_encoding = .{ .content_length = payload.len };
+    var bw = try req.sendBodyUnflushed(&.{});
+    try bw.writer.writeAll(payload);
+    try bw.end();
+    try req.connection.?.flush();
+
+    var redirect_buf: [0]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+
+    const status_code: u10 = @intFromEnum(response.head.status);
+    if (status_code < 200 or status_code >= 300) {
+        error_handler.setErrorDetail(status_code, "");
+        return error.ApiError;
+    }
+
+    const transfer_buf = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(transfer_buf);
+    const reader = response.reader(transfer_buf);
+
+    while (true) {
+        const line = reader.takeDelimiter('\n') catch |err| switch (err) {
+            error.StreamTooLong => return error.InvalidSseData,
+            error.ReadFailed => {
+                guard.poison();
+                return;
+            },
+        } orelse return;
+
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        if (trimmed.len == 0) continue;
+
+        const parsed = std.json.parseFromSlice(EventT, allocator, trimmed, .{ .ignore_unknown_fields = true }) catch |err| {
+            std.log.err("NDJSON stream: failed to parse line: {}", .{err});
+            return error.InvalidSseData;
+        };
+        defer parsed.deinit();
+        callback(context, parsed.value);
+    }
+}
+
 /// Extract an owned copy of `error.message` from a provider JSON error body, or
 /// null if absent or unparseable. Caller frees the result with `allocator`.
 ///

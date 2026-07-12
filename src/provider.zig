@@ -602,35 +602,7 @@ pub const Client = union(enum) {
                 });
                 defer response.deinit();
 
-                var result = GenerateResult.init(o.allocator);
-                errdefer result.deinit();
-                const ra = result.arena.allocator();
-
-                result.finish_reason = mapOllamaFinishReason(response.value);
-                result.usage = mapOllamaUsage(response.value);
-
-                if (response.value.message) |msg| {
-                    if (msg.content) |c| {
-                        if (c.len > 0) result.text = try ra.dupe(u8, c);
-                    }
-                    if (msg.tool_calls) |calls| {
-                        var tool_calls: std.ArrayList(ToolCall) = .empty;
-                        for (calls) |call| {
-                            if (call.function) |f| {
-                                try tool_calls.append(ra, .{
-                                    .id = if (call.id) |id| try ra.dupe(u8, id) else "",
-                                    .name = if (f.name) |n| try ra.dupe(u8, n) else "",
-                                    // Dupe args (an object) into the result arena.
-                                    .arguments = if (f.arguments) |v| try json.dupeValue(ra, v) else null,
-                                });
-                            }
-                        }
-                        if (tool_calls.items.len > 0) {
-                            result.tool_calls = try tool_calls.toOwnedSlice(ra);
-                        }
-                    }
-                }
-                return result;
+                return ollamaResult(o.allocator, response.value);
             },
             // Hugging Face speaks OpenAI-compatible Chat Completions, not the
             // Responses API the `.openai` arm uses — so it gets its own arm.
@@ -912,15 +884,41 @@ pub const Client = union(enum) {
                 if (acc.err) |e| return e;
                 return openAiResponsesResult(o.allocator, try acc.response());
             },
-            // Ollama's native `/api/chat` is non-streaming; fall back to the
-            // buffered call and emit the whole text in one delta so the caller
-            // still sees it.
-            .ollama => {
-                const result = try self.generateContent(model, messages, config);
-                if (result.text) |t| {
-                    if (t.len > 0) on_text.call(t);
-                }
-                return result;
+            // Native `/api/chat` streaming (NDJSON) so `num_ctx` can still be
+            // sized — the OpenAI-compatible `/v1` shim used by the other local
+            // arms defaults to 4096 and silently truncates. Mirrors the buffered
+            // `.ollama` arm's config mapping, then reuses `ollamaResult`.
+            .ollama => |o| {
+                var req_arena = std.heap.ArenaAllocator.init(o.allocator);
+                defer req_arena.deinit();
+                const req_alloc = req_arena.allocator();
+
+                const native_messages = try messagesToOllamaMessages(req_alloc, messages);
+                const suppress_tools = if (config.tool_choice) |tc| tc == .none else false;
+                const tools = if (!suppress_tools) blk: {
+                    break :blk if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
+                } else null;
+
+                const format: ?[]const u8 = if (config.response_format) |rf|
+                    (if (rf == .json) "json" else null)
+                else
+                    null;
+
+                var acc = ollama_native.StreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
+                ollama_native.chatStream(o, model, native_messages, tools, mapOllamaThink(config.effort), format, .{
+                    .num_predict = config.max_tokens,
+                    .temperature = config.temperature,
+                    .top_p = config.top_p,
+                    .seed = config.seed,
+                    .stop = config.stop,
+                    .frequency_penalty = config.frequency_penalty,
+                    .presence_penalty = config.presence_penalty,
+                }, &acc, ollama_native.StreamAccumulator.onChunk) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.ApiError,
+                };
+                if (acc.err) |e| return e;
+                return ollamaResult(o.allocator, acc.response());
             },
         }
     }
@@ -2127,6 +2125,40 @@ fn mapOllamaUsage(response: ollama_native.ChatResponse) Usage {
         else
             null,
     };
+}
+
+/// Map a native `/api/chat` `ChatResponse` (buffered or stream-reassembled) into
+/// the unified `GenerateResult`. Shared by the buffered and streaming arms.
+fn ollamaResult(alloc: std.mem.Allocator, response: ollama_native.ChatResponse) Client.Error!GenerateResult {
+    var result = GenerateResult.init(alloc);
+    errdefer result.deinit();
+    const ra = result.arena.allocator();
+
+    result.finish_reason = mapOllamaFinishReason(response);
+    result.usage = mapOllamaUsage(response);
+
+    if (response.message) |msg| {
+        if (msg.content) |c| {
+            if (c.len > 0) result.text = try ra.dupe(u8, c);
+        }
+        if (msg.tool_calls) |calls| {
+            var tool_calls: std.ArrayList(ToolCall) = .empty;
+            for (calls) |call| {
+                if (call.function) |f| {
+                    try tool_calls.append(ra, .{
+                        .id = if (call.id) |id| try ra.dupe(u8, id) else "",
+                        .name = if (f.name) |n| try ra.dupe(u8, n) else "",
+                        // Dupe args (an object) into the result arena.
+                        .arguments = if (f.arguments) |v| try json.dupeValue(ra, v) else null,
+                    });
+                }
+            }
+            if (tool_calls.items.len > 0) {
+                result.tool_calls = try tool_calls.toOwnedSlice(ra);
+            }
+        }
+    }
+    return result;
 }
 
 /// Map a Gemini `GenerateContentResponse` (buffered or stream-reassembled) into
