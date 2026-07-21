@@ -218,7 +218,7 @@ fn dupeParts(self: *Chat, parts: []const Part) std.mem.Allocator.Error![]Part {
 }
 
 test "Chat init and deinit" {
-    var client = Client.init(std.testing.allocator, "test-key", .{});
+    var client = Client.init(std.testing.allocator, std.testing.io, "test-key", .{});
     defer client.deinit();
     var chat = Chat.init(&client, "gemini-2.5-flash", null, .{});
     defer chat.deinit();

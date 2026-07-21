@@ -54,7 +54,23 @@ pub const retry = @import("retry.zig");
 pub const json = @import("json.zig");
 pub const http = @import("http.zig");
 
+/// Recursively reference every public decl (the removed
+/// `std.testing.refAllDeclsRecursive`) so API breakage in paths no unit
+/// test exercises still fails `zig build test`.
+fn refAllDeclsRecursive(comptime T: type) void {
+    inline for (comptime @import("std").meta.declarations(T)) |decl| {
+        if (@TypeOf(@field(T, decl.name)) == type) {
+            switch (@typeInfo(@field(T, decl.name))) {
+                .@"struct", .@"enum", .@"union", .@"opaque" => refAllDeclsRecursive(@field(T, decl.name)),
+                else => {},
+            }
+        }
+        _ = &@field(T, decl.name);
+    }
+}
+
 test {
+    refAllDeclsRecursive(@This());
     _ = gemini.Client;
     _ = gemini.Chat;
     _ = gemini.types;

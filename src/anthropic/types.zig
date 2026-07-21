@@ -361,9 +361,9 @@ test "MessageRequest serializes to JSON" {
     defer buf.deinit();
     try std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &buf.writer);
     const json = buf.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "claude-sonnet-4-6") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "max_tokens") != null);
+    try std.testing.expect(std.mem.find(u8, json, "hello") != null);
+    try std.testing.expect(std.mem.find(u8, json, "claude-sonnet-4-6") != null);
+    try std.testing.expect(std.mem.find(u8, json, "max_tokens") != null);
 }
 
 test "MessageRequest with system prompt serializes correctly" {
@@ -380,8 +380,8 @@ test "MessageRequest with system prompt serializes correctly" {
     defer buf.deinit();
     try std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &buf.writer);
     const json = buf.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"system\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "You are helpful.") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"system\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "You are helpful.") != null);
 }
 
 test "MessageResponse.text extracts text" {
@@ -465,5 +465,5 @@ test "Role serializes correctly" {
     defer buf.deinit();
     try std.json.Stringify.value(msg, .{ .emit_null_optional_fields = false }, &buf.writer);
     const json = buf.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"user\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"user\"") != null);
 }

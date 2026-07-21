@@ -460,9 +460,9 @@ test "ChatCompletionRequest serializes to JSON" {
     defer buf.deinit();
     try std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &buf.writer);
     const json = buf.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "gpt-4o") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "temperature") != null);
+    try std.testing.expect(std.mem.find(u8, json, "hello") != null);
+    try std.testing.expect(std.mem.find(u8, json, "gpt-4o") != null);
+    try std.testing.expect(std.mem.find(u8, json, "temperature") != null);
 }
 
 test "ChatCompletionResponse.text extracts text" {
@@ -542,10 +542,10 @@ test "ResponsesRequest serializes flat tools and reasoning" {
     defer buf.deinit();
     try std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &buf.writer);
     const json = buf.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"max_output_tokens\":4096") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"effort\":\"medium\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"max_output_tokens\":4096") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"effort\":\"medium\"") != null);
     // Flat function tool: name is a sibling of type, not nested under "function".
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function\",\"name\":\"goto\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"type\":\"function\",\"name\":\"goto\"") != null);
 }
 
 test "Role serializes correctly" {
@@ -554,5 +554,5 @@ test "Role serializes correctly" {
     defer buf.deinit();
     try std.json.Stringify.value(msg, .{ .emit_null_optional_fields = false }, &buf.writer);
     const json = buf.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"user\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"user\"") != null);
 }

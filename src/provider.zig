@@ -451,18 +451,22 @@ pub const Client = union(enum) {
         /// OpenAI-compatible clients; ignored by gemini/anthropic.
         bill_to: ?[]const u8 = null,
         /// GCP project for `.vertex` project/location mode (falls back to
-        /// GOOGLE_CLOUD_PROJECT). When set, `Credentials.key` must be an
-        /// OAuth access token, not an API key. Ignored by other providers.
+        /// GOOGLE_CLOUD_PROJECT in `environ`). When set, `Credentials.key`
+        /// must be an OAuth access token, not an API key. Ignored by other
+        /// providers.
         project: ?[]const u8 = null,
         /// GCP location for `.vertex` (falls back to GOOGLE_CLOUD_LOCATION,
-        /// then GOOGLE_CLOUD_REGION, then "global"). Ignored by other
-        /// providers.
+        /// then GOOGLE_CLOUD_REGION in `environ`, then "global"). Ignored by
+        /// other providers.
         location: ?[]const u8 = null,
+        /// Environment for the `.vertex` project/location fallbacks above.
+        /// The default `.empty` disables env detection.
+        environ: std.process.Environ = .empty,
     };
 
     /// Construct the per-provider client for `credentials`; the caller owns it
     /// and must release it with `deinit`.
-    pub fn init(allocator: std.mem.Allocator, credentials: Credentials, options: InitOptions) !Client {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, credentials: Credentials, options: InitOptions) !Client {
         return switch (credentials.provider) {
             inline else => |tag| blk: {
                 const ClientPtr = @FieldType(Client, @tagName(tag));
@@ -475,11 +479,11 @@ pub const Client = union(enum) {
                 if (base_url) |u| impl_opts.base_url = u;
                 if (@hasField(Impl.InitOptions, "bill_to")) impl_opts.bill_to = options.bill_to;
                 if (tag == .vertex) impl_opts.vertex = .{
-                    .project = options.project orelse std.posix.getenv("GOOGLE_CLOUD_PROJECT"),
-                    .location = options.location orelse std.posix.getenv("GOOGLE_CLOUD_LOCATION") orelse
-                        std.posix.getenv("GOOGLE_CLOUD_REGION") orelse "global",
+                    .project = options.project orelse options.environ.getPosix("GOOGLE_CLOUD_PROJECT"),
+                    .location = options.location orelse options.environ.getPosix("GOOGLE_CLOUD_LOCATION") orelse
+                        options.environ.getPosix("GOOGLE_CLOUD_REGION") orelse "global",
                 };
-                client.* = Impl.init(allocator, credentials.key, impl_opts);
+                client.* = Impl.init(allocator, io, credentials.key, impl_opts);
                 break :blk @unionInit(Client, @tagName(tag), client);
             },
         };
@@ -1190,32 +1194,32 @@ fn openAiPreset(tag: Tag) ?OpenAiPreset {
 /// True when GOOGLE_GENAI_USE_VERTEXAI is "1" or "true" (case-insensitive),
 /// matching go-genai's backend selection. Gates env detection so exactly one
 /// of `.gemini`/`.vertex` can ever detect from GOOGLE_API_KEY.
-pub fn useVertex() bool {
-    const v = std.posix.getenv("GOOGLE_GENAI_USE_VERTEXAI") orelse return false;
+pub fn useVertex(environ: std.process.Environ) bool {
+    const v = environ.getPosix("GOOGLE_GENAI_USE_VERTEXAI") orelse return false;
     return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
 }
 
-pub fn envApiKey(tag: Tag) ?[:0]const u8 {
+pub fn envApiKey(environ: std.process.Environ, tag: Tag) ?[:0]const u8 {
     if (openAiPreset(tag)) |p| {
-        if (p.env_var) |v| return std.posix.getenv(v);
+        if (p.env_var) |v| return environ.getPosix(v);
         return p.placeholder_key;
     }
     return switch (tag) {
-        .anthropic => std.posix.getenv("ANTHROPIC_API_KEY"),
-        .openai => std.posix.getenv("OPENAI_API_KEY"),
-        .gemini => if (useVertex())
+        .anthropic => environ.getPosix("ANTHROPIC_API_KEY"),
+        .openai => environ.getPosix("OPENAI_API_KEY"),
+        .gemini => if (useVertex(environ))
             null
         else
-            std.posix.getenv("GOOGLE_API_KEY") orelse std.posix.getenv("GEMINI_API_KEY"),
+            environ.getPosix("GOOGLE_API_KEY") orelse environ.getPosix("GEMINI_API_KEY"),
         // Express mode only: with GOOGLE_CLOUD_PROJECT set, the credential
         // must be an OAuth access token the caller supplies explicitly —
         // not detectable from env. VERTEX_API_KEY is unambiguous vertex
         // intent, so it skips the GOOGLE_GENAI_USE_VERTEXAI opt-in.
-        .vertex => if (std.posix.getenv("GOOGLE_CLOUD_PROJECT") != null)
+        .vertex => if (environ.getPosix("GOOGLE_CLOUD_PROJECT") != null)
             null
         else
-            std.posix.getenv("VERTEX_API_KEY") orelse
-                (if (useVertex()) std.posix.getenv("GOOGLE_API_KEY") else null),
+            environ.getPosix("VERTEX_API_KEY") orelse
+                (if (useVertex(environ)) environ.getPosix("GOOGLE_API_KEY") else null),
         else => unreachable,
     };
 }
@@ -1281,11 +1285,11 @@ pub const default_candidates: []const Tag = blk: {
 };
 
 /// Scan `candidates` and fill `buf` with a `Credentials` entry for each
-/// provider that has a key in env, preserving candidate order. Returns the
-/// subslice of `buf` actually filled. `buf.len` must be >= `candidates.len`.
-pub fn detectKeys(buf: []Credentials, candidates: []const Tag) []Credentials {
+/// provider that has a key in `environ`, preserving candidate order. Returns
+/// the subslice of `buf` actually filled. `buf.len` must be >= `candidates.len`.
+pub fn detectKeys(environ: std.process.Environ, buf: []Credentials, candidates: []const Tag) []Credentials {
     var n: usize = 0;
-    for (candidates) |p| if (envApiKey(p)) |key| {
+    for (candidates) |p| if (envApiKey(environ, p)) |key| {
         buf[n] = .{ .provider = p, .key = key };
         n += 1;
     };
@@ -1315,13 +1319,14 @@ fn isLoopbackUrl(url: []const u8) bool {
 /// OpenAI naming convention it expects.
 fn listOpenAICompatibleModelIds(
     allocator: std.mem.Allocator,
+    io: std.Io,
     arena: std.mem.Allocator,
     ids: *std.ArrayList([]const u8),
     api_key: [:0]const u8,
     base_url: [:0]const u8,
     retry_policy: retry.RetryPolicy,
 ) !void {
-    var client = openai_mod.init(allocator, api_key, .{ .base_url = base_url, .retry_policy = retry_policy });
+    var client = openai_mod.init(allocator, io, api_key, .{ .base_url = base_url, .retry_policy = retry_policy });
     defer client.deinit();
     var resp = try client.listModels();
     defer resp.deinit();
@@ -1333,12 +1338,16 @@ fn listOpenAICompatibleModelIds(
 /// Fetch chat-capable model IDs for `tag`, allocated in `arena`. Ordering
 /// is provider-defined — sort at the call site if needed. `base_url_override`
 /// is honored for `openai` and every preset (OpenAI-compatible) provider.
+/// `environ` feeds the `.vertex` project/location fallbacks; pass `.empty`
+/// to disable env detection.
 pub fn listChatModelIds(
     allocator: std.mem.Allocator,
+    io: std.Io,
     arena: std.mem.Allocator,
     tag: Tag,
     api_key: [:0]const u8,
     base_url_override: ?[:0]const u8,
+    environ: std.process.Environ,
 ) ![][]const u8 {
     var ids: std.ArrayList([]const u8) = .empty;
 
@@ -1347,10 +1356,10 @@ pub fn listChatModelIds(
     if (openAiPreset(tag)) |p| {
         const url = base_url_override orelse p.base_url;
         const policy: retry.RetryPolicy = if (p.local and isLoopbackUrl(url)) .disabled else .{};
-        try listOpenAICompatibleModelIds(allocator, arena, &ids, api_key, url, policy);
+        try listOpenAICompatibleModelIds(allocator, io, arena, &ids, api_key, url, policy);
     } else switch (tag) {
         .anthropic => {
-            var client = anthropic_mod.init(allocator, api_key, .{});
+            var client = anthropic_mod.init(allocator, io, api_key, .{});
             defer client.deinit();
             var resp = try client.listModels();
             defer resp.deinit();
@@ -1360,7 +1369,7 @@ pub fn listChatModelIds(
             }
         },
         .openai => {
-            var client = openai_mod.init(allocator, api_key, if (base_url_override) |u| .{ .base_url = u } else .{});
+            var client = openai_mod.init(allocator, io, api_key, if (base_url_override) |u| .{ .base_url = u } else .{});
             defer client.deinit();
             var resp = try client.listModels();
             defer resp.deinit();
@@ -1370,7 +1379,7 @@ pub fn listChatModelIds(
             }
         },
         .gemini => {
-            var client = gemini_mod.init(allocator, api_key, .{});
+            var client = gemini_mod.init(allocator, io, api_key, .{});
             defer client.deinit();
             var resp = try client.listModels(.{});
             defer resp.deinit();
@@ -1384,10 +1393,10 @@ pub fn listChatModelIds(
             }
         },
         .vertex => {
-            var client = gemini_mod.init(allocator, api_key, .{ .vertex = .{
-                .project = std.posix.getenv("GOOGLE_CLOUD_PROJECT"),
-                .location = std.posix.getenv("GOOGLE_CLOUD_LOCATION") orelse
-                    std.posix.getenv("GOOGLE_CLOUD_REGION") orelse "global",
+            var client = gemini_mod.init(allocator, io, api_key, .{ .vertex = .{
+                .project = environ.getPosix("GOOGLE_CLOUD_PROJECT"),
+                .location = environ.getPosix("GOOGLE_CLOUD_LOCATION") orelse
+                    environ.getPosix("GOOGLE_CLOUD_REGION") orelse "global",
             } });
             defer client.deinit();
             var resp = try client.listModels(.{});
@@ -1415,7 +1424,7 @@ pub fn listChatModelIds(
 }
 
 test "envApiKey: ollama returns placeholder regardless of env" {
-    try std.testing.expectEqualStrings("ollama", envApiKey(.ollama).?);
+    try std.testing.expectEqualStrings("ollama", envApiKey(.empty, .ollama).?);
 }
 
 test "isLoopbackUrl: loopback hosts disable retry, remote hosts keep it" {
@@ -1452,7 +1461,7 @@ test "huggingface: reads HF_TOKEN and has sensible defaults" {
 }
 
 test "llama_cpp: placeholder key, loopback default, excluded from auto-detect" {
-    try std.testing.expectEqualStrings("llama.cpp", envApiKey(.llama_cpp).?);
+    try std.testing.expectEqualStrings("llama.cpp", envApiKey(.empty, .llama_cpp).?);
     try std.testing.expect(isLoopbackUrl(llama_cpp_default_base_url));
     // Placeholder key, so it must be live-probed — never env-auto-detected.
     for (default_candidates) |t| {
@@ -1566,13 +1575,13 @@ fn separateSystemMessages(allocator: std.mem.Allocator, messages: []const Messag
                         if (p.value == .object) {
                             response_val = p.value;
                         } else {
-                            var obj = std.json.ObjectMap.init(allocator);
-                            try obj.put("result", p.value);
+                            var obj: std.json.ObjectMap = .empty;
+                            try obj.put(allocator, "result", p.value);
                             response_val = std.json.Value{ .object = obj };
                         }
                     } else {
-                        var obj = std.json.ObjectMap.init(allocator);
-                        try obj.put("result", std.json.Value{ .string = res.content });
+                        var obj: std.json.ObjectMap = .empty;
+                        try obj.put(allocator, "result", std.json.Value{ .string = res.content });
                         response_val = std.json.Value{ .object = obj };
                     }
                 }
@@ -1737,7 +1746,7 @@ fn messagesToAnthropicMessages(allocator: std.mem.Allocator, messages: []const M
                     .name = call.name,
                     // Anthropic rejects a tool_use block with no `input`; a
                     // no-arg tool must send `{}`.
-                    .input = call.arguments orelse .{ .object = .init(allocator) },
+                    .input = call.arguments orelse .{ .object = .empty },
                 });
             }
         }
@@ -2329,7 +2338,7 @@ fn mapGeminiGenerationConfig(model: []const u8, config: GenerationConfig) gemini
 /// the categorical `thinkingLevel`. Sending the wrong field returns HTTP 400
 /// ("Thinking level is not supported for this model.").
 fn geminiUsesThinkingBudget(model: []const u8) bool {
-    return std.mem.indexOf(u8, model, "gemini-2.5") != null;
+    return std.mem.find(u8, model, "gemini-2.5") != null;
 }
 
 fn mapEffortToGeminiConfig(model: []const u8, level: Effort) gemini_types.ThinkingConfig {

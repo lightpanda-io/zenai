@@ -42,13 +42,13 @@ pub const InitOptions = struct {
 };
 
 /// Create a new Anthropic API client.
-pub fn init(allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
+pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, options: InitOptions) Client {
     return .{
         .allocator = allocator,
         .api_key = api_key,
         .base_url = options.base_url,
         .api_version = options.api_version,
-        .http_client = .{ .allocator = allocator },
+        .http_client = .{ .allocator = allocator, .io = io },
         .retry_policy = options.retry_policy,
         .last_error_message = null,
         .last_error_status = null,
@@ -373,7 +373,7 @@ pub fn isChatModel(_: types.Model) bool {
 }
 
 test "Client init and deinit" {
-    var client = Client.init(std.testing.allocator, "test-key", .{});
+    var client = Client.init(std.testing.allocator, std.testing.io, "test-key", .{});
     defer client.deinit();
     try std.testing.expectEqualStrings("test-key", client.api_key);
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1", client.base_url);
@@ -381,7 +381,7 @@ test "Client init and deinit" {
 }
 
 test "listModels: missing api key" {
-    var client = Client.init(std.testing.allocator, "", .{});
+    var client = Client.init(std.testing.allocator, std.testing.io, "", .{});
     defer client.deinit();
     try std.testing.expectError(error.MissingApiKey, client.listModels());
 }

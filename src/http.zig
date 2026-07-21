@@ -9,30 +9,34 @@ pub const FetchError = error{
 } || std.http.Client.FetchError || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error || std.Uri.ParseError;
 
 /// Cross-thread trigger for aborting an in-flight HTTP request. A request path
-/// arms it with the active socket fd around the blocking read (see `armInterrupt`);
-/// another thread (the SIGINT handler) calls `fire` to `shutdown` that socket,
-/// which unblocks the read so the request returns an error instead of waiting
-/// for the server. The errored connection is dropped from the pool by `Request.deinit`.
+/// arms it with the active connection's stream around the blocking read (see
+/// `armInterrupt`); another thread (the SIGINT handler) calls `fire` to
+/// `shutdown` that socket, which unblocks the read so the request returns an
+/// error instead of waiting for the server. The errored connection is dropped
+/// from the pool by `Request.deinit`.
 ///
 /// `fire` is sticky: one landing before the socket is armed (during connect/TLS)
 /// is honored by `arm` rather than lost. `reset` clears it per turn.
 pub const Interrupt = struct {
-    fd: std.atomic.Value(std.posix.socket_t) = .init(-1),
+    stream: std.atomic.Value(?*const std.Io.net.Stream) = .init(null),
+    /// Valid whenever `stream` is non-null; written by `arm` before the
+    /// `stream` release-store so `fire`'s acquire-load orders the read.
+    io: std.Io = undefined,
     fired: std.atomic.Value(bool) = .init(false),
 
-    fn arm(self: *Interrupt, fd: std.posix.socket_t) void {
-        self.fd.store(fd, .release);
-        if (self.fired.load(.acquire)) std.posix.shutdown(fd, .both) catch {};
+    fn arm(self: *Interrupt, io: std.Io, stream: *const std.Io.net.Stream) void {
+        self.io = io;
+        self.stream.store(stream, .release);
+        if (self.fired.load(.acquire)) stream.shutdown(io, .both) catch {};
     }
 
     fn disarm(self: *Interrupt) void {
-        self.fd.store(-1, .release);
+        self.stream.store(null, .release);
     }
 
     pub fn fire(self: *Interrupt) void {
         self.fired.store(true, .release);
-        const fd = self.fd.load(.acquire);
-        if (fd >= 0) std.posix.shutdown(fd, .both) catch {};
+        if (self.stream.load(.acquire)) |stream| stream.shutdown(self.io, .both) catch {};
     }
 
     pub fn isFired(self: *const Interrupt) bool {
@@ -42,14 +46,14 @@ pub const Interrupt = struct {
     /// Clear armed + fired state so the interrupt is reusable next turn.
     pub fn reset(self: *Interrupt) void {
         self.fired.store(false, .release);
-        self.fd.store(-1, .release);
+        self.stream.store(null, .release);
     }
 };
 
-/// Arms an optional `Interrupt` with `req`'s socket fd so a cross-thread
+/// Arms an optional `Interrupt` with `req`'s connection stream so a cross-thread
 /// `Interrupt.fire` can abort a blocking read on that connection. The guard
 /// must outlive the read but be torn down before `req.deinit` (LIFO) so a late
-/// `fire` can't `shutdown` a fd the pool has already recycled:
+/// `fire` can't `shutdown` a socket the pool has already recycled:
 ///
 ///     var guard = http.armInterrupt(interrupt, &req);
 ///     defer guard.deinit();
@@ -73,7 +77,7 @@ pub const InterruptGuard = struct {
 
 pub fn armInterrupt(interrupt: ?*Interrupt, req: *std.http.Client.Request) InterruptGuard {
     if (interrupt) |it| {
-        if (req.connection) |conn| it.arm(conn.stream_reader.getStream().handle);
+        if (req.connection) |conn| it.arm(req.client.io, &conn.stream_reader.stream);
     }
     return .{ .interrupt = interrupt, .req = req };
 }
@@ -107,7 +111,7 @@ pub fn fetchJsonWithRetry(
             // Don't retry a request the user cancelled.
             if (interrupt) |it| if (it.isFired()) return err;
             if (retry.isRetryableFetchError(err) and attempt + 1 < policy.max_attempts) {
-                retry.sleepMs(retry.backoffMs(attempt, policy));
+                retry.sleepMs(http_client.io, retry.backoffMs(http_client.io, attempt, policy));
                 continue;
             }
             return err;
@@ -123,7 +127,7 @@ pub fn fetchJsonWithRetry(
         }
 
         if (retry.isRetryableStatus(status_code) and attempt + 1 < policy.max_attempts) {
-            retry.sleepMs(retry.backoffMs(attempt, policy));
+            retry.sleepMs(http_client.io, retry.backoffMs(http_client.io, attempt, policy));
             continue;
         }
         error_handler.setErrorDetail(status_code, body);
@@ -133,7 +137,7 @@ pub fn fetchJsonWithRetry(
 
 /// A single HTTP round-trip into `response_writer`, mirroring
 /// `std.http.Client.fetch` (redirects, content-encoding) but arming
-/// `interrupt` with the connection's socket fd around the blocking read so a
+/// `interrupt` with the connection's stream around the blocking read so a
 /// SIGINT on another thread can abort it. Returns the response status.
 fn fetchInterruptible(
     allocator: std.mem.Allocator,
@@ -162,7 +166,7 @@ fn fetchInterruptible(
     });
     defer req.deinit();
 
-    // Arm the interrupt with this connection's fd around the send/receive, and
+    // Arm the interrupt with this connection's stream around the send/receive, and
     // poison the connection on any failed exchange (including an interrupt-
     // induced read error) so `req.deinit` drops the socket instead of pooling
     // one with unknown framing.
@@ -316,7 +320,7 @@ fn streamLines(
             },
         } orelse return;
 
-        const json_data = switch (frame(std.mem.trimRight(u8, line, "\r"))) {
+        const json_data = switch (frame(std.mem.trimEnd(u8, line, "\r"))) {
             .skip => continue,
             .stop => return,
             .parse => |d| d,
