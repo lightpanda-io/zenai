@@ -376,6 +376,14 @@ const ai: zenai.provider.Client = .{ .gemini = &gemini_client };
 // });
 // const ai: zenai.provider.Client = .{ .llama_cpp = &llama_client };
 
+// Or any OpenAI-compatible server (vLLM, LiteLLM, Together, Groq, etc.).
+// Auto-detected when OPENAI_BASE_URL is set; the key comes from
+// OPENAI_API_KEY:
+// export OPENAI_BASE_URL=https://my-custom-server.com/v1
+// export OPENAI_API_KEY=my-key
+// var custom_client = zenai.generic_openai.Client.init(allocator, api_key, .{});
+// const ai: zenai.provider.Client = .{ .generic_openai = &custom_client };
+
 var result = try ai.generateContent("gemini-2.5-flash", &.{
     .{ .role = .user, .content = "What is Zig?" },
 }, .{});
@@ -429,7 +437,7 @@ switch (ai) {
 
 **Provider abstraction:**
 - Unified text generation, streaming, and embeddings
-- OpenAI-compatible backends: Ollama, Hugging Face, and llama.cpp (`llama-server`)
+- OpenAI-compatible backends: Ollama, Hugging Face, llama.cpp (`llama-server`), and any custom server via `OPENAI_BASE_URL`
 - `lastError()` to surface the status and message behind a failed request
 - Escape hatches to provider-specific APIs
 

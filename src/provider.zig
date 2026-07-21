@@ -430,6 +430,9 @@ pub const Client = union(enum) {
     ollama: *openai_mod,
     huggingface: *openai_mod,
     llama_cpp: *openai_mod,
+    /// Any OpenAI-compatible server configured via `OPENAI_BASE_URL`
+    /// + `OPENAI_API_KEY`. Auto-detected when `OPENAI_BASE_URL` is set.
+    generic_openai: *openai_mod,
     vercel: *openai_mod,
     mistral: *openai_mod,
 
@@ -596,7 +599,7 @@ pub const Client = union(enum) {
             },
             // Hugging Face speaks OpenAI-compatible Chat Completions, not the
             // Responses API the `.openai` arm uses — so it gets its own arm.
-            .huggingface, .llama_cpp, .vercel, .mistral => |o| {
+            .huggingface, .llama_cpp, .generic_openai, .vercel, .mistral => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
@@ -681,7 +684,7 @@ pub const Client = union(enum) {
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
                 }, .{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Wrapper.wrap);
             },
-            .openai, .huggingface, .llama_cpp, .vercel, .mistral => |o| {
+            .openai, .huggingface, .llama_cpp, .generic_openai, .vercel, .mistral => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
@@ -797,7 +800,7 @@ pub const Client = union(enum) {
                 if (acc.err) |e| return e;
                 return anthropicResult(a.allocator, try acc.response());
             },
-            .huggingface, .llama_cpp, .vercel, .mistral => |o| {
+            .huggingface, .generic_openai, .llama_cpp, .vercel, .mistral => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
@@ -903,7 +906,7 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
-            .openai, .ollama, .huggingface, .llama_cpp, .vercel, .mistral => |o| {
+            .openai, .ollama, .huggingface, .generic_openai, .llama_cpp, .vercel, .mistral => |o| {
                 var response = try o.embedText(model, text);
                 defer response.deinit();
                 var result = EmbedResult.init(o.allocator);
@@ -1179,6 +1182,14 @@ fn openAiPreset(tag: Tag) ?OpenAiPreset {
     return switch (tag) {
         .ollama => .{ .base_url = "http://localhost:11434/v1", .placeholder_key = "ollama", .default_model = "qwen3.5:latest", .local = true },
         .huggingface => .{ .base_url = "https://router.huggingface.co/v1", .env_var = "HF_TOKEN", .default_model = "Qwen/Qwen3.5-122B-A10B" },
+        .generic_openai => blk: {
+            const base_url = std.posix.getenv("OPENAI_BASE_URL") orelse return null;
+            break :blk .{
+                .base_url = base_url,
+                .env_var = "OPENAI_API_KEY",
+                .default_model = "",
+            };
+        },
         // Empty default: the served model is whatever `llama-server` loaded.
         .llama_cpp => .{ .base_url = "http://localhost:8080/v1", .placeholder_key = "llama.cpp", .default_model = "", .local = true },
         .vercel => .{ .base_url = "https://ai-gateway.vercel.sh/v1", .env_var = "AI_GATEWAY_API_KEY", .default_model = "openai/gpt-5.5" },
@@ -1205,6 +1216,10 @@ pub fn envApiKey(environ: std.process.Environ, tag: Tag) ?[:0]const u8 {
     return switch (tag) {
         .anthropic => environ.getPosix("ANTHROPIC_API_KEY"),
         .openai => environ.getPosix("OPENAI_API_KEY"),
+        .generic_openai => if (std.posix.getenv("OPENAI_BASE_URL") != null)
+            std.posix.getenv("OPENAI_API_KEY")
+        else
+            null,
         .gemini => if (useVertex(environ))
             null
         else
@@ -1231,6 +1246,7 @@ pub fn envVarName(tag: Tag) []const u8 {
         .openai => "OPENAI_API_KEY",
         .gemini => "GOOGLE_API_KEY/GEMINI_API_KEY",
         .vertex => "VERTEX_API_KEY/GOOGLE_API_KEY",
+        .generic_openai => "OPENAI_API_KEY",
         else => unreachable,
     };
 }
@@ -1246,6 +1262,7 @@ pub fn defaultModel(tag: Tag) []const u8 {
         .anthropic => "claude-sonnet-5",
         .openai => "gpt-5.5",
         .gemini, .vertex => "gemini-3.6-flash",
+        .generic_openai => "",
         else => unreachable,
     };
 }
@@ -1281,6 +1298,14 @@ pub const default_candidates: []const Tag = blk: {
     var arr: [all.len]Tag = undefined;
     var n: usize = 0;
     for (all) |t| {
+        // generic_openai is always a candidate; the runtime envApiKey gates
+        // detection on OPENAI_BASE_URL being set, so it's only auto-detected
+        // when the user has explicitly configured a custom server.
+        if (t == .generic_openai) {
+            arr[n] = t;
+            n += 1;
+            continue;
+        }
         if (openAiPreset(t)) |p| if (p.local) continue;
         arr[n] = t;
         n += 1;
@@ -1503,6 +1528,29 @@ test "vercel/mistral: real-key cloud presets, auto-detectable" {
         try std.testing.expect(t != .ollama and t != .llama_cpp);
     }
     try std.testing.expect(saw_vercel and saw_mistral);
+}
+
+test "generic_openai: no preset when OPENAI_BASE_URL is unset" {
+    // Without the env var, there's no valid base URL — the preset must be null
+    // so generic_openai never silently falls back to api.openai.com.
+    try std.testing.expect(openAiPreset(.generic_openai) == null);
+    try std.testing.expect(envApiKey(.generic_openai) == null);
+}
+
+test "generic_openai: envVarName and defaultModel" {
+    // These don't need the env var set — they're compile-time constants.
+    try std.testing.expectEqualStrings("OPENAI_API_KEY", envVarName(.generic_openai));
+    try std.testing.expectEqualStrings("", defaultModel(.generic_openai));
+}
+
+test "generic_openai: present in default_candidates (runtime-gated)" {
+    // generic_openai is always in the candidate list; runtime envApiKey
+    // gates actual detection on OPENAI_BASE_URL being set.
+    var found = false;
+    for (default_candidates) |t| {
+        if (t == .generic_openai) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "defaultEffort: none for Mistral, unset elsewhere" {
