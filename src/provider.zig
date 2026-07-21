@@ -1243,7 +1243,7 @@ pub fn defaultModel(tag: Tag) []const u8 {
     return switch (tag) {
         .anthropic => "claude-sonnet-5",
         .openai => "gpt-5.5",
-        .gemini, .vertex => "gemini-3.5-flash",
+        .gemini, .vertex => "gemini-3.6-flash",
         else => unreachable,
     };
 }
