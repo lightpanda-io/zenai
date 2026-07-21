@@ -478,11 +478,7 @@ pub const Client = union(enum) {
                 var impl_opts: Impl.InitOptions = .{ .retry_policy = options.retry_policy };
                 if (base_url) |u| impl_opts.base_url = u;
                 if (@hasField(Impl.InitOptions, "bill_to")) impl_opts.bill_to = options.bill_to;
-                if (tag == .vertex) impl_opts.vertex = .{
-                    .project = options.project orelse options.environ.getPosix("GOOGLE_CLOUD_PROJECT"),
-                    .location = options.location orelse options.environ.getPosix("GOOGLE_CLOUD_LOCATION") orelse
-                        options.environ.getPosix("GOOGLE_CLOUD_REGION") orelse "global",
-                };
+                if (tag == .vertex) impl_opts.vertex = vertexConfigFromEnv(options.environ, options.project, options.location);
                 client.* = Impl.init(allocator, io, credentials.key, impl_opts);
                 break :blk @unionInit(Client, @tagName(tag), client);
             },
@@ -1296,6 +1292,17 @@ pub fn detectKeys(environ: std.process.Environ, buf: []Credentials, candidates: 
     return buf[0..n];
 }
 
+/// Vertex project/location resolution shared by `Client.init` and
+/// `listChatModelIds`: explicit values win, then the conventional
+/// GOOGLE_CLOUD_* env vars, then the "global" location.
+fn vertexConfigFromEnv(environ: std.process.Environ, project: ?[]const u8, location: ?[]const u8) gemini_mod.VertexConfig {
+    return .{
+        .project = project orelse environ.getPosix("GOOGLE_CLOUD_PROJECT"),
+        .location = location orelse environ.getPosix("GOOGLE_CLOUD_LOCATION") orelse
+            environ.getPosix("GOOGLE_CLOUD_REGION") orelse "global",
+    };
+}
+
 /// True when `url`'s host is a loopback address, where a refused connection is
 /// instant and definitive rather than a transient error worth retrying. Returns
 /// false on an unparseable or host-less URL, defaulting callers to retry.
@@ -1335,26 +1342,33 @@ fn listOpenAICompatibleModelIds(
     }
 }
 
+/// Options for `listChatModelIds`. Only some providers consume each field;
+/// the rest ignore them.
+pub const ListModelsOptions = struct {
+    /// Overrides the provider's default base URL. Honored for `openai` and
+    /// every preset (OpenAI-compatible) provider.
+    base_url: ?[:0]const u8 = null,
+    /// Environment for the `.vertex` project/location fallbacks. The default
+    /// `.empty` disables env detection.
+    environ: std.process.Environ = .empty,
+};
+
 /// Fetch chat-capable model IDs for `tag`, allocated in `arena`. Ordering
-/// is provider-defined — sort at the call site if needed. `base_url_override`
-/// is honored for `openai` and every preset (OpenAI-compatible) provider.
-/// `environ` feeds the `.vertex` project/location fallbacks; pass `.empty`
-/// to disable env detection.
+/// is provider-defined — sort at the call site if needed.
 pub fn listChatModelIds(
     allocator: std.mem.Allocator,
     io: std.Io,
     arena: std.mem.Allocator,
     tag: Tag,
     api_key: [:0]const u8,
-    base_url_override: ?[:0]const u8,
-    environ: std.process.Environ,
+    options: ListModelsOptions,
 ) ![][]const u8 {
     var ids: std.ArrayList([]const u8) = .empty;
 
     // Preset catalogs don't follow isChatModel's naming, so none filters. A
     // not-running loopback server refuses instantly — disable retry there.
     if (openAiPreset(tag)) |p| {
-        const url = base_url_override orelse p.base_url;
+        const url = options.base_url orelse p.base_url;
         const policy: retry.RetryPolicy = if (p.local and isLoopbackUrl(url)) .disabled else .{};
         try listOpenAICompatibleModelIds(allocator, io, arena, &ids, api_key, url, policy);
     } else switch (tag) {
@@ -1369,7 +1383,7 @@ pub fn listChatModelIds(
             }
         },
         .openai => {
-            var client = openai_mod.init(allocator, io, api_key, if (base_url_override) |u| .{ .base_url = u } else .{});
+            var client = openai_mod.init(allocator, io, api_key, if (options.base_url) |u| .{ .base_url = u } else .{});
             defer client.deinit();
             var resp = try client.listModels();
             defer resp.deinit();
@@ -1393,11 +1407,9 @@ pub fn listChatModelIds(
             }
         },
         .vertex => {
-            var client = gemini_mod.init(allocator, io, api_key, .{ .vertex = .{
-                .project = environ.getPosix("GOOGLE_CLOUD_PROJECT"),
-                .location = environ.getPosix("GOOGLE_CLOUD_LOCATION") orelse
-                    environ.getPosix("GOOGLE_CLOUD_REGION") orelse "global",
-            } });
+            var client = gemini_mod.init(allocator, io, api_key, .{
+                .vertex = vertexConfigFromEnv(options.environ, null, null),
+            });
             defer client.deinit();
             var resp = try client.listModels(.{});
             defer resp.deinit();

@@ -4,8 +4,8 @@ const zenai = @import("zenai");
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
-    const api_key = init.environ_map.get("GOOGLE_API_KEY") orelse
-        init.environ_map.get("GEMINI_API_KEY") orelse
+    const api_key = init.minimal.environ.getPosix("GOOGLE_API_KEY") orelse
+        init.minimal.environ.getPosix("GEMINI_API_KEY") orelse
         {
             std.debug.print("Error: set GOOGLE_API_KEY or GEMINI_API_KEY environment variable\n", .{});
             std.process.exit(1);

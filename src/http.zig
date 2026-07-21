@@ -18,25 +18,23 @@ pub const FetchError = error{
 /// `fire` is sticky: one landing before the socket is armed (during connect/TLS)
 /// is honored by `arm` rather than lost. `reset` clears it per turn.
 pub const Interrupt = struct {
-    stream: std.atomic.Value(?*const std.Io.net.Stream) = .init(null),
-    /// Valid whenever `stream` is non-null; written by `arm` before the
-    /// `stream` release-store so `fire`'s acquire-load orders the read.
-    io: std.Io = undefined,
+    /// The armed connection's stream reader, which carries both the stream
+    /// and the `Io` needed to shut it down.
+    reader: std.atomic.Value(?*const std.Io.net.Stream.Reader) = .init(null),
     fired: std.atomic.Value(bool) = .init(false),
 
-    fn arm(self: *Interrupt, io: std.Io, stream: *const std.Io.net.Stream) void {
-        self.io = io;
-        self.stream.store(stream, .release);
-        if (self.fired.load(.acquire)) stream.shutdown(io, .both) catch {};
+    fn arm(self: *Interrupt, reader: *const std.Io.net.Stream.Reader) void {
+        self.reader.store(reader, .release);
+        if (self.fired.load(.acquire)) reader.stream.shutdown(reader.io, .both) catch {};
     }
 
     fn disarm(self: *Interrupt) void {
-        self.stream.store(null, .release);
+        self.reader.store(null, .release);
     }
 
     pub fn fire(self: *Interrupt) void {
         self.fired.store(true, .release);
-        if (self.stream.load(.acquire)) |stream| stream.shutdown(self.io, .both) catch {};
+        if (self.reader.load(.acquire)) |r| r.stream.shutdown(r.io, .both) catch {};
     }
 
     pub fn isFired(self: *const Interrupt) bool {
@@ -46,7 +44,7 @@ pub const Interrupt = struct {
     /// Clear armed + fired state so the interrupt is reusable next turn.
     pub fn reset(self: *Interrupt) void {
         self.fired.store(false, .release);
-        self.stream.store(null, .release);
+        self.reader.store(null, .release);
     }
 };
 
@@ -77,7 +75,7 @@ pub const InterruptGuard = struct {
 
 pub fn armInterrupt(interrupt: ?*Interrupt, req: *std.http.Client.Request) InterruptGuard {
     if (interrupt) |it| {
-        if (req.connection) |conn| it.arm(req.client.io, &conn.stream_reader.stream);
+        if (req.connection) |conn| it.arm(&conn.stream_reader);
     }
     return .{ .interrupt = interrupt, .req = req };
 }
@@ -111,7 +109,7 @@ pub fn fetchJsonWithRetry(
             // Don't retry a request the user cancelled.
             if (interrupt) |it| if (it.isFired()) return err;
             if (retry.isRetryableFetchError(err) and attempt + 1 < policy.max_attempts) {
-                retry.sleepMs(http_client.io, retry.backoffMs(http_client.io, attempt, policy));
+                retry.sleepBackoff(http_client.io, attempt, policy);
                 continue;
             }
             return err;
@@ -127,7 +125,7 @@ pub fn fetchJsonWithRetry(
         }
 
         if (retry.isRetryableStatus(status_code) and attempt + 1 < policy.max_attempts) {
-            retry.sleepMs(http_client.io, retry.backoffMs(http_client.io, attempt, policy));
+            retry.sleepBackoff(http_client.io, attempt, policy);
             continue;
         }
         error_handler.setErrorDetail(status_code, body);
