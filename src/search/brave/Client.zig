@@ -131,9 +131,8 @@ fn boolStr(v: bool) []const u8 {
     return if (v) "true" else "false";
 }
 
-// `std.Uri.Component.formatQuery` is not strict enough here: RFC 3986 query
-// production permits `&`, `=`, and `+` raw, which would corrupt parameter
-// framing. Encode everything outside the unreserved set instead.
+// Not `formatQuery`: the RFC 3986 query production passes `&`/`=`/`+` through
+// raw, which would corrupt parameter framing.
 fn percentEncode(w: *std.Io.Writer, raw: []const u8) std.Io.Writer.Error!void {
     try std.Uri.Component.percentEncode(w, raw, isUnreserved);
 }
