@@ -1,6 +1,6 @@
 # zenai
 
-Zig client for AI APIs, supporting [Google Gemini](https://ai.google.dev/gemini-api/docs) (Developer API and [Vertex AI](https://cloud.google.com/vertex-ai/generative-ai/docs)), [OpenAI](https://platform.openai.com/docs/api-reference), and [Anthropic](https://docs.anthropic.com/en/docs/about-claude/models). OpenAI-compatible endpoints — [Ollama](https://github.com/ollama/ollama/blob/main/docs/openai.md), [Hugging Face Inference](https://huggingface.co/docs/inference-providers/index), and [llama.cpp](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) (`llama-server`) — are supported through the OpenAI client. Ported from the official [Go Gen AI SDK](https://github.com/googleapis/go-genai), [openai-go](https://github.com/openai/openai-go), and [anthropic-sdk-go](https://github.com/anthropics/anthropic-sdk-go). Also ships an `agent infrastructure` namespace under `zenai.search` — currently [Tavily](https://docs.tavily.com/), with room for sibling providers.
+Zig client for AI APIs, supporting [Google Gemini](https://ai.google.dev/gemini-api/docs) (Developer API and [Vertex AI](https://cloud.google.com/vertex-ai/generative-ai/docs)), [OpenAI](https://platform.openai.com/docs/api-reference), and [Anthropic](https://docs.anthropic.com/en/docs/about-claude/models). OpenAI-compatible endpoints — [Ollama](https://github.com/ollama/ollama/blob/main/docs/openai.md), [Hugging Face Inference](https://huggingface.co/docs/inference-providers/index), and [llama.cpp](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) (`llama-server`) — are supported through the OpenAI client. Ported from the official [Go Gen AI SDK](https://github.com/googleapis/go-genai), [openai-go](https://github.com/openai/openai-go), and [anthropic-sdk-go](https://github.com/anthropics/anthropic-sdk-go). Also ships an `agent infrastructure` namespace under `zenai.search` — currently [Tavily](https://docs.tavily.com/) and [Brave Search](https://brave.com/search/api/), with room for sibling providers.
 
 <img width="1024" height="1024" alt="Meditating panda with incense smoke" src="https://github.com/user-attachments/assets/b9c82960-05ec-4aa1-b171-092ee2126551" />
 
@@ -302,6 +302,32 @@ for (response.value.results) |r| {
 }
 ```
 
+## Brave (search)
+
+Brave Search is a web search API over Brave's independent index, returning JSON sections of `{title, url, description}` results. Set your API key ([get one here](https://api-dashboard.search.brave.com/)):
+
+```bash
+export BRAVE_API_KEY='BSA...'
+```
+
+```zig
+const zenai = @import("zenai");
+
+const api_key = std.posix.getenv("BRAVE_API_KEY") orelse return error.MissingApiKey;
+var client = zenai.search.brave.Client.init(allocator, api_key, .{});
+defer client.deinit();
+
+// text_decorations=false strips <strong> highlight markup from descriptions.
+var response = try client.search("what is zig", .{ .count = 5, .text_decorations = false });
+defer response.deinit();
+
+if (response.value.web) |web| {
+    for (web.results) |r| {
+        std.debug.print("{s} — {s}\n", .{ r.title, r.url });
+    }
+}
+```
+
 ## Provider Abstraction
 
 Use `zenai.provider.Client` to write provider-agnostic code. Swap providers by changing one line:
@@ -391,6 +417,7 @@ switch (ai) {
 
 **Search providers:**
 - Tavily (`zenai.search.tavily`) — JSON search API with optional synthesized answers, domain include/exclude, news/general topic, time-range filtering
+- Brave (`zenai.search.brave`) — independent-index web search with country/language targeting, safesearch, freshness and section filtering, extra snippets
 
 **Provider abstraction:**
 - Unified text generation, streaming, and embeddings
