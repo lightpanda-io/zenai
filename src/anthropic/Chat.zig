@@ -211,7 +211,7 @@ fn dupeContentBlocks(self: *Chat, blocks: []const ContentBlockParam) std.mem.All
 }
 
 test "Chat init and deinit" {
-    var client = Client.init(std.testing.allocator, "test-key", .{});
+    var client = Client.init(std.testing.io, std.testing.allocator, "test-key", .{});
     defer client.deinit();
     var chat = Chat.init(&client, "claude-sonnet-4-6", 1024, .{});
     defer chat.deinit();

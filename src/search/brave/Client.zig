@@ -31,12 +31,12 @@ pub const InitOptions = struct {
     retry_policy: RetryPolicy = .{},
 };
 
-pub fn init(allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
+pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
     return .{
         .allocator = allocator,
         .api_key = api_key,
         .base_url = options.base_url,
-        .http_client = .{ .allocator = allocator },
+        .http_client = .{ .allocator = allocator, .io = io },
         .retry_policy = options.retry_policy,
     };
 }
@@ -145,7 +145,7 @@ fn isUnreserved(c: u8) bool {
 }
 
 test "search rejects empty api key" {
-    var client = init(std.testing.allocator, "", .{});
+    var client = init(std.testing.io, std.testing.allocator, "", .{});
     defer client.deinit();
     try std.testing.expectError(error.MissingApiKey, client.search("anything", .{}));
 }

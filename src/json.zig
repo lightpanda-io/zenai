@@ -67,8 +67,8 @@ pub fn dupeValue(a: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.
             break :blk .{ .array = new_arr };
         },
         .object => |obj| blk: {
-            var new_obj = std.json.ObjectMap.init(a);
-            try new_obj.ensureTotalCapacity(@intCast(obj.count()));
+            var new_obj: std.json.ObjectMap = .empty;
+            try new_obj.ensureTotalCapacity(a, @intCast(obj.count()));
             var it = obj.iterator();
             while (it.next()) |entry| {
                 new_obj.putAssumeCapacity(try a.dupe(u8, entry.key_ptr.*), try dupeValue(a, entry.value_ptr.*));

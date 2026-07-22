@@ -158,7 +158,7 @@ fn showUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
 /// Strip the OpenAI-compatible `/v1` suffix (or a trailing slash) to recover
 /// the server origin the native `/api/*` endpoints hang off.
 fn stripV1(base_url: []const u8) []const u8 {
-    const trimmed = std.mem.trimRight(u8, base_url, "/");
+    const trimmed = std.mem.trimEnd(u8, base_url, "/");
     if (std.mem.endsWith(u8, trimmed, "/v1"))
         return trimmed[0 .. trimmed.len - "/v1".len];
     return trimmed;

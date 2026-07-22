@@ -74,7 +74,7 @@ pub const InitOptions = struct {
 /// The `api_key` can be obtained from https://ai.google.dev/gemini-api/docs/api-key
 /// In Vertex project/location mode, pass an OAuth access token instead — the
 /// `MissingApiKey` guard then means "missing access token".
-pub fn init(allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
+pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
     return .{
         .allocator = allocator,
         .api_key = api_key,
@@ -82,7 +82,7 @@ pub fn init(allocator: std.mem.Allocator, api_key: []const u8, options: InitOpti
         .api_version = options.api_version orelse
             (if (options.vertex != null) "v1beta1" else "v1beta"),
         .vertex = options.vertex,
-        .http_client = .{ .allocator = allocator },
+        .http_client = .{ .allocator = allocator, .io = io },
         .retry_policy = options.retry_policy,
         .last_error_message = null,
         .last_error_status = null,
@@ -213,7 +213,7 @@ fn writeModelUrl(self: *const Client, w: *std.Io.Writer, model: []const u8, opts
             std.mem.startsWith(u8, model, "publishers/"))
         {
             try w.writeAll(model);
-        } else if (std.mem.indexOfScalar(u8, model, '/')) |slash| {
+        } else if (std.mem.findScalar(u8, model, '/')) |slash| {
             try w.print("publishers/{s}/models/{s}", .{ model[0..slash], model[slash + 1 ..] });
         } else {
             try w.print("publishers/google/models/{s}", .{model});
@@ -890,7 +890,7 @@ pub fn deleteCachedContent(self: *Client, name: []const u8) !void {
 }
 
 test "Client init and deinit" {
-    var client = Client.init(std.testing.allocator, "test-key", .{});
+    var client = Client.init(std.testing.io, std.testing.allocator, "test-key", .{});
     defer client.deinit();
     try std.testing.expectEqualStrings("test-key", client.api_key);
     try std.testing.expect(client.base_url == null);
@@ -898,17 +898,17 @@ test "Client init and deinit" {
 }
 
 test "init derives the api version per backend, override wins" {
-    var vertex = Client.init(std.testing.allocator, "tok", .{ .vertex = .{} });
+    var vertex = Client.init(std.testing.io, std.testing.allocator, "tok", .{ .vertex = .{} });
     defer vertex.deinit();
     try std.testing.expectEqualStrings("v1beta1", vertex.api_version);
 
-    var pinned = Client.init(std.testing.allocator, "tok", .{ .api_version = "v1", .vertex = .{} });
+    var pinned = Client.init(std.testing.io, std.testing.allocator, "tok", .{ .api_version = "v1", .vertex = .{} });
     defer pinned.deinit();
     try std.testing.expectEqualStrings("v1", pinned.api_version);
 }
 
 test "modelUrl: developer API" {
-    var client = Client.init(std.testing.allocator, "key", .{});
+    var client = Client.init(std.testing.io, std.testing.allocator, "key", .{});
     defer client.deinit();
     const url = try client.modelUrl("gemini-2.5-flash", .{ .action = "generateContent" });
     defer std.testing.allocator.free(url);
@@ -919,7 +919,7 @@ test "modelUrl: developer API" {
 }
 
 test "modelUrl: vertex express mode" {
-    var client = Client.init(std.testing.allocator, "key", .{ .vertex = .{} });
+    var client = Client.init(std.testing.io, std.testing.allocator, "key", .{ .vertex = .{} });
     defer client.deinit();
     const url = try client.modelUrl("gemini-2.5-flash", .{ .action = "generateContent" });
     defer std.testing.allocator.free(url);
@@ -930,7 +930,7 @@ test "modelUrl: vertex express mode" {
 }
 
 test "modelUrl: vertex project mode, global and regional" {
-    var global = Client.init(std.testing.allocator, "tok", .{ .vertex = .{ .project = "my-proj" } });
+    var global = Client.init(std.testing.io, std.testing.allocator, "tok", .{ .vertex = .{ .project = "my-proj" } });
     defer global.deinit();
     const global_url = try global.modelUrl("gemini-2.5-flash", .{ .action = "countTokens" });
     defer std.testing.allocator.free(global_url);
@@ -939,7 +939,7 @@ test "modelUrl: vertex project mode, global and regional" {
         global_url,
     );
 
-    var regional = Client.init(std.testing.allocator, "tok", .{
+    var regional = Client.init(std.testing.io, std.testing.allocator, "tok", .{
         .vertex = .{ .project = "my-proj", .location = "us-central1" },
     });
     defer regional.deinit();
@@ -952,7 +952,7 @@ test "modelUrl: vertex project mode, global and regional" {
 }
 
 test "modelUrl: vertex model name normalization" {
-    var client = Client.init(std.testing.allocator, "tok", .{ .vertex = .{ .project = "p" } });
+    var client = Client.init(std.testing.io, std.testing.allocator, "tok", .{ .vertex = .{ .project = "p" } });
     defer client.deinit();
 
     // Full resource names pass through with no project prefix added.
@@ -989,7 +989,7 @@ test "modelUrl: vertex model name normalization" {
 }
 
 test "modelUrl: explicit base_url overrides the backend host" {
-    var client = Client.init(std.testing.allocator, "tok", .{
+    var client = Client.init(std.testing.io, std.testing.allocator, "tok", .{
         .base_url = "http://localhost:8080",
         .vertex = .{ .project = "p", .location = "us-central1" },
     });
@@ -1003,17 +1003,17 @@ test "modelUrl: explicit base_url overrides the backend host" {
 }
 
 test "authHeader: api key vs cached bearer token" {
-    var dev = Client.init(std.testing.allocator, "key", .{});
+    var dev = Client.init(std.testing.io, std.testing.allocator, "key", .{});
     defer dev.deinit();
     const dev_header = try dev.authHeader();
     try std.testing.expectEqualStrings("x-goog-api-key", dev_header.name);
     try std.testing.expectEqualStrings("key", dev_header.value);
 
-    var express = Client.init(std.testing.allocator, "key", .{ .vertex = .{} });
+    var express = Client.init(std.testing.io, std.testing.allocator, "key", .{ .vertex = .{} });
     defer express.deinit();
     try std.testing.expectEqualStrings("x-goog-api-key", (try express.authHeader()).name);
 
-    var project = Client.init(std.testing.allocator, "tok", .{ .vertex = .{ .project = "p" } });
+    var project = Client.init(std.testing.io, std.testing.allocator, "tok", .{ .vertex = .{ .project = "p" } });
     defer project.deinit();
     const first = try project.authHeader();
     try std.testing.expectEqualStrings("authorization", first.name);
@@ -1024,7 +1024,7 @@ test "authHeader: api key vs cached bearer token" {
 }
 
 test "vertex: developer-only methods are unsupported" {
-    var client = Client.init(std.testing.allocator, "tok", .{ .vertex = .{ .project = "p" } });
+    var client = Client.init(std.testing.io, std.testing.allocator, "tok", .{ .vertex = .{ .project = "p" } });
     defer client.deinit();
     try std.testing.expectError(error.UnsupportedByBackend, client.embedText("m", "hi"));
     try std.testing.expectError(error.UnsupportedByBackend, client.getFile("files/abc"));

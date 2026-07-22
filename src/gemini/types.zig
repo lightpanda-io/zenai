@@ -1057,8 +1057,8 @@ test "GenerateContentRequest serializes to JSON" {
     defer buf.deinit();
     try std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &buf.writer);
     const json = buf.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "temperature") != null);
+    try std.testing.expect(std.mem.find(u8, json, "hello") != null);
+    try std.testing.expect(std.mem.find(u8, json, "temperature") != null);
 }
 
 test "GenerateContentRequest with systemInstruction serializes correctly" {
@@ -1074,9 +1074,9 @@ test "GenerateContentRequest with systemInstruction serializes correctly" {
     defer buf.deinit();
     try std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &buf.writer);
     const json = buf.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "systemInstruction") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "You are helpful.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "maxOutputTokens") != null);
+    try std.testing.expect(std.mem.find(u8, json, "systemInstruction") != null);
+    try std.testing.expect(std.mem.find(u8, json, "You are helpful.") != null);
+    try std.testing.expect(std.mem.find(u8, json, "maxOutputTokens") != null);
 }
 
 test "SafetySetting serializes with enum tag names" {
@@ -1088,8 +1088,8 @@ test "SafetySetting serializes with enum tag names" {
     defer buf.deinit();
     try std.json.Stringify.value(setting, .{ .emit_null_optional_fields = false }, &buf.writer);
     const json = buf.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "HARM_CATEGORY_HARASSMENT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "BLOCK_MEDIUM_AND_ABOVE") != null);
+    try std.testing.expect(std.mem.find(u8, json, "HARM_CATEGORY_HARASSMENT") != null);
+    try std.testing.expect(std.mem.find(u8, json, "BLOCK_MEDIUM_AND_ABOVE") != null);
 }
 
 test "GenerateContentResponse.text extracts text" {
@@ -1175,8 +1175,8 @@ test "Schema serializes with enum type" {
     defer buf.deinit();
     try std.json.Stringify.value(schema, .{ .emit_null_optional_fields = false }, &buf.writer);
     const json = buf.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "OBJECT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "A person") != null);
+    try std.testing.expect(std.mem.find(u8, json, "OBJECT") != null);
+    try std.testing.expect(std.mem.find(u8, json, "A person") != null);
 }
 
 test "ThinkingConfig serializes correctly with thinkingLevel" {
@@ -1187,6 +1187,6 @@ test "ThinkingConfig serializes correctly with thinkingLevel" {
     defer buf.deinit();
     try std.json.Stringify.value(config, .{ .emit_null_optional_fields = false }, &buf.writer);
     const json = buf.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "thinkingLevel") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "HIGH") != null);
+    try std.testing.expect(std.mem.find(u8, json, "thinkingLevel") != null);
+    try std.testing.expect(std.mem.find(u8, json, "HIGH") != null);
 }

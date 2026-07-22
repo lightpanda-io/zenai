@@ -56,7 +56,7 @@ pub const InitOptions = struct {
 };
 
 /// Create a new OpenAI API client.
-pub fn init(allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
+pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
     return .{
         .allocator = allocator,
         .api_key = api_key,
@@ -64,7 +64,7 @@ pub fn init(allocator: std.mem.Allocator, api_key: []const u8, options: InitOpti
         .organization = options.organization,
         .project = options.project,
         .bill_to = options.bill_to,
-        .http_client = .{ .allocator = allocator },
+        .http_client = .{ .allocator = allocator, .io = io },
         .retry_policy = options.retry_policy,
         .last_error_message = null,
         .last_error_status = null,
@@ -571,13 +571,13 @@ pub fn isChatModel(m: types.Model) bool {
         "embedding", "image", "audio", "realtime", "transcribe", "tts", "moderation",
     };
     for (non_chat_substrings) |s| {
-        if (std.mem.indexOf(u8, id, s) != null) return false;
+        if (std.mem.find(u8, id, s) != null) return false;
     }
     return true;
 }
 
 test "Client init and deinit" {
-    var client = Client.init(std.testing.allocator, "test-key", .{});
+    var client = Client.init(std.testing.io, std.testing.allocator, "test-key", .{});
     defer client.deinit();
     try std.testing.expectEqualStrings("test-key", client.api_key);
     try std.testing.expectEqualStrings("https://api.openai.com/v1", client.base_url);
@@ -586,11 +586,11 @@ test "Client init and deinit" {
 test "authHeaders emits X-HF-Bill-To only when bill_to is set" {
     var buf: [4]std.http.Header = undefined;
 
-    var plain = Client.init(std.testing.allocator, "k", .{});
+    var plain = Client.init(std.testing.io, std.testing.allocator, "k", .{});
     defer plain.deinit();
     try std.testing.expectEqual(@as(usize, 3), (try plain.authHeaders(&buf)).len);
 
-    var billed = Client.init(std.testing.allocator, "k", .{ .bill_to = "my-org" });
+    var billed = Client.init(std.testing.io, std.testing.allocator, "k", .{ .bill_to = "my-org" });
     defer billed.deinit();
     const headers = try billed.authHeaders(&buf);
     try std.testing.expectEqual(@as(usize, 4), headers.len);

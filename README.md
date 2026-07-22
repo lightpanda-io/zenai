@@ -18,6 +18,17 @@ const zenai = b.dependency("zenai", .{});
 exe.root_module.addImport("zenai", zenai.module("zenai"));
 ```
 
+Requires Zig >= 0.16.0. The examples below assume `allocator`, `io`, and `environ` are in scope; with Zig 0.16's main signature they come straight from `std.process.Init`:
+
+```zig
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const environ = init.minimal.environ;
+    // ...
+}
+```
+
 ## Gemini
 
 Set your API key ([get one here](https://ai.google.dev/gemini-api/docs/api-key)):
@@ -29,8 +40,8 @@ export GOOGLE_API_KEY='your-api-key'
 ```zig
 const zenai = @import("zenai");
 
-const api_key = std.posix.getenv("GOOGLE_API_KEY") orelse return error.MissingApiKey;
-var client = zenai.gemini.Client.init(allocator, api_key, .{});
+const api_key = environ.getPosix("GOOGLE_API_KEY") orelse return error.MissingApiKey;
+var client = zenai.gemini.Client.init(io, allocator, api_key, .{});
 defer client.deinit();
 
 var response = try client.generateContentFromText("gemini-2.5-flash", "What is Zig?", .{}, .{});
@@ -51,8 +62,7 @@ try client.generateContentStreamFromText(
     &struct {
         fn cb(_: void, response: zenai.gemini.types.GenerateContentResponse) void {
             if (response.text()) |t| {
-                const fd = std.posix.STDOUT_FILENO;
-                _ = std.posix.write(fd, t) catch return;
+                std.debug.print("{s}", .{t});
             }
         }
     }.cb,
@@ -109,7 +119,7 @@ The same Gemini client can target [Vertex AI](https://cloud.google.com/vertex-ai
 **Express mode** — a plain [Vertex API key](https://cloud.google.com/vertex-ai/generative-ai/docs/start/express-mode/overview), no project needed:
 
 ```zig
-var client = zenai.vertex.Client.init(allocator, api_key, .{ .vertex = .{} });
+var client = zenai.vertex.Client.init(io, allocator, api_key, .{ .vertex = .{} });
 defer client.deinit();
 ```
 
@@ -120,7 +130,7 @@ export TOKEN=$(gcloud auth print-access-token)
 ```
 
 ```zig
-var client = zenai.vertex.Client.init(allocator, token, .{
+var client = zenai.vertex.Client.init(io, allocator, token, .{
     .vertex = .{ .project = "my-project", .location = "global" },
 });
 defer client.deinit();
@@ -141,8 +151,8 @@ export OPENAI_API_KEY='your-api-key'
 ```zig
 const zenai = @import("zenai");
 
-const api_key = std.posix.getenv("OPENAI_API_KEY") orelse return error.MissingApiKey;
-var client = zenai.openai.Client.init(allocator, api_key, .{});
+const api_key = environ.getPosix("OPENAI_API_KEY") orelse return error.MissingApiKey;
+var client = zenai.openai.Client.init(io, allocator, api_key, .{});
 defer client.deinit();
 
 var response = try client.chatCompletionFromText("gpt-4o", "What is Zig?", .{});
@@ -162,8 +172,7 @@ try client.chatCompletionStreamFromText(
     &struct {
         fn cb(_: void, response: zenai.openai.types.ChatCompletionResponse) void {
             if (response.text()) |t| {
-                const fd = std.posix.STDOUT_FILENO;
-                _ = std.posix.write(fd, t) catch return;
+                std.debug.print("{s}", .{t});
             }
         }
     }.cb,
@@ -215,8 +224,8 @@ export ANTHROPIC_API_KEY='your-api-key'
 ```zig
 const zenai = @import("zenai");
 
-const api_key = std.posix.getenv("ANTHROPIC_API_KEY") orelse return error.MissingApiKey;
-var client = zenai.anthropic.Client.init(allocator, api_key, .{});
+const api_key = environ.getPosix("ANTHROPIC_API_KEY") orelse return error.MissingApiKey;
+var client = zenai.anthropic.Client.init(io, allocator, api_key, .{});
 defer client.deinit();
 
 var response = try client.createMessageFromText("claude-sonnet-4-6", "What is Zig?", 1024, .{});
@@ -238,8 +247,7 @@ try client.createMessageStreamFromText(
         fn cb(_: void, event: zenai.anthropic.types.StreamEvent) void {
             if (event.delta) |delta| {
                 if (delta.text) |t| {
-                    const fd = std.posix.STDOUT_FILENO;
-                    _ = std.posix.write(fd, t) catch return;
+                    std.debug.print("{s}", .{t});
                 }
             }
         }
@@ -290,8 +298,8 @@ export TAVILY_API_KEY='tvly-...'
 ```zig
 const zenai = @import("zenai");
 
-const api_key = std.posix.getenv("TAVILY_API_KEY") orelse return error.MissingApiKey;
-var client = zenai.search.tavily.Client.init(allocator, api_key, .{});
+const api_key = environ.getPosix("TAVILY_API_KEY") orelse return error.MissingApiKey;
+var client = zenai.search.tavily.Client.init(io, allocator, api_key, .{});
 defer client.deinit();
 
 var response = try client.search("what is zig", .{ .max_results = 5 });
@@ -336,34 +344,34 @@ Use `zenai.provider.Client` to write provider-agnostic code. Swap providers by c
 const zenai = @import("zenai");
 
 // Pick your provider:
-var gemini_client = zenai.gemini.Client.init(allocator, gemini_key, .{});
+var gemini_client = zenai.gemini.Client.init(io, allocator, gemini_key, .{});
 defer gemini_client.deinit();
 const ai: zenai.provider.Client = .{ .gemini = &gemini_client };
 
 // Or Vertex AI (same Gemini client, Vertex backend — see the Vertex section):
-// var vertex_client = zenai.vertex.Client.init(allocator, token, .{
+// var vertex_client = zenai.vertex.Client.init(io, allocator, token, .{
 //     .vertex = .{ .project = "my-project" },
 // });
 // const ai: zenai.provider.Client = .{ .vertex = &vertex_client };
 
 // Or:
-// var openai_client = zenai.openai.Client.init(allocator, openai_key, .{});
+// var openai_client = zenai.openai.Client.init(io, allocator, openai_key, .{});
 // const ai: zenai.provider.Client = .{ .openai = &openai_client };
 
 // Or:
-// var anthropic_client = zenai.anthropic.Client.init(allocator, anthropic_key, .{});
+// var anthropic_client = zenai.anthropic.Client.init(io, allocator, anthropic_key, .{});
 // const ai: zenai.provider.Client = .{ .anthropic = &anthropic_client };
 
 // Or Hugging Face (OpenAI-compatible). Token comes from HF_TOKEN. Defaults to the
 // serverless router; pass `.base_url` for a dedicated Inference Endpoint:
-// var hf_client = zenai.huggingface.Client.init(allocator, hf_token, .{
+// var hf_client = zenai.huggingface.Client.init(io, allocator, hf_token, .{
 //     .base_url = "https://router.huggingface.co/v1",
 // });
 // const ai: zenai.provider.Client = .{ .huggingface = &hf_client };
 
 // Or a local llama.cpp `llama-server` (OpenAI-compatible). No key needed;
 // defaults to http://localhost:8080/v1 — override with `.base_url`:
-// var llama_client = zenai.llama_cpp.Client.init(allocator, "llama.cpp", .{
+// var llama_client = zenai.llama_cpp.Client.init(io, allocator, "llama.cpp", .{
 //     .base_url = "http://localhost:8080/v1",
 // });
 // const ai: zenai.provider.Client = .{ .llama_cpp = &llama_client };

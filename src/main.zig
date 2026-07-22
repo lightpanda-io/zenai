@@ -1,17 +1,17 @@
 const std = @import("std");
 const zenai = @import("zenai");
 
-pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    const api_key = std.posix.getenv("GOOGLE_API_KEY") orelse
-        std.posix.getenv("GEMINI_API_KEY") orelse
+    const api_key = init.minimal.environ.getPosix("GOOGLE_API_KEY") orelse
+        init.minimal.environ.getPosix("GEMINI_API_KEY") orelse
         {
             std.debug.print("Error: set GOOGLE_API_KEY or GEMINI_API_KEY environment variable\n", .{});
             std.process.exit(1);
         };
 
-    var client = zenai.gemini.Client.init(allocator, api_key, .{});
+    var client = zenai.gemini.Client.init(init.io, allocator, api_key, .{});
     defer client.deinit();
 
     // --- Model info ---
@@ -137,8 +137,7 @@ pub fn main() !void {
 
 fn printStreamChunk(_: void, response: zenai.gemini.types.GenerateContentResponse) void {
     if (response.text()) |t| {
-        const fd = std.posix.STDOUT_FILENO;
-        _ = std.posix.write(fd, t) catch return;
+        std.debug.print("{s}", .{t});
     }
 }
 
