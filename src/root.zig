@@ -40,12 +40,16 @@ pub const llama_cpp = openai;
 pub const vercel = openai;
 pub const mistral = openai;
 
-/// Search providers — separate namespace from the LLM clients above. Tavily
-/// is the first; Brave/Serper/Google CSE could land as siblings here.
+/// Search providers — separate namespace from the LLM clients above.
+/// Serper/Google CSE could land as siblings here.
 pub const search = struct {
     pub const tavily = struct {
         pub const Client = @import("search/tavily/Client.zig");
         pub const types = @import("search/tavily/types.zig");
+    };
+    pub const brave = struct {
+        pub const Client = @import("search/brave/Client.zig");
+        pub const types = @import("search/brave/types.zig");
     };
 };
 

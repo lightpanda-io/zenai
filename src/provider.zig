@@ -466,7 +466,7 @@ pub const Client = union(enum) {
 
     /// Construct the per-provider client for `credentials`; the caller owns it
     /// and must release it with `deinit`.
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, credentials: Credentials, options: InitOptions) !Client {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, credentials: Credentials, options: InitOptions) !Client {
         return switch (credentials.provider) {
             inline else => |tag| blk: {
                 const ClientPtr = @FieldType(Client, @tagName(tag));
@@ -479,7 +479,7 @@ pub const Client = union(enum) {
                 if (base_url) |u| impl_opts.base_url = u;
                 if (@hasField(Impl.InitOptions, "bill_to")) impl_opts.bill_to = options.bill_to;
                 if (tag == .vertex) impl_opts.vertex = vertexConfigFromEnv(options.environ, options.project, options.location);
-                client.* = Impl.init(allocator, io, credentials.key, impl_opts);
+                client.* = Impl.init(io, allocator, credentials.key, impl_opts);
                 break :blk @unionInit(Client, @tagName(tag), client);
             },
         };
@@ -1325,15 +1325,15 @@ fn isLoopbackUrl(url: []const u8) bool {
 /// to `ids`. No `isChatModel` filtering — local/HF catalogs don't follow the
 /// OpenAI naming convention it expects.
 fn listOpenAICompatibleModelIds(
-    allocator: std.mem.Allocator,
     io: std.Io,
+    allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
     ids: *std.ArrayList([]const u8),
     api_key: [:0]const u8,
     base_url: [:0]const u8,
     retry_policy: retry.RetryPolicy,
 ) !void {
-    var client = openai_mod.init(allocator, io, api_key, .{ .base_url = base_url, .retry_policy = retry_policy });
+    var client = openai_mod.init(io, allocator, api_key, .{ .base_url = base_url, .retry_policy = retry_policy });
     defer client.deinit();
     var resp = try client.listModels();
     defer resp.deinit();
@@ -1356,8 +1356,8 @@ pub const ListModelsOptions = struct {
 /// Fetch chat-capable model IDs for `tag`, allocated in `arena`. Ordering
 /// is provider-defined — sort at the call site if needed.
 pub fn listChatModelIds(
-    allocator: std.mem.Allocator,
     io: std.Io,
+    allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
     tag: Tag,
     api_key: [:0]const u8,
@@ -1370,10 +1370,10 @@ pub fn listChatModelIds(
     if (openAiPreset(tag)) |p| {
         const url = options.base_url orelse p.base_url;
         const policy: retry.RetryPolicy = if (p.local and isLoopbackUrl(url)) .disabled else .{};
-        try listOpenAICompatibleModelIds(allocator, io, arena, &ids, api_key, url, policy);
+        try listOpenAICompatibleModelIds(io, allocator, arena, &ids, api_key, url, policy);
     } else switch (tag) {
         .anthropic => {
-            var client = anthropic_mod.init(allocator, io, api_key, .{});
+            var client = anthropic_mod.init(io, allocator, api_key, .{});
             defer client.deinit();
             var resp = try client.listModels();
             defer resp.deinit();
@@ -1383,7 +1383,7 @@ pub fn listChatModelIds(
             }
         },
         .openai => {
-            var client = openai_mod.init(allocator, io, api_key, if (options.base_url) |u| .{ .base_url = u } else .{});
+            var client = openai_mod.init(io, allocator, api_key, if (options.base_url) |u| .{ .base_url = u } else .{});
             defer client.deinit();
             var resp = try client.listModels();
             defer resp.deinit();
@@ -1393,7 +1393,7 @@ pub fn listChatModelIds(
             }
         },
         .gemini => {
-            var client = gemini_mod.init(allocator, io, api_key, .{});
+            var client = gemini_mod.init(io, allocator, api_key, .{});
             defer client.deinit();
             var resp = try client.listModels(.{});
             defer resp.deinit();
@@ -1407,7 +1407,7 @@ pub fn listChatModelIds(
             }
         },
         .vertex => {
-            var client = gemini_mod.init(allocator, io, api_key, .{
+            var client = gemini_mod.init(io, allocator, api_key, .{
                 .vertex = vertexConfigFromEnv(options.environ, null, null),
             });
             defer client.deinit();

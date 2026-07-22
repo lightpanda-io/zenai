@@ -56,7 +56,7 @@ pub const InitOptions = struct {
 };
 
 /// Create a new OpenAI API client.
-pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, options: InitOptions) Client {
+pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
     return .{
         .allocator = allocator,
         .api_key = api_key,
@@ -577,7 +577,7 @@ pub fn isChatModel(m: types.Model) bool {
 }
 
 test "Client init and deinit" {
-    var client = Client.init(std.testing.allocator, std.testing.io, "test-key", .{});
+    var client = Client.init(std.testing.io, std.testing.allocator, "test-key", .{});
     defer client.deinit();
     try std.testing.expectEqualStrings("test-key", client.api_key);
     try std.testing.expectEqualStrings("https://api.openai.com/v1", client.base_url);
@@ -586,11 +586,11 @@ test "Client init and deinit" {
 test "authHeaders emits X-HF-Bill-To only when bill_to is set" {
     var buf: [4]std.http.Header = undefined;
 
-    var plain = Client.init(std.testing.allocator, std.testing.io, "k", .{});
+    var plain = Client.init(std.testing.io, std.testing.allocator, "k", .{});
     defer plain.deinit();
     try std.testing.expectEqual(@as(usize, 3), (try plain.authHeaders(&buf)).len);
 
-    var billed = Client.init(std.testing.allocator, std.testing.io, "k", .{ .bill_to = "my-org" });
+    var billed = Client.init(std.testing.io, std.testing.allocator, "k", .{ .bill_to = "my-org" });
     defer billed.deinit();
     const headers = try billed.authHeaders(&buf);
     try std.testing.expectEqual(@as(usize, 4), headers.len);

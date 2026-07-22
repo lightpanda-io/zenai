@@ -204,7 +204,7 @@ fn dupeMessage(self: *Chat, msg: Message) std.mem.Allocator.Error!Message {
 }
 
 test "Chat init and deinit" {
-    var client = Client.init(std.testing.allocator, std.testing.io, "test-key", .{});
+    var client = Client.init(std.testing.io, std.testing.allocator, "test-key", .{});
     defer client.deinit();
     var chat = Chat.init(&client, "gpt-4o", .{});
     defer chat.deinit();

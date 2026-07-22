@@ -11,7 +11,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
 
-    var client = zenai.gemini.Client.init(allocator, init.io, api_key, .{});
+    var client = zenai.gemini.Client.init(init.io, allocator, api_key, .{});
     defer client.deinit();
 
     // --- Model info ---
