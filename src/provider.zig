@@ -478,6 +478,7 @@ pub const Client = union(enum) {
                 var impl_opts: Impl.InitOptions = .{ .retry_policy = options.retry_policy };
                 if (base_url) |u| impl_opts.base_url = u;
                 if (@hasField(Impl.InitOptions, "bill_to")) impl_opts.bill_to = options.bill_to;
+                if (@hasField(Impl.InitOptions, "auth")) impl_opts.auth = credentials.auth;
                 if (tag == .vertex) impl_opts.vertex = vertexConfigFromEnv(options.environ, options.project, options.location);
                 client.* = Impl.init(io, allocator, credentials.key, impl_opts);
                 break :blk @unionInit(Client, @tagName(tag), client);
@@ -500,6 +501,16 @@ pub const Client = union(enum) {
     pub fn setInterrupt(self: Client, it: *http.Interrupt) void {
         switch (self) {
             inline else => |client| client.interrupt = it,
+        }
+    }
+
+    /// Swap the credential in place (e.g. a refreshed OAuth access token)
+    /// without tearing down connections. The caller retains ownership of `key`
+    /// and must free the previous buffer only after this returns. Not safe to
+    /// call during an in-flight request.
+    pub fn setApiKey(self: Client, key: []const u8) void {
+        switch (self) {
+            inline else => |client| client.setApiKey(key),
         }
     }
 
@@ -606,10 +617,7 @@ pub const Client = union(enum) {
                 const system_text = try extractSystemText(req_alloc, messages);
                 const ant_messages = try messagesToAnthropicMessages(req_alloc, messages);
 
-                const system_blocks: ?[]const anthropic_types.TextBlock = if (system_text) |sys|
-                    @as([]const anthropic_types.TextBlock, &.{.{ .text = sys }})
-                else
-                    null;
+                const system_blocks = try anthropicSystemBlocks(req_alloc, a.auth, system_text);
 
                 const tools = if (config.tools) |t| try mapAnthropicTools(req_alloc, t) else null;
                 const reasoning = mapEffortToAnthropic(config.effort, config.max_tokens orelse 4096);
@@ -712,10 +720,7 @@ pub const Client = union(enum) {
                 const system_text = extractSystemText(req_alloc, messages) catch return error.OutOfMemory;
                 const ant_messages = messagesToAnthropicMessages(req_alloc, messages) catch return error.OutOfMemory;
 
-                const system_blocks: ?[]const anthropic_types.TextBlock = if (system_text) |sys|
-                    @as([]const anthropic_types.TextBlock, &.{.{ .text = sys }})
-                else
-                    null;
+                const system_blocks = anthropicSystemBlocks(req_alloc, a.auth, system_text) catch return error.OutOfMemory;
 
                 const tools = if (config.tools) mapAnthropicTools(req_alloc, config.tools.?) catch return error.OutOfMemory else null;
                 const reasoning = mapEffortToAnthropic(config.effort, config.max_tokens orelse 4096);
@@ -771,10 +776,7 @@ pub const Client = union(enum) {
 
                 const system_text = try extractSystemText(req_alloc, messages);
                 const ant_messages = try messagesToAnthropicMessages(req_alloc, messages);
-                const system_blocks: ?[]const anthropic_types.TextBlock = if (system_text) |sys|
-                    @as([]const anthropic_types.TextBlock, &.{.{ .text = sys }})
-                else
-                    null;
+                const system_blocks = try anthropicSystemBlocks(req_alloc, a.auth, system_text);
                 const tools = if (config.tools) |t| try mapAnthropicTools(req_alloc, t) else null;
                 const reasoning = mapEffortToAnthropic(config.effort, config.max_tokens orelse 4096);
 
@@ -1258,11 +1260,18 @@ pub fn defaultEffort(tag: Tag) ?Effort {
     };
 }
 
+/// How `Credentials.key` authenticates: a normal API key, or an OAuth bearer
+/// token (Claude subscription). Only meaningful for `.anthropic` today.
+pub const AuthMode = anthropic_mod.Auth;
+
 /// A provider tag paired with the env-resolved key that authenticates it.
 /// The two travel together: a tag is only meaningful with its key.
 pub const Credentials = struct {
     provider: Tag,
     key: [:0]const u8,
+    /// `.bearer` reinterprets `key` as an OAuth access token. Threaded to the
+    /// anthropic client; ignored by providers whose `InitOptions` lack `auth`.
+    auth: AuthMode = .api_key,
 };
 
 /// Env-detectable providers, in enum order. Keyless local servers (preset
@@ -1523,6 +1532,50 @@ fn extractSystemText(allocator: std.mem.Allocator, messages: []const Message) !?
     if (sys_parts.items.len == 0) return null;
     if (sys_parts.items.len == 1) return sys_parts.items[0];
     return try std.mem.join(allocator, "\n\n", sys_parts.items);
+}
+
+/// Build the Anthropic `system` blocks from the merged `system_text`. On the
+/// OAuth (`.bearer`) path the subscription endpoint requires
+/// `anthropic_mod.oauth_system_prompt` as the verbatim first block, so it is
+/// prepended as its own block ahead of the caller's system text.
+fn anthropicSystemBlocks(arena: std.mem.Allocator, auth: AuthMode, system_text: ?[]const u8) !?[]const anthropic_types.TextBlock {
+    switch (auth) {
+        .api_key => return if (system_text) |sys|
+            try arena.dupe(anthropic_types.TextBlock, &.{.{ .text = sys }})
+        else
+            null,
+        .bearer => {
+            const marker = anthropic_mod.oauth_system_prompt;
+            return if (system_text) |sys|
+                try arena.dupe(anthropic_types.TextBlock, &.{ .{ .text = marker }, .{ .text = sys } })
+            else
+                try arena.dupe(anthropic_types.TextBlock, &.{.{ .text = marker }});
+        },
+    }
+}
+
+test "anthropicSystemBlocks: bearer prepends the oauth marker as the first block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const marker = anthropic_mod.oauth_system_prompt;
+
+    // api_key: single block, or null.
+    try std.testing.expectEqual(@as(?[]const anthropic_types.TextBlock, null), try anthropicSystemBlocks(a, .api_key, null));
+    const ak = (try anthropicSystemBlocks(a, .api_key, "hi")).?;
+    try std.testing.expectEqual(@as(usize, 1), ak.len);
+    try std.testing.expectEqualStrings("hi", ak[0].text);
+
+    // bearer: marker first, then the system text.
+    const b = (try anthropicSystemBlocks(a, .bearer, "hi")).?;
+    try std.testing.expectEqual(@as(usize, 2), b.len);
+    try std.testing.expectEqualStrings(marker, b[0].text);
+    try std.testing.expectEqualStrings("hi", b[1].text);
+
+    // bearer with no system text: marker alone, still present.
+    const b0 = (try anthropicSystemBlocks(a, .bearer, null)).?;
+    try std.testing.expectEqual(@as(usize, 1), b0.len);
+    try std.testing.expectEqualStrings(marker, b0[0].text);
 }
 
 const SeparatedMessages = struct {

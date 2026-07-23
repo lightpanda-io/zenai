@@ -19,6 +19,12 @@ allocator: std.mem.Allocator,
 api_key: []const u8,
 base_url: []const u8,
 api_version: []const u8,
+/// How `api_key` is presented: an `x-api-key` API key, or an OAuth access token
+/// via `authorization: Bearer` (Claude Pro/Max subscription).
+auth: Auth,
+/// Cached "Bearer {token}" value for `.bearer` auth. Built on first request;
+/// owned, freed in `deinit` and cleared by `setApiKey`.
+authorization: ?[]u8 = null,
 http_client: std.http.Client,
 /// Retry policy applied to every non-streaming request.
 retry_policy: RetryPolicy,
@@ -28,6 +34,24 @@ last_error_message: ?[]u8 = null,
 last_error_status: ?u10 = null,
 /// Set by the host so a SIGINT can abort an in-flight request mid-read.
 interrupt: ?*http.Interrupt = null,
+
+/// How the client presents `api_key`.
+pub const Auth = enum {
+    /// Standard API key sent as `x-api-key`.
+    api_key,
+    /// OAuth access token (Claude subscription) sent as `authorization: Bearer`,
+    /// with the `anthropic-beta: oauth-2025-04-20` header and the required first
+    /// system block (see `oauth_system_prompt`).
+    bearer,
+};
+
+/// `anthropic-beta` value required on OAuth (subscription) requests.
+pub const oauth_beta = "oauth-2025-04-20";
+
+/// The OAuth (subscription) endpoint requires this exact sentence as the first
+/// system block, verbatim. Callers building a `.bearer` request must place it
+/// ahead of any other system text.
+pub const oauth_system_prompt = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Options for customizing the API endpoint.
 pub const InitOptions = struct {
@@ -39,6 +63,8 @@ pub const InitOptions = struct {
     /// `overloaded_error`, 429, and known flaky network errors). Pass
     /// `RetryPolicy.disabled` to opt out.
     retry_policy: RetryPolicy = .{},
+    /// Whether `api_key` is an API key or an OAuth bearer token.
+    auth: Auth = .api_key,
 };
 
 /// Create a new Anthropic API client.
@@ -48,6 +74,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
         .api_key = api_key,
         .base_url = options.base_url,
         .api_version = options.api_version,
+        .auth = options.auth,
         .http_client = .{ .allocator = allocator, .io = io },
         .retry_policy = options.retry_policy,
         .last_error_message = null,
@@ -57,8 +84,20 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
 
 /// Release all resources held by the client, including HTTP connections.
 pub fn deinit(self: *Client) void {
+    if (self.authorization) |a| self.allocator.free(a);
     if (self.last_error_message) |m| self.allocator.free(m);
     self.http_client.deinit();
+}
+
+/// Repoint the client at a new key/token (e.g. a refreshed OAuth access token)
+/// without tearing down connections. The caller retains ownership of `key` and
+/// must keep the previous buffer alive until this returns.
+pub fn setApiKey(self: *Client, key: []const u8) void {
+    self.api_key = key;
+    if (self.authorization) |a| {
+        self.allocator.free(a);
+        self.authorization = null;
+    }
 }
 
 pub const Response = http.Response;
@@ -71,11 +110,21 @@ pub const ApiError = error{
 
 // --- Internal helpers ---
 
-fn authHeaders(self: *const Client) [2]std.http.Header {
-    return .{
-        .{ .name = "x-api-key", .value = self.api_key },
-        .{ .name = "anthropic-version", .value = self.api_version },
-    };
+fn authHeaders(self: *Client, buf: *[3]std.http.Header) ![]const std.http.Header {
+    buf[0] = .{ .name = "anthropic-version", .value = self.api_version };
+    switch (self.auth) {
+        .api_key => {
+            buf[1] = .{ .name = "x-api-key", .value = self.api_key };
+            return buf[0..2];
+        },
+        .bearer => {
+            if (self.authorization == null)
+                self.authorization = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key});
+            buf[1] = .{ .name = "authorization", .value = self.authorization.? };
+            buf[2] = .{ .name = "anthropic-beta", .value = oauth_beta };
+            return buf[0..3];
+        },
+    }
 }
 
 pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
@@ -91,11 +140,12 @@ pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
 }
 
 fn fetchGet(self: *Client, url: []const u8, comptime T: type) ApiError!Response(T) {
-    const auth = self.authHeaders();
+    var hdr_buf: [3]std.http.Header = undefined;
+    const auth = try self.authHeaders(&hdr_buf);
     return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, .{
         .location = .{ .url = url },
         .method = .GET,
-        .extra_headers = &auth,
+        .extra_headers = auth,
     }, T, self);
 }
 
@@ -105,12 +155,13 @@ fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) Ap
     std.json.Stringify.value(body, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
         return error.OutOfMemory;
 
-    const auth = self.authHeaders();
+    var hdr_buf: [3]std.http.Header = undefined;
+    const auth = try self.authHeaders(&hdr_buf);
     return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, .{
         .location = .{ .url = url },
         .method = .POST,
         .payload = payload_buf.written(),
-        .extra_headers = &auth,
+        .extra_headers = auth,
         .headers = .{ .content_type = .{ .override = "application/json" } },
     }, T, self);
 }
@@ -232,8 +283,9 @@ pub fn createMessageStream(
     defer payload_buf.deinit();
     std.json.Stringify.value(req_body, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
         return error.OutOfMemory;
-    const auth = self.authHeaders();
-    return http.streamSse(self.allocator, &self.http_client, url, &auth, payload_buf.written(), StreamEvent, self, context, callback);
+    var hdr_buf: [3]std.http.Header = undefined;
+    const auth = try self.authHeaders(&hdr_buf);
+    return http.streamSse(self.allocator, &self.http_client, url, auth, payload_buf.written(), StreamEvent, self, context, callback);
 }
 
 /// Convenience: stream a message from a single text prompt.
@@ -384,6 +436,42 @@ test "listModels: missing api key" {
     var client = Client.init(std.testing.io, std.testing.allocator, "", .{});
     defer client.deinit();
     try std.testing.expectError(error.MissingApiKey, client.listModels());
+}
+
+fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
+    for (headers) |h| if (std.mem.eql(u8, h.name, name)) return h.value;
+    return null;
+}
+
+test "authHeaders: api_key mode sends x-api-key, no bearer" {
+    var client = Client.init(std.testing.io, std.testing.allocator, "sk-test", .{});
+    defer client.deinit();
+    var buf: [3]std.http.Header = undefined;
+    const headers = try client.authHeaders(&buf);
+    try std.testing.expectEqualStrings("sk-test", headerValue(headers, "x-api-key").?);
+    try std.testing.expectEqualStrings("2023-06-01", headerValue(headers, "anthropic-version").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), headerValue(headers, "authorization"));
+    try std.testing.expectEqual(@as(?[]const u8, null), headerValue(headers, "anthropic-beta"));
+}
+
+test "authHeaders: bearer mode sends Authorization + oauth beta, no x-api-key" {
+    var client = Client.init(std.testing.io, std.testing.allocator, "tok-abc", .{ .auth = .bearer });
+    defer client.deinit();
+    var buf: [3]std.http.Header = undefined;
+    const headers = try client.authHeaders(&buf);
+    try std.testing.expectEqualStrings("Bearer tok-abc", headerValue(headers, "authorization").?);
+    try std.testing.expectEqualStrings(oauth_beta, headerValue(headers, "anthropic-beta").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), headerValue(headers, "x-api-key"));
+}
+
+test "setApiKey: rebuilds the cached bearer value" {
+    var client = Client.init(std.testing.io, std.testing.allocator, "tok-old", .{ .auth = .bearer });
+    defer client.deinit();
+    var buf: [3]std.http.Header = undefined;
+    try std.testing.expectEqualStrings("Bearer tok-old", headerValue(try client.authHeaders(&buf), "authorization").?);
+    client.setApiKey("tok-new");
+    try std.testing.expectEqual(@as(?[]u8, null), client.authorization);
+    try std.testing.expectEqualStrings("Bearer tok-new", headerValue(try client.authHeaders(&buf), "authorization").?);
 }
 
 const TextProbe = struct {

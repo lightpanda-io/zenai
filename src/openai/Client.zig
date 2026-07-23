@@ -79,6 +79,17 @@ pub fn deinit(self: *Client) void {
     self.http_client.deinit();
 }
 
+/// Repoint the client at a new key/token (e.g. a refreshed OAuth access token)
+/// without tearing down connections. The caller retains ownership of `key` and
+/// must keep the previous buffer alive until this returns.
+pub fn setApiKey(self: *Client, key: []const u8) void {
+    self.api_key = key;
+    if (self.authorization) |a| {
+        self.allocator.free(a);
+        self.authorization = null;
+    }
+}
+
 pub const Response = http.Response;
 
 pub const ApiError = error{
