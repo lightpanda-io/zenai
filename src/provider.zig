@@ -512,6 +512,17 @@ pub const Client = union(enum) {
         }
     }
 
+    /// Repoint a subscription client at a refreshed OAuth access token without
+    /// tearing down connections. Only `.codex` refreshes tokens in place; other
+    /// providers use a static key, so this is a no-op for them. The caller keeps
+    /// ownership of `key` and frees the previous buffer only after this returns.
+    pub fn setApiKey(self: Client, key: []const u8) void {
+        switch (self) {
+            .codex => |c| c.setApiKey(key),
+            else => {},
+        }
+    }
+
     /// Status and message from the client's most recent failed request, to
     /// surface detail past the opaque `error.ApiError`. The message is owned by
     /// the client and valid until its next request; both null if none failed.
