@@ -4,6 +4,7 @@ const retry = @import("retry.zig");
 const http = @import("http.zig");
 const gemini_mod = @import("gemini/Client.zig");
 const openai_mod = @import("openai/Client.zig");
+const codex_mod = @import("codex/Client.zig");
 const anthropic_mod = @import("anthropic/Client.zig");
 const gemini_types = @import("gemini/types.zig");
 const openai_types = @import("openai/types.zig");
@@ -432,9 +433,10 @@ pub const Client = union(enum) {
     llama_cpp: *openai_mod,
     vercel: *openai_mod,
     mistral: *openai_mod,
+    codex: *codex_mod,
 
-    pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError;
-    pub const StreamError = gemini_mod.StreamError || openai_mod.StreamError || anthropic_mod.StreamError;
+    pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError || codex_mod.ApiError;
+    pub const StreamError = gemini_mod.StreamError || openai_mod.StreamError || anthropic_mod.StreamError || codex_mod.StreamError;
 
     fn clientAllocator(self: Client) std.mem.Allocator {
         return switch (self) {
@@ -462,6 +464,11 @@ pub const Client = union(enum) {
         /// Environment for the `.vertex` project/location fallbacks above.
         /// The default `.empty` disables env detection.
         environ: std.process.Environ = .empty,
+        /// ChatGPT account id for `.codex` (`ChatGPT-Account-Id` header),
+        /// derived from the OAuth JWT. Ignored by other providers.
+        account_id: ?[]const u8 = null,
+        /// Session id for `.codex` (`session-id` header). Ignored by others.
+        session_id: ?[]const u8 = null,
     };
 
     /// Construct the per-provider client for `credentials`; the caller owns it
@@ -478,6 +485,8 @@ pub const Client = union(enum) {
                 var impl_opts: Impl.InitOptions = .{ .retry_policy = options.retry_policy };
                 if (base_url) |u| impl_opts.base_url = u;
                 if (@hasField(Impl.InitOptions, "bill_to")) impl_opts.bill_to = options.bill_to;
+                if (@hasField(Impl.InitOptions, "account_id")) impl_opts.account_id = options.account_id;
+                if (@hasField(Impl.InitOptions, "session_id")) impl_opts.session_id = options.session_id;
                 if (tag == .vertex) impl_opts.vertex = vertexConfigFromEnv(options.environ, options.project, options.location);
                 client.* = Impl.init(io, allocator, credentials.key, impl_opts);
                 break :blk @unionInit(Client, @tagName(tag), client);
@@ -571,6 +580,22 @@ pub const Client = union(enum) {
                 defer response.deinit();
 
                 return openAiResponsesResult(o.allocator, response.value);
+            },
+            // Codex speaks the same Responses API on the ChatGPT host; `store`
+            // false + encrypted-reasoning `include` are its stateless-backend
+            // requirements, and it omits `max_output_tokens` (matching codex-cli).
+            .codex => |c| {
+                var req_arena = std.heap.ArenaAllocator.init(c.allocator);
+                defer req_arena.deinit();
+                const req_alloc = req_arena.allocator();
+
+                const input = try messagesToOpenAIResponsesInput(req_alloc, messages);
+                const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
+
+                var response = try c.createResponse(codexRequest(model, input, tools, config));
+                defer response.deinit();
+
+                return openAiResponsesResult(c.allocator, response.value);
             },
             // Native `/api/chat` so `num_ctx` can be sized — see `openai/ollama.zig`.
             .ollama => |o| {
@@ -694,9 +719,9 @@ pub const Client = union(enum) {
 
                 try o.chatCompletionStream(model, oai_messages, mapOpenAICompletionConfig(config, tools), .{ .user_ctx = context, .user_cb = callback, .alloc = o.allocator }, &Wrapper.wrap);
             },
-            // The native chat (which sets `num_ctx`) is non-streaming, so emit
-            // the full result in one callback rather than truncate via `/v1` SSE.
-            .ollama => {
+            // Ollama's native chat is non-streaming; codex reuses this one-shot
+            // fallback since the agent drives it via generateContentStreamAccumulate.
+            .ollama, .codex => {
                 var result = self.generateContent(model, messages, config) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.ApiError,
@@ -863,6 +888,22 @@ pub const Client = union(enum) {
                 if (acc.err) |e| return e;
                 return openAiResponsesResult(o.allocator, try acc.response());
             },
+            .codex => |c| {
+                var req_arena = std.heap.ArenaAllocator.init(c.allocator);
+                defer req_arena.deinit();
+                const req_alloc = req_arena.allocator();
+
+                const input = try messagesToOpenAIResponsesInput(req_alloc, messages);
+                const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
+
+                var acc = openai_mod.ResponsesStreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
+                c.createResponseStream(codexRequest(model, input, tools, config), &acc, openai_mod.ResponsesStreamAccumulator.onEvent) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.ApiError,
+                };
+                if (acc.err) |e| return e;
+                return openAiResponsesResult(c.allocator, try acc.response());
+            },
             // Native `/api/chat` streaming (NDJSON) keeps the `num_ctx` sizing
             // that the OpenAI-compatible `/v1` shim (used by the other local
             // arms) lacks — it defaults to 4096 and silently truncates.
@@ -914,7 +955,7 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
-            .anthropic => {
+            .anthropic, .codex => {
                 return error.ApiError;
             },
         }
@@ -1181,7 +1222,7 @@ fn openAiPreset(tag: Tag) ?OpenAiPreset {
         .llama_cpp => .{ .base_url = "http://localhost:8080/v1", .placeholder_key = "llama.cpp", .default_model = "", .local = true },
         .vercel => .{ .base_url = "https://ai-gateway.vercel.sh/v1", .env_var = "AI_GATEWAY_API_KEY", .default_model = "openai/gpt-5.5" },
         .mistral => .{ .base_url = "https://api.mistral.ai/v1", .env_var = "MISTRAL_API_KEY", .default_model = "mistral-medium-3.5" },
-        .anthropic, .gemini, .vertex, .openai => null,
+        .anthropic, .gemini, .vertex, .openai, .codex => null,
     };
 }
 
@@ -1216,6 +1257,9 @@ pub fn envApiKey(environ: std.process.Environ, tag: Tag) ?[:0]const u8 {
         else
             environ.getPosix("VERTEX_API_KEY") orelse
                 (if (useVertex(environ)) environ.getPosix("GOOGLE_API_KEY") else null),
+        // Codex authenticates with an OAuth subscription token supplied by the
+        // caller, not an env var — never env-detected.
+        .codex => null,
         else => unreachable,
     };
 }
@@ -1229,6 +1273,7 @@ pub fn envVarName(tag: Tag) []const u8 {
         .openai => "OPENAI_API_KEY",
         .gemini => "GOOGLE_API_KEY/GEMINI_API_KEY",
         .vertex => "VERTEX_API_KEY/GOOGLE_API_KEY",
+        .codex => "a ChatGPT subscription (OAuth)",
         else => unreachable,
     };
 }
@@ -1243,6 +1288,7 @@ pub fn defaultModel(tag: Tag) []const u8 {
     return switch (tag) {
         .anthropic => "claude-sonnet-5",
         .openai => "gpt-5.5",
+        .codex => "gpt-5.5",
         .gemini, .vertex => "gemini-3.6-flash",
         else => unreachable,
     };
@@ -1423,6 +1469,9 @@ pub fn listChatModelIds(
                 try ids.append(arena, try arena.dupe(u8, stripped));
             }
         },
+        // Codex has no listable models endpoint under OAuth; callers fall back
+        // to the models.dev catalog. Return an empty list rather than panic.
+        .codex => {},
         else => unreachable,
     }
 
@@ -1793,6 +1842,22 @@ fn mapOpenAITools(allocator: std.mem.Allocator, tools: []const Tool) ![]openai_t
         };
     }
     return out;
+}
+
+/// Build the Codex Responses request from already-mapped input/tools. Codex
+/// requires `store=false` on the stateless backend and echoes encrypted
+/// reasoning via `include`; it omits `max_output_tokens` to match codex-cli.
+fn codexRequest(model: []const u8, input: []const openai_types.ResponseInputItem, tools: ?[]const openai_types.ResponseTool, config: GenerationConfig) openai_types.ResponsesRequest {
+    return .{
+        .model = model,
+        .input = input,
+        .tools = tools,
+        .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
+        .reasoning = if (config.effort) |tl| .{ .effort = mapEffortToOpenAI(tl), .summary = "auto" } else null,
+        .temperature = config.temperature,
+        .store = false,
+        .include = &.{"reasoning.encrypted_content"},
+    };
 }
 
 /// Flatten the normalized conversation into Responses-API `input` items: each

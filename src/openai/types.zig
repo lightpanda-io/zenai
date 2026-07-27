@@ -268,9 +268,11 @@ pub const ResponseTool = struct {
     strict: ?bool = null,
 };
 
-/// Reasoning controls for reasoning-capable models.
+/// Reasoning controls for reasoning-capable models. `summary` (e.g. "auto") is
+/// used by the Codex backend to echo reasoning summaries.
 pub const ResponseReasoning = struct {
     effort: ReasoningEffort,
+    summary: ?[]const u8 = null,
 };
 
 /// One item in the request `input` list. The `type` selects which fields are
@@ -298,6 +300,12 @@ pub const ResponsesRequest = struct {
     temperature: ?f32 = null,
     top_p: ?f32 = null,
     stream: ?bool = null,
+    /// Codex (ChatGPT backend) fields; omitted (null) for the standard OpenAI
+    /// endpoint. `store=false` makes the stateless backend accept the request;
+    /// `include`/`prompt_cache_key` carry encrypted reasoning across turns.
+    store: ?bool = null,
+    include: ?[]const []const u8 = null,
+    prompt_cache_key: ?[]const u8 = null,
 };
 
 /// A content block within an output `message` item. `output_text` blocks carry
