@@ -137,7 +137,7 @@ pub fn fetchJsonWithRetry(
 /// `std.http.Client.fetch` (redirects, content-encoding) but arming
 /// `interrupt` with the connection's stream around the blocking read so a
 /// SIGINT on another thread can abort it. Returns the response status.
-fn fetchInterruptible(
+pub fn fetchInterruptible(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     options: std.http.Client.FetchOptions,

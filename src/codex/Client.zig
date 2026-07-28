@@ -20,6 +20,7 @@ allocator: std.mem.Allocator,
 access_token: []const u8,
 base_url: []const u8,
 /// ChatGPT account id from the OAuth JWT; sent as `ChatGPT-Account-Id`.
+/// Owned copy — a borrowed pointer would dangle once token refreshes free it.
 account_id: ?[]const u8,
 /// Client identifier sent as `originator`.
 originator: []const u8,
@@ -43,12 +44,12 @@ pub const InitOptions = struct {
     retry_policy: RetryPolicy = .{},
 };
 
-pub fn init(io: std.Io, allocator: std.mem.Allocator, access_token: []const u8, options: InitOptions) Client {
+pub fn init(io: std.Io, allocator: std.mem.Allocator, access_token: []const u8, options: InitOptions) !Client {
     return .{
         .allocator = allocator,
         .access_token = access_token,
         .base_url = options.base_url,
-        .account_id = options.account_id,
+        .account_id = if (options.account_id) |a| try allocator.dupe(u8, a) else null,
         .session_id = options.session_id,
         .originator = options.originator,
         .user_agent = options.user_agent,
@@ -57,6 +58,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, access_token: []const u8, 
 }
 
 pub fn deinit(self: *Client) void {
+    if (self.account_id) |a| self.allocator.free(a);
     if (self.authorization) |a| self.allocator.free(a);
     if (self.last_error_message) |m| self.allocator.free(m);
     self.http_client.deinit();
@@ -141,7 +143,7 @@ fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
 }
 
 test "authHeaders: bearer + account-id + originator + session-id, no api-key" {
-    var client = Client.init(std.testing.io, std.testing.allocator, "tok-abc", .{
+    var client = try Client.init(std.testing.io, std.testing.allocator, "tok-abc", .{
         .account_id = "acct-1",
         .session_id = "sess-1",
     });
@@ -156,7 +158,7 @@ test "authHeaders: bearer + account-id + originator + session-id, no api-key" {
 }
 
 test "authHeaders: account-id and session-id omitted when null" {
-    var client = Client.init(std.testing.io, std.testing.allocator, "tok", .{});
+    var client = try Client.init(std.testing.io, std.testing.allocator, "tok", .{});
     defer client.deinit();
     var buf: [5]std.http.Header = undefined;
     const headers = try client.authHeaders(&buf);
@@ -166,7 +168,7 @@ test "authHeaders: account-id and session-id omitted when null" {
 }
 
 test "setApiKey rebuilds the cached bearer value" {
-    var client = Client.init(std.testing.io, std.testing.allocator, "tok-old", .{});
+    var client = try Client.init(std.testing.io, std.testing.allocator, "tok-old", .{});
     defer client.deinit();
     var buf: [5]std.http.Header = undefined;
     try std.testing.expectEqualStrings("Bearer tok-old", headerValue(try client.authHeaders(&buf), "authorization").?);

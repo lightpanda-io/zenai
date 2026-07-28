@@ -488,7 +488,8 @@ pub const Client = union(enum) {
                 if (@hasField(Impl.InitOptions, "account_id")) impl_opts.account_id = options.account_id;
                 if (@hasField(Impl.InitOptions, "session_id")) impl_opts.session_id = options.session_id;
                 if (tag == .vertex) impl_opts.vertex = vertexConfigFromEnv(options.environ, options.project, options.location);
-                client.* = Impl.init(io, allocator, credentials.key, impl_opts);
+                const impl = Impl.init(io, allocator, credentials.key, impl_opts);
+                client.* = if (@typeInfo(@TypeOf(impl)) == .error_union) try impl else impl;
                 break :blk @unionInit(Client, @tagName(tag), client);
             },
         };
