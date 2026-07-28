@@ -1251,7 +1251,13 @@ pub fn envApiKey(environ: std.process.Environ, tag: Tag) ?[:0]const u8 {
     }
     return switch (tag) {
         .anthropic => environ.getPosix("ANTHROPIC_API_KEY"),
-        .openai => environ.getPosix("OPENAI_API_KEY"),
+        // OPENAI_BASE_URL gates OPENAI_API_KEY between `.openai` and
+        // `.generic_openai` so exactly one of them can ever detect it,
+        // mirroring the `.gemini`/`.vertex` split on GOOGLE_API_KEY.
+        .openai => if (environ.getPosix("OPENAI_BASE_URL") == null)
+            environ.getPosix("OPENAI_API_KEY")
+        else
+            null,
         .generic_openai => if (environ.getPosix("OPENAI_BASE_URL") != null)
             environ.getPosix("OPENAI_API_KEY")
         else
@@ -1568,6 +1574,23 @@ test "generic_openai: no static preset, env-gated key detection" {
     try std.testing.expect(openAiPreset(.generic_openai) == null);
     // Without OPENAI_BASE_URL the key must not be detected — that's `.openai`.
     try std.testing.expect(envApiKey(.empty, .generic_openai) == null);
+}
+
+test "openai/generic_openai: OPENAI_BASE_URL splits key detection" {
+    // Environ.PosixBlock is not the block representation on Windows.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const with_url: std.process.Environ = .{ .block = .{ .slice = &[_:null]?[*:0]const u8{
+        "OPENAI_BASE_URL=http://localhost:8000/v1",
+        "OPENAI_API_KEY=sk-test",
+    } } };
+    try std.testing.expect(envApiKey(with_url, .openai) == null);
+    try std.testing.expectEqualStrings("sk-test", envApiKey(with_url, .generic_openai).?);
+
+    const without_url: std.process.Environ = .{ .block = .{ .slice = &[_:null]?[*:0]const u8{
+        "OPENAI_API_KEY=sk-test",
+    } } };
+    try std.testing.expectEqualStrings("sk-test", envApiKey(without_url, .openai).?);
+    try std.testing.expect(envApiKey(without_url, .generic_openai) == null);
 }
 
 test "generic_openai: envVarName and defaultModel" {
