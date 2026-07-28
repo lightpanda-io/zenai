@@ -18,6 +18,12 @@ pub const anthropic = struct {
     pub const types = @import("anthropic/types.zig");
 };
 
+/// OpenAI Codex — the ChatGPT-subscription backend. Reuses the openai Responses
+/// types; see `codex/Client.zig`.
+pub const codex = struct {
+    pub const Client = @import("codex/Client.zig");
+};
+
 /// Vertex AI uses the Gemini client with `InitOptions.vertex` set — express
 /// mode (API key) or project/location mode (OAuth access token from e.g.
 /// `gcloud auth print-access-token`).

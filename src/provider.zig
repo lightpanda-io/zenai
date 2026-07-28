@@ -4,6 +4,7 @@ const retry = @import("retry.zig");
 const http = @import("http.zig");
 const gemini_mod = @import("gemini/Client.zig");
 const openai_mod = @import("openai/Client.zig");
+const codex_mod = @import("codex/Client.zig");
 const anthropic_mod = @import("anthropic/Client.zig");
 const gemini_types = @import("gemini/types.zig");
 const openai_types = @import("openai/types.zig");
@@ -435,9 +436,10 @@ pub const Client = union(enum) {
     generic_openai: *openai_mod,
     vercel: *openai_mod,
     mistral: *openai_mod,
+    codex: *codex_mod,
 
-    pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError;
-    pub const StreamError = gemini_mod.StreamError || openai_mod.StreamError || anthropic_mod.StreamError;
+    pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError || codex_mod.ApiError;
+    pub const StreamError = gemini_mod.StreamError || openai_mod.StreamError || anthropic_mod.StreamError || codex_mod.StreamError;
 
     fn clientAllocator(self: Client) std.mem.Allocator {
         return switch (self) {
@@ -454,36 +456,47 @@ pub const Client = union(enum) {
         /// OpenAI-compatible clients; ignored by gemini/anthropic.
         bill_to: ?[]const u8 = null,
         /// GCP project for `.vertex` project/location mode (falls back to
-        /// GOOGLE_CLOUD_PROJECT in `environ`). When set, `Credentials.key`
-        /// must be an OAuth access token, not an API key. Ignored by other
+        /// GOOGLE_CLOUD_PROJECT in `environ`). When set, the init `key` must
+        /// be an OAuth access token, not an API key. Ignored by other
         /// providers.
         project: ?[]const u8 = null,
         /// GCP location for `.vertex` (falls back to GOOGLE_CLOUD_LOCATION,
         /// then GOOGLE_CLOUD_REGION in `environ`, then "global"). Ignored by
         /// other providers.
         location: ?[]const u8 = null,
-        /// Environment for the `.vertex` project/location fallbacks above.
-        /// The default `.empty` disables env detection.
+        /// Environment for the `.vertex` project/location fallbacks above and
+        /// the `.generic_openai` OPENAI_BASE_URL fallback. The default
+        /// `.empty` disables env detection.
         environ: std.process.Environ = .empty,
+        /// ChatGPT account id for `.codex` (`ChatGPT-Account-Id` header),
+        /// derived from the OAuth JWT. Ignored by other providers.
+        account_id: ?[]const u8 = null,
+        /// Session id for `.codex` (`session-id` header). Ignored by others.
+        session_id: ?[]const u8 = null,
     };
 
-    /// Construct the per-provider client for `credentials`; the caller owns it
-    /// and must release it with `deinit`.
-    pub fn init(io: std.Io, allocator: std.mem.Allocator, credentials: Credentials, options: InitOptions) !Client {
-        return switch (credentials.provider) {
+    /// Construct the client for `provider`, authenticating with `key`; the
+    /// caller owns it and must release it with `deinit`.
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, provider: Tag, key: [:0]const u8, options: InitOptions) !Client {
+        return switch (provider) {
             inline else => |tag| blk: {
                 const ClientPtr = @FieldType(Client, @tagName(tag));
                 const Impl = @typeInfo(ClientPtr).pointer.child;
                 const client = try allocator.create(Impl);
                 errdefer allocator.destroy(client);
-                const base_url: ?[:0]const u8 = options.base_url orelse
-                    if (openAiPreset(tag)) |p| p.base_url else null;
+                const base_url: ?[:0]const u8 = options.base_url orelse switch (tag) {
+                    // Never fall through to api.openai.com.
+                    .generic_openai => options.environ.getPosix("OPENAI_BASE_URL") orelse return error.MissingBaseUrl,
+                    else => if (openAiPreset(tag)) |p| p.base_url else null,
+                };
                 var impl_opts: Impl.InitOptions = .{ .retry_policy = options.retry_policy };
                 if (base_url) |u| impl_opts.base_url = u;
                 if (@hasField(Impl.InitOptions, "bill_to")) impl_opts.bill_to = options.bill_to;
-                if (@hasField(Impl.InitOptions, "auth")) impl_opts.auth = credentials.auth;
+                if (@hasField(Impl.InitOptions, "account_id")) impl_opts.account_id = options.account_id;
+                if (@hasField(Impl.InitOptions, "session_id")) impl_opts.session_id = options.session_id;
                 if (tag == .vertex) impl_opts.vertex = vertexConfigFromEnv(options.environ, options.project, options.location);
-                client.* = Impl.init(io, allocator, credentials.key, impl_opts);
+                const impl = Impl.init(io, allocator, key, impl_opts);
+                client.* = if (@typeInfo(@TypeOf(impl)) == .error_union) try impl else impl;
                 break :blk @unionInit(Client, @tagName(tag), client);
             },
         };
@@ -507,13 +520,14 @@ pub const Client = union(enum) {
         }
     }
 
-    /// Swap the credential in place (e.g. a refreshed OAuth access token)
-    /// without tearing down connections. The caller retains ownership of `key`
-    /// and must free the previous buffer only after this returns. Not safe to
-    /// call during an in-flight request.
+    /// Repoint a subscription client at a refreshed OAuth access token without
+    /// tearing down connections. Only `.codex` refreshes tokens in place; other
+    /// providers use a static key, so this is a no-op for them. The caller keeps
+    /// ownership of `key` and frees the previous buffer only after this returns.
     pub fn setApiKey(self: Client, key: []const u8) void {
         switch (self) {
-            inline else => |client| client.setApiKey(key),
+            .codex => |c| c.setApiKey(key),
+            else => {},
         }
     }
 
@@ -567,7 +581,7 @@ pub const Client = union(enum) {
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
 
-                const input = try messagesToOpenAIResponsesInput(req_alloc, messages);
+                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, "system");
                 const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
 
                 var response = try o.createResponse(.{
@@ -586,6 +600,9 @@ pub const Client = union(enum) {
 
                 return openAiResponsesResult(o.allocator, response.value);
             },
+            // The Codex backend rejects `stream:false`, so one-shot is the
+            // streaming path accumulated into a discard-text sink.
+            .codex => return self.generateContentStreamAccumulate(model, messages, config, .{ .context = undefined, .onText = noopOnText }),
             // Native `/api/chat` so `num_ctx` can be sized — see `openai/ollama.zig`.
             .ollama => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
@@ -620,7 +637,10 @@ pub const Client = union(enum) {
                 const system_text = try extractSystemText(req_alloc, messages);
                 const ant_messages = try messagesToAnthropicMessages(req_alloc, messages);
 
-                const system_blocks = try anthropicSystemBlocks(req_alloc, a.auth, system_text);
+                const system_blocks: ?[]const anthropic_types.TextBlock = if (system_text) |sys|
+                    @as([]const anthropic_types.TextBlock, &.{.{ .text = sys }})
+                else
+                    null;
 
                 const tools = if (config.tools) |t| try mapAnthropicTools(req_alloc, t) else null;
                 const reasoning = mapEffortToAnthropic(config.effort, config.max_tokens orelse 4096);
@@ -705,9 +725,9 @@ pub const Client = union(enum) {
 
                 try o.chatCompletionStream(model, oai_messages, mapOpenAICompletionConfig(config, tools), .{ .user_ctx = context, .user_cb = callback, .alloc = o.allocator }, &Wrapper.wrap);
             },
-            // The native chat (which sets `num_ctx`) is non-streaming, so emit
-            // the full result in one callback rather than truncate via `/v1` SSE.
-            .ollama => {
+            // Ollama's native chat is non-streaming; codex reuses this one-shot
+            // fallback since the agent drives it via generateContentStreamAccumulate.
+            .ollama, .codex => {
                 var result = self.generateContent(model, messages, config) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.ApiError,
@@ -723,7 +743,10 @@ pub const Client = union(enum) {
                 const system_text = extractSystemText(req_alloc, messages) catch return error.OutOfMemory;
                 const ant_messages = messagesToAnthropicMessages(req_alloc, messages) catch return error.OutOfMemory;
 
-                const system_blocks = anthropicSystemBlocks(req_alloc, a.auth, system_text) catch return error.OutOfMemory;
+                const system_blocks: ?[]const anthropic_types.TextBlock = if (system_text) |sys|
+                    @as([]const anthropic_types.TextBlock, &.{.{ .text = sys }})
+                else
+                    null;
 
                 const tools = if (config.tools) mapAnthropicTools(req_alloc, config.tools.?) catch return error.OutOfMemory else null;
                 const reasoning = mapEffortToAnthropic(config.effort, config.max_tokens orelse 4096);
@@ -779,7 +802,10 @@ pub const Client = union(enum) {
 
                 const system_text = try extractSystemText(req_alloc, messages);
                 const ant_messages = try messagesToAnthropicMessages(req_alloc, messages);
-                const system_blocks = try anthropicSystemBlocks(req_alloc, a.auth, system_text);
+                const system_blocks: ?[]const anthropic_types.TextBlock = if (system_text) |sys|
+                    @as([]const anthropic_types.TextBlock, &.{.{ .text = sys }})
+                else
+                    null;
                 const tools = if (config.tools) |t| try mapAnthropicTools(req_alloc, t) else null;
                 const reasoning = mapEffortToAnthropic(config.effort, config.max_tokens orelse 4096);
 
@@ -849,7 +875,7 @@ pub const Client = union(enum) {
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
 
-                const input = try messagesToOpenAIResponsesInput(req_alloc, messages);
+                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, "system");
                 const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
 
                 var acc = openai_mod.ResponsesStreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
@@ -867,6 +893,22 @@ pub const Client = union(enum) {
                 };
                 if (acc.err) |e| return e;
                 return openAiResponsesResult(o.allocator, try acc.response());
+            },
+            .codex => |c| {
+                var req_arena = std.heap.ArenaAllocator.init(c.allocator);
+                defer req_arena.deinit();
+                const req_alloc = req_arena.allocator();
+
+                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, codex_system_role);
+                const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
+
+                var acc = openai_mod.ResponsesStreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
+                c.createResponseStream(codexRequest(model, input, tools, config), &acc, openai_mod.ResponsesStreamAccumulator.onEvent) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.ApiError,
+                };
+                if (acc.err) |e| return e;
+                return openAiResponsesResult(c.allocator, try acc.response());
             },
             // Native `/api/chat` streaming (NDJSON) keeps the `num_ctx` sizing
             // that the OpenAI-compatible `/v1` shim (used by the other local
@@ -919,7 +961,7 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
-            .anthropic => {
+            .anthropic, .codex => {
                 return error.ApiError;
             },
         }
@@ -1182,19 +1224,13 @@ fn openAiPreset(tag: Tag) ?OpenAiPreset {
     return switch (tag) {
         .ollama => .{ .base_url = "http://localhost:11434/v1", .placeholder_key = "ollama", .default_model = "qwen3.5:latest", .local = true },
         .huggingface => .{ .base_url = "https://router.huggingface.co/v1", .env_var = "HF_TOKEN", .default_model = "Qwen/Qwen3.5-122B-A10B" },
-        .generic_openai => blk: {
-            const base_url = std.posix.getenv("OPENAI_BASE_URL") orelse return null;
-            break :blk .{
-                .base_url = base_url,
-                .env_var = "OPENAI_API_KEY",
-                .default_model = "",
-            };
-        },
+        // No static preset: the base URL comes from OPENAI_BASE_URL.
+        .generic_openai => null,
         // Empty default: the served model is whatever `llama-server` loaded.
         .llama_cpp => .{ .base_url = "http://localhost:8080/v1", .placeholder_key = "llama.cpp", .default_model = "", .local = true },
         .vercel => .{ .base_url = "https://ai-gateway.vercel.sh/v1", .env_var = "AI_GATEWAY_API_KEY", .default_model = "openai/gpt-5.5" },
         .mistral => .{ .base_url = "https://api.mistral.ai/v1", .env_var = "MISTRAL_API_KEY", .default_model = "mistral-medium-3.5" },
-        .anthropic, .gemini, .vertex, .openai => null,
+        .anthropic, .gemini, .vertex, .openai, .codex => null,
     };
 }
 
@@ -1216,8 +1252,8 @@ pub fn envApiKey(environ: std.process.Environ, tag: Tag) ?[:0]const u8 {
     return switch (tag) {
         .anthropic => environ.getPosix("ANTHROPIC_API_KEY"),
         .openai => environ.getPosix("OPENAI_API_KEY"),
-        .generic_openai => if (std.posix.getenv("OPENAI_BASE_URL") != null)
-            std.posix.getenv("OPENAI_API_KEY")
+        .generic_openai => if (environ.getPosix("OPENAI_BASE_URL") != null)
+            environ.getPosix("OPENAI_API_KEY")
         else
             null,
         .gemini => if (useVertex(environ))
@@ -1233,6 +1269,9 @@ pub fn envApiKey(environ: std.process.Environ, tag: Tag) ?[:0]const u8 {
         else
             environ.getPosix("VERTEX_API_KEY") orelse
                 (if (useVertex(environ)) environ.getPosix("GOOGLE_API_KEY") else null),
+        // Codex authenticates with an OAuth subscription token supplied by the
+        // caller, not an env var — never env-detected.
+        .codex => null,
         else => unreachable,
     };
 }
@@ -1247,6 +1286,7 @@ pub fn envVarName(tag: Tag) []const u8 {
         .gemini => "GOOGLE_API_KEY/GEMINI_API_KEY",
         .vertex => "VERTEX_API_KEY/GOOGLE_API_KEY",
         .generic_openai => "OPENAI_API_KEY",
+        .codex => "a ChatGPT subscription (OAuth)",
         else => unreachable,
     };
 }
@@ -1260,7 +1300,7 @@ pub fn defaultModel(tag: Tag) []const u8 {
     if (openAiPreset(tag)) |p| return p.default_model;
     return switch (tag) {
         .anthropic => "claude-sonnet-5",
-        .openai => "gpt-5.5",
+        .openai, .codex => "gpt-5.5",
         .gemini, .vertex => "gemini-3.6-flash",
         .generic_openai => "",
         else => unreachable,
@@ -1277,18 +1317,11 @@ pub fn defaultEffort(tag: Tag) ?Effort {
     };
 }
 
-/// How `Credentials.key` authenticates: a normal API key, or an OAuth bearer
-/// token (Claude subscription). Only meaningful for `.anthropic` today.
-pub const AuthMode = anthropic_mod.Auth;
-
-/// A provider tag paired with the env-resolved key that authenticates it.
-/// The two travel together: a tag is only meaningful with its key.
-pub const Credentials = struct {
+/// A provider whose key was found in the environment (`detectKeys`) or served
+/// by a local probe — a selectable option, not yet the active credential.
+pub const Candidate = struct {
     provider: Tag,
     key: [:0]const u8,
-    /// `.bearer` reinterprets `key` as an OAuth access token. Threaded to the
-    /// anthropic client; ignored by providers whose `InitOptions` lack `auth`.
-    auth: AuthMode = .api_key,
 };
 
 /// Env-detectable providers, in enum order. Keyless local servers (preset
@@ -1298,14 +1331,7 @@ pub const default_candidates: []const Tag = blk: {
     var arr: [all.len]Tag = undefined;
     var n: usize = 0;
     for (all) |t| {
-        // generic_openai is always a candidate; the runtime envApiKey gates
-        // detection on OPENAI_BASE_URL being set, so it's only auto-detected
-        // when the user has explicitly configured a custom server.
-        if (t == .generic_openai) {
-            arr[n] = t;
-            n += 1;
-            continue;
-        }
+        // generic_openai is included; envApiKey gates it on OPENAI_BASE_URL.
         if (openAiPreset(t)) |p| if (p.local) continue;
         arr[n] = t;
         n += 1;
@@ -1314,10 +1340,10 @@ pub const default_candidates: []const Tag = blk: {
     break :blk &out;
 };
 
-/// Scan `candidates` and fill `buf` with a `Credentials` entry for each
+/// Scan `candidates` and fill `buf` with a `Candidate` entry for each
 /// provider that has a key in `environ`, preserving candidate order. Returns
 /// the subslice of `buf` actually filled. `buf.len` must be >= `candidates.len`.
-pub fn detectKeys(environ: std.process.Environ, buf: []Credentials, candidates: []const Tag) []Credentials {
+pub fn detectKeys(environ: std.process.Environ, buf: []Candidate, candidates: []const Tag) []Candidate {
     var n: usize = 0;
     for (candidates) |p| if (envApiKey(environ, p)) |key| {
         buf[n] = .{ .provider = p, .key = key };
@@ -1406,6 +1432,11 @@ pub fn listChatModelIds(
         const policy: retry.RetryPolicy = if (p.local and isLoopbackUrl(url)) .disabled else .{};
         try listOpenAICompatibleModelIds(io, allocator, arena, &ids, api_key, url, policy);
     } else switch (tag) {
+        .generic_openai => {
+            const url = options.base_url orelse
+                options.environ.getPosix("OPENAI_BASE_URL") orelse return error.MissingBaseUrl;
+            try listOpenAICompatibleModelIds(io, allocator, arena, &ids, api_key, url, .{});
+        },
         .anthropic => {
             var client = anthropic_mod.init(io, allocator, api_key, .{});
             defer client.deinit();
@@ -1457,6 +1488,9 @@ pub fn listChatModelIds(
                 try ids.append(arena, try arena.dupe(u8, stripped));
             }
         },
+        // Codex has no listable models endpoint under OAuth; callers fall back
+        // to the models.dev catalog. Return an empty list rather than panic.
+        .codex => {},
         else => unreachable,
     }
 
@@ -1530,22 +1564,18 @@ test "vercel/mistral: real-key cloud presets, auto-detectable" {
     try std.testing.expect(saw_vercel and saw_mistral);
 }
 
-test "generic_openai: no preset when OPENAI_BASE_URL is unset" {
-    // Without the env var, there's no valid base URL — the preset must be null
-    // so generic_openai never silently falls back to api.openai.com.
+test "generic_openai: no static preset, env-gated key detection" {
     try std.testing.expect(openAiPreset(.generic_openai) == null);
-    try std.testing.expect(envApiKey(.generic_openai) == null);
+    // Without OPENAI_BASE_URL the key must not be detected — that's `.openai`.
+    try std.testing.expect(envApiKey(.empty, .generic_openai) == null);
 }
 
 test "generic_openai: envVarName and defaultModel" {
-    // These don't need the env var set — they're compile-time constants.
     try std.testing.expectEqualStrings("OPENAI_API_KEY", envVarName(.generic_openai));
     try std.testing.expectEqualStrings("", defaultModel(.generic_openai));
 }
 
 test "generic_openai: present in default_candidates (runtime-gated)" {
-    // generic_openai is always in the candidate list; runtime envApiKey
-    // gates actual detection on OPENAI_BASE_URL being set.
     var found = false;
     for (default_candidates) |t| {
         if (t == .generic_openai) found = true;
@@ -1580,50 +1610,6 @@ fn extractSystemText(allocator: std.mem.Allocator, messages: []const Message) !?
     if (sys_parts.items.len == 0) return null;
     if (sys_parts.items.len == 1) return sys_parts.items[0];
     return try std.mem.join(allocator, "\n\n", sys_parts.items);
-}
-
-/// Build the Anthropic `system` blocks from the merged `system_text`. On the
-/// OAuth (`.bearer`) path the subscription endpoint requires
-/// `anthropic_mod.oauth_system_prompt` as the verbatim first block, so it is
-/// prepended as its own block ahead of the caller's system text.
-fn anthropicSystemBlocks(arena: std.mem.Allocator, auth: AuthMode, system_text: ?[]const u8) !?[]const anthropic_types.TextBlock {
-    switch (auth) {
-        .api_key => return if (system_text) |sys|
-            try arena.dupe(anthropic_types.TextBlock, &.{.{ .text = sys }})
-        else
-            null,
-        .bearer => {
-            const marker = anthropic_mod.oauth_system_prompt;
-            return if (system_text) |sys|
-                try arena.dupe(anthropic_types.TextBlock, &.{ .{ .text = marker }, .{ .text = sys } })
-            else
-                try arena.dupe(anthropic_types.TextBlock, &.{.{ .text = marker }});
-        },
-    }
-}
-
-test "anthropicSystemBlocks: bearer prepends the oauth marker as the first block" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const marker = anthropic_mod.oauth_system_prompt;
-
-    // api_key: single block, or null.
-    try std.testing.expectEqual(@as(?[]const anthropic_types.TextBlock, null), try anthropicSystemBlocks(a, .api_key, null));
-    const ak = (try anthropicSystemBlocks(a, .api_key, "hi")).?;
-    try std.testing.expectEqual(@as(usize, 1), ak.len);
-    try std.testing.expectEqualStrings("hi", ak[0].text);
-
-    // bearer: marker first, then the system text.
-    const b = (try anthropicSystemBlocks(a, .bearer, "hi")).?;
-    try std.testing.expectEqual(@as(usize, 2), b.len);
-    try std.testing.expectEqualStrings(marker, b[0].text);
-    try std.testing.expectEqualStrings("hi", b[1].text);
-
-    // bearer with no system text: marker alone, still present.
-    const b0 = (try anthropicSystemBlocks(a, .bearer, null)).?;
-    try std.testing.expectEqual(@as(usize, 1), b0.len);
-    try std.testing.expectEqualStrings(marker, b0[0].text);
 }
 
 const SeparatedMessages = struct {
@@ -1896,11 +1882,32 @@ fn mapOpenAITools(allocator: std.mem.Allocator, tools: []const Tool) ![]openai_t
     return out;
 }
 
+// The Codex backend 400s on `system` messages; `developer` is its equivalent.
+const codex_system_role = "developer";
+
+fn noopOnText(_: *anyopaque, _: []const u8) void {}
+
+/// Build the Codex Responses request from already-mapped input/tools. Codex
+/// requires `store=false` on the stateless backend and echoes encrypted
+/// reasoning via `include`; it omits `max_output_tokens` to match codex-cli.
+fn codexRequest(model: []const u8, input: []const openai_types.ResponseInputItem, tools: ?[]const openai_types.ResponseTool, config: GenerationConfig) openai_types.ResponsesRequest {
+    return .{
+        .model = model,
+        .input = input,
+        .tools = tools,
+        .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
+        .reasoning = if (config.effort) |tl| .{ .effort = mapEffortToOpenAI(tl), .summary = "auto" } else null,
+        .temperature = config.temperature,
+        .store = false,
+        .include = &.{"reasoning.encrypted_content"},
+    };
+}
+
 /// Flatten the normalized conversation into Responses-API `input` items: each
 /// assistant tool call becomes a `function_call` item and each tool result a
 /// `function_call_output` item, rather than the role-tagged messages chat
 /// completions uses.
-fn messagesToOpenAIResponsesInput(allocator: std.mem.Allocator, messages: []const Message) ![]openai_types.ResponseInputItem {
+fn messagesToOpenAIResponsesInput(allocator: std.mem.Allocator, messages: []const Message, system_role: []const u8) ![]openai_types.ResponseInputItem {
     var out: std.ArrayList(openai_types.ResponseInputItem) = .empty;
 
     for (messages) |msg| {
@@ -1929,7 +1936,7 @@ fn messagesToOpenAIResponsesInput(allocator: std.mem.Allocator, messages: []cons
             try out.append(allocator, .{
                 .type = "message",
                 .role = switch (msg.role) {
-                    .system => "system",
+                    .system => system_role,
                     .user => "user",
                     .assistant => "assistant",
                     .tool => unreachable,
