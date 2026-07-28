@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("../openai/types.zig");
+const openai_mod = @import("../openai/Client.zig");
 const http = @import("../http.zig");
 const retry = @import("../retry.zig");
 
@@ -26,7 +27,6 @@ user_agent: []const u8,
 /// Sent as `session-id`; null omits it.
 session_id: ?[]const u8,
 http_client: std.http.Client,
-retry_policy: RetryPolicy,
 last_error_message: ?[]u8 = null,
 last_error_status: ?u10 = null,
 interrupt: ?*http.Interrupt = null,
@@ -39,6 +39,7 @@ pub const InitOptions = struct {
     session_id: ?[]const u8 = null,
     originator: []const u8 = "lightpanda",
     user_agent: []const u8 = "lightpanda",
+    /// Accepted for uniform provider init; the streaming-only path never retries.
     retry_policy: RetryPolicy = .{},
 };
 
@@ -52,9 +53,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, access_token: []const u8, 
         .originator = options.originator,
         .user_agent = options.user_agent,
         .http_client = .{ .allocator = allocator, .io = io },
-        .retry_policy = options.retry_policy,
-        .last_error_message = null,
-        .last_error_status = null,
     };
 }
 
@@ -75,17 +73,9 @@ pub fn setApiKey(self: *Client, token: []const u8) void {
     }
 }
 
-pub const ApiError = error{
-    ApiError,
-    MissingApiKey,
-    EmptyResponse,
-} || std.http.Client.FetchError || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error || std.Uri.ParseError;
-
-pub const StreamError = error{
-    ApiError,
-    MissingApiKey,
-    InvalidSseData,
-} || std.http.Client.RequestError || std.http.Client.Request.ReceiveHeadError || std.Io.Writer.Error || std.Io.Reader.DelimiterError || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error || std.Uri.ParseError;
+// Same wire protocol and transport as the openai client, so the same failures.
+pub const ApiError = openai_mod.ApiError;
+pub const StreamError = openai_mod.StreamError;
 
 fn authHeaders(self: *Client, buf: *[5]std.http.Header) ![]const std.http.Header {
     if (self.authorization == null)
@@ -193,7 +183,6 @@ test "Codex ResponsesRequest serializes store/include/reasoning.summary, omits m
         .reasoning = .{ .effort = .medium, .summary = "auto" },
         .store = false,
         .include = &.{"reasoning.encrypted_content"},
-        .prompt_cache_key = "sess-1",
     };
     var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer buf.deinit();
@@ -202,6 +191,5 @@ test "Codex ResponsesRequest serializes store/include/reasoning.summary, omits m
     try std.testing.expect(std.mem.find(u8, json, "\"store\":false") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"reasoning.encrypted_content\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"summary\":\"auto\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"prompt_cache_key\":\"sess-1\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "max_output_tokens") == null);
 }

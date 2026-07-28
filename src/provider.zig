@@ -592,26 +592,9 @@ pub const Client = union(enum) {
 
                 return openAiResponsesResult(o.allocator, response.value);
             },
-            // Codex speaks the same Responses API on the ChatGPT host; `store`
-            // false + encrypted-reasoning `include` are its stateless-backend
-            // requirements, and it omits `max_output_tokens` (matching codex-cli).
-            // The backend rejects `stream:false`, so one-shot = stream + accumulate.
-            .codex => |c| {
-                var req_arena = std.heap.ArenaAllocator.init(c.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
-
-                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, codex_system_role);
-                const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
-
-                var acc = openai_mod.ResponsesStreamAccumulator.init(req_alloc, undefined, noopOnText);
-                c.createResponseStream(codexRequest(model, input, tools, config), &acc, openai_mod.ResponsesStreamAccumulator.onEvent) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.ApiError,
-                };
-                if (acc.err) |e| return e;
-                return openAiResponsesResult(c.allocator, try acc.response());
-            },
+            // The Codex backend rejects `stream:false`, so one-shot is the
+            // streaming path accumulated into a discard-text sink.
+            .codex => return self.generateContentStreamAccumulate(model, messages, config, .{ .context = undefined, .onText = noopOnText }),
             // Native `/api/chat` so `num_ctx` can be sized — see `openai/ollama.zig`.
             .ollama => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
@@ -1302,8 +1285,7 @@ pub fn defaultModel(tag: Tag) []const u8 {
     if (openAiPreset(tag)) |p| return p.default_model;
     return switch (tag) {
         .anthropic => "claude-sonnet-5",
-        .openai => "gpt-5.5",
-        .codex => "gpt-5.5",
+        .openai, .codex => "gpt-5.5",
         .gemini, .vertex => "gemini-3.6-flash",
         else => unreachable,
     };
