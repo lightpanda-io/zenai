@@ -573,7 +573,7 @@ pub const Client = union(enum) {
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
 
-                const input = try messagesToOpenAIResponsesInput(req_alloc, messages);
+                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, "system");
                 const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
 
                 var response = try o.createResponse(.{
@@ -595,18 +595,22 @@ pub const Client = union(enum) {
             // Codex speaks the same Responses API on the ChatGPT host; `store`
             // false + encrypted-reasoning `include` are its stateless-backend
             // requirements, and it omits `max_output_tokens` (matching codex-cli).
+            // The backend rejects `stream:false`, so one-shot = stream + accumulate.
             .codex => |c| {
                 var req_arena = std.heap.ArenaAllocator.init(c.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
 
-                const input = try messagesToOpenAIResponsesInput(req_alloc, messages);
+                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, codex_system_role);
                 const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
 
-                var response = try c.createResponse(codexRequest(model, input, tools, config));
-                defer response.deinit();
-
-                return openAiResponsesResult(c.allocator, response.value);
+                var acc = openai_mod.ResponsesStreamAccumulator.init(req_alloc, undefined, noopOnText);
+                c.createResponseStream(codexRequest(model, input, tools, config), &acc, openai_mod.ResponsesStreamAccumulator.onEvent) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.ApiError,
+                };
+                if (acc.err) |e| return e;
+                return openAiResponsesResult(c.allocator, try acc.response());
             },
             // Native `/api/chat` so `num_ctx` can be sized — see `openai/ollama.zig`.
             .ollama => |o| {
@@ -880,7 +884,7 @@ pub const Client = union(enum) {
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
 
-                const input = try messagesToOpenAIResponsesInput(req_alloc, messages);
+                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, "system");
                 const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
 
                 var acc = openai_mod.ResponsesStreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
@@ -904,7 +908,7 @@ pub const Client = union(enum) {
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
 
-                const input = try messagesToOpenAIResponsesInput(req_alloc, messages);
+                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, codex_system_role);
                 const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
 
                 var acc = openai_mod.ResponsesStreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
@@ -1855,6 +1859,11 @@ fn mapOpenAITools(allocator: std.mem.Allocator, tools: []const Tool) ![]openai_t
     return out;
 }
 
+// The Codex backend 400s on `system` messages; `developer` is its equivalent.
+const codex_system_role = "developer";
+
+fn noopOnText(_: *anyopaque, _: []const u8) void {}
+
 /// Build the Codex Responses request from already-mapped input/tools. Codex
 /// requires `store=false` on the stateless backend and echoes encrypted
 /// reasoning via `include`; it omits `max_output_tokens` to match codex-cli.
@@ -1875,7 +1884,7 @@ fn codexRequest(model: []const u8, input: []const openai_types.ResponseInputItem
 /// assistant tool call becomes a `function_call` item and each tool result a
 /// `function_call_output` item, rather than the role-tagged messages chat
 /// completions uses.
-fn messagesToOpenAIResponsesInput(allocator: std.mem.Allocator, messages: []const Message) ![]openai_types.ResponseInputItem {
+fn messagesToOpenAIResponsesInput(allocator: std.mem.Allocator, messages: []const Message, system_role: []const u8) ![]openai_types.ResponseInputItem {
     var out: std.ArrayList(openai_types.ResponseInputItem) = .empty;
 
     for (messages) |msg| {
@@ -1904,7 +1913,7 @@ fn messagesToOpenAIResponsesInput(allocator: std.mem.Allocator, messages: []cons
             try out.append(allocator, .{
                 .type = "message",
                 .role = switch (msg.role) {
-                    .system => "system",
+                    .system => system_role,
                     .user => "user",
                     .assistant => "assistant",
                     .tool => unreachable,

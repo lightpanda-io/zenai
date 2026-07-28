@@ -6,7 +6,6 @@ const retry = @import("../retry.zig");
 pub const RetryPolicy = retry.RetryPolicy;
 
 const ResponsesRequest = types.ResponsesRequest;
-const ResponsesResponse = types.ResponsesResponse;
 const ResponseStreamEvent = types.ResponseStreamEvent;
 
 /// Client for the OpenAI "Codex" backend — the ChatGPT-subscription endpoint at
@@ -76,8 +75,6 @@ pub fn setApiKey(self: *Client, token: []const u8) void {
     }
 }
 
-pub const Response = http.Response;
-
 pub const ApiError = error{
     ApiError,
     MissingApiKey,
@@ -123,32 +120,8 @@ pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
     }
 }
 
-fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) ApiError!Response(T) {
-    var payload_buf: std.Io.Writer.Allocating = .init(self.allocator);
-    defer payload_buf.deinit();
-    std.json.Stringify.value(body, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
-        return error.OutOfMemory;
-
-    var hdr_buf: [5]std.http.Header = undefined;
-    const auth = try self.authHeaders(&hdr_buf);
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, .{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = payload_buf.written(),
-        .extra_headers = auth,
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-    }, T, self);
-}
-
-/// Create a model response via the Responses API on the Codex backend.
-pub fn createResponse(self: *Client, request: ResponsesRequest) ApiError!Response(ResponsesResponse) {
-    if (self.access_token.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/responses", .{self.base_url});
-    defer self.allocator.free(url);
-    return self.fetchPost(url, request, ResponsesResponse);
-}
-
-/// Stream a model response via the Responses API; `request.stream` is forced on.
+/// Stream a model response via the Responses API; `request.stream` is forced on
+/// (the backend rejects non-streaming requests outright).
 pub fn createResponseStream(
     self: *Client,
     request: ResponsesRequest,
