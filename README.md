@@ -379,10 +379,10 @@ const ai: zenai.provider.Client = .{ .gemini = &gemini_client };
 // Or any OpenAI-compatible server (vLLM, LiteLLM, Together, Groq, etc.).
 // Auto-detected by `provider.Client.init` when OPENAI_BASE_URL is set; the
 // key comes from OPENAI_API_KEY. With the raw client, pass `.base_url`:
-// var custom_client = zenai.generic_openai.Client.init(io, allocator, api_key, .{
+// var custom_client = zenai.openai_compatible.Client.init(io, allocator, api_key, .{
 //     .base_url = "https://my-custom-server.com/v1",
 // });
-// const ai: zenai.provider.Client = .{ .generic_openai = &custom_client };
+// const ai: zenai.provider.Client = .{ .openai_compatible = &custom_client };
 
 var result = try ai.generateContent("gemini-2.5-flash", &.{
     .{ .role = .user, .content = "What is Zig?" },

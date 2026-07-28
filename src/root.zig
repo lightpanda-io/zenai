@@ -44,7 +44,7 @@ pub const llama_cpp = openai;
 /// Generic OpenAI-compatible Chat Completions API. Auto-detected when
 /// `OPENAI_BASE_URL` is set — use it for any server that speaks the OpenAI
 /// chat completions wire format (vLLM, LiteLLM, Together, Groq, etc.).
-pub const generic_openai = openai;
+pub const openai_compatible = openai;
 
 /// Vercel AI Gateway and Mistral both use the OpenAI-compatible Chat Completions
 /// API with their own default base URLs.
