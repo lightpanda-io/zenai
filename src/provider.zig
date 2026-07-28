@@ -453,8 +453,8 @@ pub const Client = union(enum) {
         /// OpenAI-compatible clients; ignored by gemini/anthropic.
         bill_to: ?[]const u8 = null,
         /// GCP project for `.vertex` project/location mode (falls back to
-        /// GOOGLE_CLOUD_PROJECT in `environ`). When set, `Credentials.key`
-        /// must be an OAuth access token, not an API key. Ignored by other
+        /// GOOGLE_CLOUD_PROJECT in `environ`). When set, the init `key` must
+        /// be an OAuth access token, not an API key. Ignored by other
         /// providers.
         project: ?[]const u8 = null,
         /// GCP location for `.vertex` (falls back to GOOGLE_CLOUD_LOCATION,
@@ -471,10 +471,10 @@ pub const Client = union(enum) {
         session_id: ?[]const u8 = null,
     };
 
-    /// Construct the per-provider client for `credentials`; the caller owns it
-    /// and must release it with `deinit`.
-    pub fn init(io: std.Io, allocator: std.mem.Allocator, credentials: Credentials, options: InitOptions) !Client {
-        return switch (credentials.provider) {
+    /// Construct the client for `provider`, authenticating with `key`; the
+    /// caller owns it and must release it with `deinit`.
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, provider: Tag, key: [:0]const u8, options: InitOptions) !Client {
+        return switch (provider) {
             inline else => |tag| blk: {
                 const ClientPtr = @FieldType(Client, @tagName(tag));
                 const Impl = @typeInfo(ClientPtr).pointer.child;
@@ -488,7 +488,7 @@ pub const Client = union(enum) {
                 if (@hasField(Impl.InitOptions, "account_id")) impl_opts.account_id = options.account_id;
                 if (@hasField(Impl.InitOptions, "session_id")) impl_opts.session_id = options.session_id;
                 if (tag == .vertex) impl_opts.vertex = vertexConfigFromEnv(options.environ, options.project, options.location);
-                const impl = Impl.init(io, allocator, credentials.key, impl_opts);
+                const impl = Impl.init(io, allocator, key, impl_opts);
                 client.* = if (@typeInfo(@TypeOf(impl)) == .error_union) try impl else impl;
                 break :blk @unionInit(Client, @tagName(tag), client);
             },
@@ -1302,9 +1302,9 @@ pub fn defaultEffort(tag: Tag) ?Effort {
     };
 }
 
-/// A provider tag paired with the env-resolved key that authenticates it.
-/// The two travel together: a tag is only meaningful with its key.
-pub const Credentials = struct {
+/// A provider whose key was found in the environment (`detectKeys`) or served
+/// by a local probe — a selectable option, not yet the active credential.
+pub const Candidate = struct {
     provider: Tag,
     key: [:0]const u8,
 };
@@ -1324,10 +1324,10 @@ pub const default_candidates: []const Tag = blk: {
     break :blk &out;
 };
 
-/// Scan `candidates` and fill `buf` with a `Credentials` entry for each
+/// Scan `candidates` and fill `buf` with a `Candidate` entry for each
 /// provider that has a key in `environ`, preserving candidate order. Returns
 /// the subslice of `buf` actually filled. `buf.len` must be >= `candidates.len`.
-pub fn detectKeys(environ: std.process.Environ, buf: []Credentials, candidates: []const Tag) []Credentials {
+pub fn detectKeys(environ: std.process.Environ, buf: []Candidate, candidates: []const Tag) []Candidate {
     var n: usize = 0;
     for (candidates) |p| if (envApiKey(environ, p)) |key| {
         buf[n] = .{ .provider = p, .key = key };
