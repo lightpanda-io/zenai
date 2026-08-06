@@ -35,6 +35,7 @@ pub const RetryPolicy = struct {
 };
 
 /// HTTP status codes that are considered transient and worth retrying.
+///   408 request timeout
 ///   429 rate-limited
 ///   500 internal server error
 ///   502 bad gateway
@@ -43,7 +44,7 @@ pub const RetryPolicy = struct {
 ///   529 overloaded (Anthropic)
 pub fn isRetryableStatus(code: u10) bool {
     return switch (code) {
-        429, 500, 502, 503, 504, 529 => true,
+        408, 429, 500, 502, 503, 504, 529 => true,
         else => false,
     };
 }
@@ -109,6 +110,7 @@ pub fn sleepBackoff(io: std.Io, attempt: u8, policy: RetryPolicy) void {
 }
 
 test "isRetryableStatus covers known transients" {
+    try std.testing.expect(isRetryableStatus(408));
     try std.testing.expect(isRetryableStatus(429));
     try std.testing.expect(isRetryableStatus(500));
     try std.testing.expect(isRetryableStatus(502));
