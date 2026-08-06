@@ -19,6 +19,7 @@ pub const StopReason = union(enum) {
     tool_use,
     pause_turn,
     refusal,
+    model_context_window_exceeded,
     unknown: []const u8,
 
     pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
@@ -214,6 +215,7 @@ pub const RefusalCategory = union(enum) {
     bio,
     frontier_llm,
     reasoning_extraction,
+    general_harms,
     unknown: []const u8,
 
     pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
@@ -430,7 +432,7 @@ test "StopReason parses from JSON" {
 
 test "StopReason preserves unknown values" {
     const json =
-        \\{"id":"msg_123","type":"message","role":"assistant","content":[{"type":"text","text":"x"}],"stop_reason":"model_context_window_exceeded","usage":{"input_tokens":10,"output_tokens":5}}
+        \\{"id":"msg_123","type":"message","role":"assistant","content":[{"type":"text","text":"x"}],"stop_reason":"some_future_reason","usage":{"input_tokens":10,"output_tokens":5}}
     ;
     const parsed = try std.json.parseFromSlice(
         MessageResponse,
@@ -439,7 +441,7 @@ test "StopReason preserves unknown values" {
         .{ .ignore_unknown_fields = true },
     );
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("model_context_window_exceeded", parsed.value.stop_reason.?.unknown);
+    try std.testing.expectEqualStrings("some_future_reason", parsed.value.stop_reason.?.unknown);
 }
 
 test "Usage parses output_tokens_details" {

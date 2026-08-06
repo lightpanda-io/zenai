@@ -122,6 +122,8 @@ pub const FinishReason = union(enum) {
     PROHIBITED_CONTENT,
     SPII, // Sensitive PII
     MALFORMED_FUNCTION_CALL,
+    /// Model called too many tools consecutively, so the system exited execution.
+    TOO_MANY_TOOL_CALLS,
     unknown: []const u8,
 
     pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
@@ -276,6 +278,30 @@ pub const ToolResponse = struct {
     response: ?std.json.Value = null,
 };
 
+/// Information about a single recognized word in an audio transcription.
+pub const WordInfo = struct {
+    /// Transcript of the word.
+    word: ?[]const u8 = null,
+    /// Start offset in time of the word relative to the start of the audio.
+    startOffset: ?[]const u8 = null,
+    /// End offset in time of the word relative to the start of the audio.
+    endOffset: ?[]const u8 = null,
+};
+
+/// Audio transcription of a part (output only).
+pub const Transcription = struct {
+    /// Transcription text.
+    text: ?[]const u8 = null,
+    /// Indicates the end of the transcription.
+    finished: ?bool = null,
+    /// The BCP-47 language code of the transcription.
+    languageCode: ?[]const u8 = null,
+    /// A label identifying the speaker of this audio segment (e.g. "spk_1").
+    speakerLabel: ?[]const u8 = null,
+    /// Detailed word-level transcriptions and timing details.
+    words: ?[]const WordInfo = null,
+};
+
 /// A datatype containing media content. Exactly one field within a Part should be set.
 pub const Part = struct {
     /// Text content.
@@ -307,6 +333,8 @@ pub const Part = struct {
     toolCall: ?ToolCall = null,
     /// Output from a server-side `toolCall` execution.
     toolResponse: ?ToolResponse = null,
+    /// The transcription of the audio part (output only).
+    audioTranscription: ?Transcription = null,
 };
 
 /// Contains the multi-part content of a message.
@@ -506,6 +534,20 @@ pub const ThinkingConfig = struct {
 
 // --- Generation Config ---
 
+/// Configuration for audio transcription (speech recognition).
+pub const AudioTranscriptionConfig = struct {
+    /// BCP-47 language codes providing hints about the languages present in
+    /// the audio. If omitted or empty, defaults to automatic detection.
+    languageCodes: ?[]const []const u8 = null,
+    /// Custom vocabulary phrases that bias the ASR model to improve
+    /// recognition of these specific terms.
+    customVocabulary: ?[]const []const u8 = null,
+    /// Configures speaker diarization.
+    diarization: ?bool = null,
+    /// Configures word-level timestamp generation.
+    wordTimestamp: ?bool = null,
+};
+
 /// Optional model configuration parameters for content generation.
 pub const GenerationConfig = struct {
     /// Controls the degree of randomness in token selection (0.0-2.0).
@@ -550,6 +592,8 @@ pub const GenerationConfig = struct {
     labels: ?std.json.Value = null,
     /// Output schema of the generated response (alternative to responseSchema).
     responseJsonSchema: ?std.json.Value = null,
+    /// Configuration for audio transcription (speech recognition).
+    audioTranscriptionConfig: ?AudioTranscriptionConfig = null,
 };
 
 // --- Request ---

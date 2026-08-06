@@ -2430,7 +2430,7 @@ fn openAiResponsesResult(alloc: std.mem.Allocator, response: openai_types.Respon
 fn mapAnthropicStopReason(reason: anthropic_types.StopReason) FinishReason {
     return switch (reason) {
         .end_turn, .stop_sequence => .stop,
-        .max_tokens, .pause_turn => .max_tokens,
+        .max_tokens, .pause_turn, .model_context_window_exceeded => .max_tokens,
         .tool_use => .tool_call,
         .refusal => .safety,
         .unknown => .unknown,
