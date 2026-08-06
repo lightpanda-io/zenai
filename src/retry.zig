@@ -72,6 +72,39 @@ pub fn isRetryableFetchError(err: anyerror) bool {
     };
 }
 
+/// Upper bound on a server-provided Retry-After hint. Hints above this are
+/// clamped rather than ignored: sleeping the cap and spending an attempt on
+/// another 429 beats a multi-minute stall from a confused server.
+pub const max_retry_after_ms: u32 = 60_000;
+
+pub const RetryAfterUnit = enum { seconds, milliseconds };
+
+/// Parse a `Retry-After` / `Retry-After-Ms` header value into milliseconds,
+/// clamped to `max_retry_after_ms`. Handles the delta form (integer or
+/// fractional, e.g. "30" or "1.5"); the rare HTTP-date form is not supported
+/// and yields null, so callers fall back to computed backoff.
+pub fn parseRetryAfter(value: []const u8, unit: RetryAfterUnit) ?u32 {
+    const v = std.fmt.parseFloat(f64, std.mem.trim(u8, value, " \t")) catch return null;
+    if (!std.math.isFinite(v) or v <= 0) return null;
+    const ms: f64 = switch (unit) {
+        .seconds => v * 1000.0,
+        .milliseconds => v,
+    };
+    if (ms >= @as(f64, @floatFromInt(max_retry_after_ms))) return max_retry_after_ms;
+    return @intFromFloat(ms);
+}
+
+/// Sleep before the next retry. A server-provided Retry-After hint (already
+/// parsed and clamped by `parseRetryAfter`) wins over the computed backoff —
+/// the server knows its rate-limit window better than our exponential guess.
+pub fn sleepBackoffHinted(io: std.Io, attempt: u8, policy: RetryPolicy, hint_ms: ?u32) void {
+    if (hint_ms) |ms| {
+        sleepMs(io, ms);
+        return;
+    }
+    sleepBackoff(io, attempt, policy);
+}
+
 /// Compute the backoff delay (ms) for a given 0-based attempt number.
 /// `attempt == 0` is the delay before the *first retry* (after the
 /// initial attempt fails), so callers pass the retry index, not the
@@ -174,6 +207,28 @@ test "backoffMs with jitter stays within ±25% of the capped base" {
         try std.testing.expect(ms3 >= 6000);
         try std.testing.expect(ms3 < 10000);
     }
+}
+
+test "parseRetryAfter handles delta seconds and milliseconds" {
+    try std.testing.expectEqual(@as(?u32, 30_000), parseRetryAfter("30", .seconds));
+    try std.testing.expectEqual(@as(?u32, 1500), parseRetryAfter("1.5", .seconds));
+    try std.testing.expectEqual(@as(?u32, 250), parseRetryAfter("250", .milliseconds));
+    try std.testing.expectEqual(@as(?u32, 5000), parseRetryAfter(" 5 ", .seconds));
+}
+
+test "parseRetryAfter clamps to max_retry_after_ms" {
+    try std.testing.expectEqual(@as(?u32, max_retry_after_ms), parseRetryAfter("300", .seconds));
+    try std.testing.expectEqual(@as(?u32, max_retry_after_ms), parseRetryAfter("86400000", .milliseconds));
+    try std.testing.expectEqual(@as(?u32, max_retry_after_ms), parseRetryAfter("1e300", .seconds));
+}
+
+test "parseRetryAfter rejects dates, garbage, and non-positive values" {
+    try std.testing.expectEqual(@as(?u32, null), parseRetryAfter("Wed, 21 Oct 2026 07:28:00 GMT", .seconds));
+    try std.testing.expectEqual(@as(?u32, null), parseRetryAfter("", .seconds));
+    try std.testing.expectEqual(@as(?u32, null), parseRetryAfter("0", .seconds));
+    try std.testing.expectEqual(@as(?u32, null), parseRetryAfter("-5", .seconds));
+    try std.testing.expectEqual(@as(?u32, null), parseRetryAfter("nan", .seconds));
+    try std.testing.expectEqual(@as(?u32, null), parseRetryAfter("inf", .seconds));
 }
 
 test "RetryPolicy.disabled gives a single attempt" {

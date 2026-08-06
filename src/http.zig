@@ -105,7 +105,8 @@ pub fn fetchJsonWithRetry(
         var keep_buf = false;
         defer if (!keep_buf) response_buf.deinit();
 
-        const status = fetchInterruptible(allocator, http_client, options, &response_buf.writer, interrupt) catch |err| {
+        var retry_after_ms: ?u32 = null;
+        const status = fetchCapturingRetryAfter(allocator, http_client, options, &response_buf.writer, interrupt, &retry_after_ms) catch |err| {
             // Don't retry a request the user cancelled.
             if (interrupt) |it| if (it.isFired()) return err;
             if (retry.isRetryableFetchError(err) and attempt + 1 < policy.max_attempts) {
@@ -125,7 +126,7 @@ pub fn fetchJsonWithRetry(
         }
 
         if (retry.isRetryableStatus(status_code) and attempt + 1 < policy.max_attempts) {
-            retry.sleepBackoff(http_client.io, attempt, policy);
+            retry.sleepBackoffHinted(http_client.io, attempt, policy, retry_after_ms);
             continue;
         }
         error_handler.setErrorDetail(status_code, body);
@@ -143,6 +144,38 @@ pub fn fetchInterruptible(
     options: std.http.Client.FetchOptions,
     response_writer: *std.Io.Writer,
     interrupt: ?*Interrupt,
+) std.http.Client.FetchError!std.http.Status {
+    var retry_after_ms: ?u32 = null;
+    return fetchCapturingRetryAfter(allocator, client, options, response_writer, interrupt, &retry_after_ms);
+}
+
+/// Server-provided retry hint from a response head: `Retry-After-Ms`
+/// (milliseconds, Anthropic) wins over the standard `Retry-After` (seconds).
+/// Parsed and clamped by `retry.parseRetryAfter`; null when absent or
+/// unparseable (e.g. the HTTP-date form).
+fn retryAfterFromHead(head: std.http.Client.Response.Head) ?u32 {
+    var seconds_hint: ?u32 = null;
+    var it = head.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "retry-after-ms")) {
+            if (retry.parseRetryAfter(h.value, .milliseconds)) |ms| return ms;
+        } else if (seconds_hint == null and std.ascii.eqlIgnoreCase(h.name, "retry-after")) {
+            seconds_hint = retry.parseRetryAfter(h.value, .seconds);
+        }
+    }
+    return seconds_hint;
+}
+
+/// `fetchInterruptible` plus capture of the response's Retry-After hint into
+/// `retry_after_ms` (read from the head before the body is streamed, while
+/// the header bytes are still valid) so `fetchJsonWithRetry` can honor it.
+fn fetchCapturingRetryAfter(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    options: std.http.Client.FetchOptions,
+    response_writer: *std.Io.Writer,
+    interrupt: ?*Interrupt,
+    retry_after_ms: *?u32,
 ) std.http.Client.FetchError!std.http.Status {
     const uri = switch (options.location) {
         .url => |u| try std.Uri.parse(u),
@@ -187,6 +220,7 @@ pub fn fetchInterruptible(
     defer if (own_redirect_buffer) allocator.free(redirect_buffer);
 
     var response = try req.receiveHead(redirect_buffer);
+    retry_after_ms.* = retryAfterFromHead(response.head);
 
     const decompress_buffer: []u8 = switch (response.head.content_encoding) {
         .identity => &.{},
