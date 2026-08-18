@@ -8,6 +8,23 @@ pub const FetchError = error{
     EmptyResponse,
 } || std.http.Client.FetchError || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error || std.Uri.ParseError;
 
+/// Non-2xx detail captured via a client's `setErrorDetail` for later
+/// inspection. Owns `body`; `set` frees the previous body, `deinit` the last.
+pub const ErrorDetail = struct {
+    status: ?u10 = null,
+    body: ?[]const u8 = null,
+
+    pub fn set(self: *ErrorDetail, allocator: std.mem.Allocator, status: u10, body: []const u8) void {
+        self.status = status;
+        if (self.body) |old| allocator.free(old);
+        self.body = if (body.len == 0) null else allocator.dupe(u8, body) catch null;
+    }
+
+    pub fn deinit(self: *ErrorDetail, allocator: std.mem.Allocator) void {
+        if (self.body) |b| allocator.free(b);
+    }
+};
+
 /// Cross-thread trigger for aborting an in-flight HTTP request. A request path
 /// arms it with the active connection's stream around the blocking read (see
 /// `armInterrupt`); another thread (the SIGINT handler) calls `fire` to

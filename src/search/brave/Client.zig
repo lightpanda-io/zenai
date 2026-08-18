@@ -23,8 +23,7 @@ api_key: []const u8,
 base_url: []const u8,
 http_client: std.http.Client,
 retry_policy: RetryPolicy,
-last_error_status: ?u10 = null,
-last_error_body: ?[]const u8 = null,
+last_error: http.ErrorDetail = .{},
 
 pub const InitOptions = struct {
     base_url: []const u8 = "https://api.search.brave.com",
@@ -43,21 +42,15 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
 
 pub fn deinit(self: *Client) void {
     self.http_client.deinit();
-    if (self.last_error_body) |b| self.allocator.free(b);
+    self.last_error.deinit(self.allocator);
 }
 
 pub const Response = http.Response;
 
-pub const ApiError = error{
-    ApiError,
-    MissingApiKey,
-    EmptyResponse,
-} || std.http.Client.FetchError || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error || std.Uri.ParseError;
+pub const ApiError = error{MissingApiKey} || http.FetchError;
 
 pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error_status = status_code;
-    if (self.last_error_body) |old| self.allocator.free(old);
-    self.last_error_body = if (body.len == 0) null else self.allocator.dupe(u8, body) catch null;
+    self.last_error.set(self.allocator, status_code, body);
 }
 
 /// Run a search. Caller owns the returned `Response` and must call `deinit()`.

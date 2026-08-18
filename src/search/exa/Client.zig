@@ -1,8 +1,8 @@
-//! Tavily Search API client. https://docs.tavily.com/
+//! Exa Search API client. https://exa.ai/docs/reference/search
 //!
-//! Tavily is an AI-friendly search API: a query goes in, a clean JSON list
-//! of `{title, url, content}` results comes out (plus an optional synthesized
-//! `answer`). Designed as a low-noise alternative to scraping a SERP.
+//! An embeddings-based search API aimed at agents. Snippet text is opt-in:
+//! a bare search returns metadata only — request `contents`
+//! (highlights/text/summary) to get any.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -24,7 +24,7 @@ retry_policy: RetryPolicy,
 last_error: http.ErrorDetail = .{},
 
 pub const InitOptions = struct {
-    base_url: []const u8 = "https://api.tavily.com",
+    base_url: []const u8 = "https://api.exa.ai",
     retry_policy: RetryPolicy = .{},
 };
 
@@ -69,10 +69,8 @@ pub fn search(
     std.json.Stringify.value(request, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
         return error.OutOfMemory;
 
-    const auth = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key});
-    defer self.allocator.free(auth);
     const extra_headers = [_]std.http.Header{
-        .{ .name = "Authorization", .value = auth },
+        .{ .name = "x-api-key", .value = self.api_key },
     };
 
     return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, .{

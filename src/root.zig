@@ -62,6 +62,10 @@ pub const search = struct {
         pub const Client = @import("search/brave/Client.zig");
         pub const types = @import("search/brave/types.zig");
     };
+    pub const exa = struct {
+        pub const Client = @import("search/exa/Client.zig");
+        pub const types = @import("search/exa/types.zig");
+    };
 };
 
 pub const provider = @import("provider.zig");

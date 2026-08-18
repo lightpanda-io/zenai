@@ -5,19 +5,11 @@ const std = @import("std");
 pub const SearchDepth = enum {
     basic,
     advanced,
-
-    pub fn jsonStringify(self: SearchDepth, jws: anytype) !void {
-        try jws.write(@tagName(self));
-    }
 };
 
 pub const Topic = enum {
     general,
     news,
-
-    pub fn jsonStringify(self: Topic, jws: anytype) !void {
-        try jws.write(@tagName(self));
-    }
 };
 
 pub const Result = struct {
@@ -34,19 +26,9 @@ pub const SearchResponse = struct {
     response_time: ?f32 = null,
 };
 
+/// Doubles as the request body: `Client.search` fills in `query`.
 pub const SearchOptions = struct {
-    max_results: ?u8 = null,
-    search_depth: ?SearchDepth = null,
-    topic: ?Topic = null,
-    include_answer: ?bool = null,
-    include_raw_content: ?bool = null,
-    time_range: ?[]const u8 = null,
-    include_domains: ?[]const []const u8 = null,
-    exclude_domains: ?[]const []const u8 = null,
-};
-
-pub const SearchRequest = struct {
-    query: []const u8,
+    query: []const u8 = "",
     max_results: ?u8 = null,
     search_depth: ?SearchDepth = null,
     topic: ?Topic = null,
@@ -77,9 +59,14 @@ test "SearchResponse parses Tavily fixture" {
     try std.testing.expectEqualStrings("Paris - Wikipedia", parsed.value.results[0].title);
 }
 
-test "SearchDepth jsonStringify emits enum tag" {
+test "SearchOptions stringifies with enum tag and no null fields" {
     var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer buf.deinit();
-    try std.json.Stringify.value(SearchDepth.advanced, .{}, &buf.writer);
-    try std.testing.expectEqualStrings("\"advanced\"", buf.written());
+    try std.json.Stringify.value(SearchOptions{
+        .query = "zig",
+        .search_depth = .advanced,
+    }, .{ .emit_null_optional_fields = false }, &buf.writer);
+    try std.testing.expectEqualStrings(
+        \\{"query":"zig","search_depth":"advanced"}
+    , buf.written());
 }
