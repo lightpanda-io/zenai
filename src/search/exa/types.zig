@@ -12,11 +12,17 @@ pub const SearchType = enum {
 };
 
 /// A bare search returns metadata only; snippet text must be requested here.
-/// The API also accepts object forms (maxCharacters etc.) — not modeled.
+/// `text`/`summary` model the boolean form only (object forms not modeled).
 pub const Contents = struct {
     text: ?bool = null,
-    highlights: ?bool = null,
+    highlights: ?Highlights = null,
     summary: ?bool = null,
+};
+
+/// `{}` enables highlights with the provider defaults.
+pub const Highlights = struct {
+    numSentences: ?u8 = null,
+    highlightsPerUrl: ?u8 = null,
 };
 
 pub const Result = struct {
@@ -80,9 +86,9 @@ test "SearchOptions stringifies with enum tag and no null fields" {
     try std.json.Stringify.value(SearchOptions{
         .query = "zig",
         .type = .@"deep-lite",
-        .contents = .{ .highlights = true },
+        .contents = .{ .highlights = .{ .numSentences = 3 } },
     }, .{ .emit_null_optional_fields = false }, &buf.writer);
     try std.testing.expectEqualStrings(
-        \\{"query":"zig","type":"deep-lite","contents":{"highlights":true}}
+        \\{"query":"zig","type":"deep-lite","contents":{"highlights":{"numSentences":3}}}
     , buf.written());
 }
