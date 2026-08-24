@@ -6,10 +6,11 @@ pub const Result = struct {
     title: []const u8 = "",
     url: []const u8 = "",
     /// The page-text excerpt — this is the field that carries the result's
-    /// text. `description` (the page's meta description) comes back empty on
-    /// essentially every result; read `snippet`.
+    /// text. The wire format also has `description` (the page's meta
+    /// description), which comes back empty on essentially every result; it
+    /// is deliberately not mapped, so nothing can bind to it by mistake —
+    /// parsing ignores unknown fields.
     snippet: []const u8 = "",
-    description: []const u8 = "",
     published_at: ?[]const u8 = null,
     acquired_at: ?[]const u8 = null,
 };
@@ -37,7 +38,9 @@ pub const SearchOptions = struct {
 };
 
 test "SearchResponse parses Keenable fixture" {
-    // Real response shape: `description` present but empty, text in `snippet`.
+    // Real response shape: `description` present but empty, text in
+    // `snippet`. The fixture keeps `description` to prove the unmapped
+    // field is ignored, not tripped over.
     const fixture =
         \\{
         \\  "query": "zig systems programming language",
@@ -54,7 +57,6 @@ test "SearchResponse parses Keenable fixture" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.results.len);
     try std.testing.expectEqualStrings("Zig (programming language)", parsed.value.results[0].title);
     try std.testing.expectEqualStrings("Zig is a system programming language.", parsed.value.results[0].snippet);
-    try std.testing.expectEqualStrings("", parsed.value.results[0].description);
 }
 
 test "SearchOptions stringifies with no null fields" {

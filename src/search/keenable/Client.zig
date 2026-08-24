@@ -2,10 +2,10 @@
 //!
 //! Keenable is an AI-friendly search API: a query goes in, a clean JSON list
 //! of `{title, url, snippet}` results comes out. Unlike the other search
-//! providers here it also works without an API key: with an empty `api_key`
-//! the client calls the public endpoint (rate-limited per client IP), which
-//! requires an application title header for attribution. A key lifts the
-//! rate limits; it is not a prerequisite.
+//! providers here it also works without an API key: pass `null` as `api_key`
+//! and the client calls the public endpoint (rate-limited per client IP),
+//! which requires an application title header for attribution. A key lifts
+//! the rate limits; it is not a prerequisite.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -20,7 +20,11 @@ const SearchResponse = types.SearchResponse;
 const Client = @This();
 
 allocator: std.mem.Allocator,
-api_key: []const u8,
+/// `null` selects the keyless public endpoint. A non-null key — even an
+/// empty one, e.g. from a set-but-empty environment variable — selects the
+/// keyed endpoint, so a misconfigured key fails loudly instead of silently
+/// changing endpoint and rate-limit regime.
+api_key: ?[]const u8,
 base_url: []const u8,
 app_title: []const u8,
 http_client: std.http.Client,
@@ -31,11 +35,14 @@ pub const InitOptions = struct {
     base_url: []const u8 = "https://api.keenable.ai",
     /// Sent as `X-Keenable-Title`. Required by the keyless endpoint (it
     /// rejects requests without one); pure attribution on keyed calls.
-    app_title: []const u8 = "zenai",
+    /// Deliberately no default: only the embedding application knows its
+    /// own name, and a library default would self-attribute every embedder
+    /// that forgets to set it.
+    app_title: []const u8,
     retry_policy: RetryPolicy = .{},
 };
 
-pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
+pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: ?[]const u8, options: InitOptions) Client {
     return .{
         .allocator = allocator,
         .api_key = api_key,
@@ -53,16 +60,17 @@ pub fn deinit(self: *Client) void {
 
 pub const Response = http.Response;
 
-/// No `MissingApiKey`: an empty key routes to the public endpoint instead.
-pub const ApiError = http.FetchError;
+/// No `MissingApiKey` — a `null` key is the supported keyless mode. What is
+/// required instead is the attribution title, checked before any request.
+pub const ApiError = error{MissingAppTitle} || http.FetchError;
 
 pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
     self.last_error.set(self.allocator, status_code, body);
 }
 
 /// `/v1/search` keyed, `/v1/search/public` keyless.
-fn searchPath(api_key: []const u8) []const u8 {
-    return if (api_key.len == 0) "/v1/search/public" else "/v1/search";
+fn searchPath(api_key: ?[]const u8) []const u8 {
+    return if (api_key == null) "/v1/search/public" else "/v1/search";
 }
 
 /// Run a search. Caller owns the returned `Response` and must call `deinit()`.
@@ -71,6 +79,8 @@ pub fn search(
     query: []const u8,
     options: SearchOptions,
 ) ApiError!Response(SearchResponse) {
+    if (self.app_title.len == 0) return error.MissingAppTitle;
+
     const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.base_url, searchPath(self.api_key) });
     defer self.allocator.free(url);
 
@@ -81,25 +91,30 @@ pub fn search(
     std.json.Stringify.value(request, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
         return error.OutOfMemory;
 
-    var headers_buf: [2]std.http.Header = undefined;
-    var n: usize = 0;
-    headers_buf[n] = .{ .name = "X-Keenable-Title", .value = self.app_title };
-    n += 1;
-    if (self.api_key.len > 0) {
-        headers_buf[n] = .{ .name = "X-API-Key", .value = self.api_key };
-        n += 1;
-    }
+    const headers = [_]std.http.Header{
+        .{ .name = "X-Keenable-Title", .value = self.app_title },
+        .{ .name = "X-API-Key", .value = self.api_key orelse "" },
+    };
 
     return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, .{
         .location = .{ .url = url },
         .method = .POST,
         .payload = payload_buf.written(),
-        .extra_headers = headers_buf[0..n],
+        .extra_headers = headers[0..if (self.api_key == null) 1 else 2],
         .headers = .{ .content_type = .{ .override = "application/json" } },
     }, SearchResponse, self);
 }
 
-test "empty api key routes to the public endpoint" {
-    try std.testing.expectEqualStrings("/v1/search/public", searchPath(""));
+test "null api key routes to the public endpoint" {
+    try std.testing.expectEqualStrings("/v1/search/public", searchPath(null));
     try std.testing.expectEqualStrings("/v1/search", searchPath("sk-abc"));
+    // Set-but-empty is keyed on purpose: it fails loudly server-side rather
+    // than silently downgrading to the keyless rate-limit regime.
+    try std.testing.expectEqualStrings("/v1/search", searchPath(""));
+}
+
+test "search rejects an empty app title" {
+    var client = init(std.testing.io, std.testing.allocator, null, .{ .app_title = "" });
+    defer client.deinit();
+    try std.testing.expectError(error.MissingAppTitle, client.search("anything", .{}));
 }
