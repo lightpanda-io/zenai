@@ -269,6 +269,7 @@ pub const StreamAccumulator = struct {
         index: i32,
         id: []const u8,
         name: []const u8,
+        toolset_name: ?[]const u8 = null,
         json: std.ArrayListUnmanaged(u8) = .empty,
     };
 
@@ -296,6 +297,7 @@ pub const StreamAccumulator = struct {
                     .index = event.index orelse 0,
                     .id = if (cb.id) |id| try self.arena.dupe(u8, id) else "",
                     .name = if (cb.name) |n| try self.arena.dupe(u8, n) else "",
+                    .toolset_name = if (cb.toolset_name) |tn| try self.arena.dupe(u8, tn) else null,
                 });
             }
         } else if (std.mem.eql(u8, et, "content_block_delta")) {
@@ -345,7 +347,7 @@ pub const StreamAccumulator = struct {
                 (std.json.parseFromSliceLeaky(std.json.Value, self.arena, tb.json.items, .{}) catch null)
             else
                 null;
-            try blocks.append(self.arena, .{ .type = "tool_use", .id = tb.id, .name = tb.name, .input = input });
+            try blocks.append(self.arena, .{ .type = "tool_use", .id = tb.id, .name = tb.name, .input = input, .toolset_name = tb.toolset_name });
         }
         return .{
             .content = if (blocks.items.len > 0) blocks.items else null,

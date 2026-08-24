@@ -185,6 +185,7 @@ fn responseToContentBlocks(self: *Chat, response: MessageResponse) std.mem.Alloc
             .id = if (block.id) |v| try a.dupe(u8, v) else null,
             .name = if (block.name) |v| try a.dupe(u8, v) else null,
             .input = if (block.input) |v| try json.dupeValue(a, v) else null,
+            .toolset_name = if (block.toolset_name) |v| try a.dupe(u8, v) else null,
             .thinking = if (block.thinking) |v| try a.dupe(u8, v) else null,
             .signature = if (block.signature) |v| try a.dupe(u8, v) else null,
         };
@@ -204,6 +205,7 @@ fn dupeContentBlocks(self: *Chat, blocks: []const ContentBlockParam) std.mem.All
         if (block.input) |v| duped[i].input = try json.dupeValue(a, v);
         if (block.tool_use_id) |v| duped[i].tool_use_id = try a.dupe(u8, v);
         if (block.content) |v| duped[i].content = try a.dupe(u8, v);
+        if (block.toolset_name) |v| duped[i].toolset_name = try a.dupe(u8, v);
         if (block.thinking) |v| duped[i].thinking = try a.dupe(u8, v);
         if (block.signature) |v| duped[i].signature = try a.dupe(u8, v);
     }

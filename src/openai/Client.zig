@@ -374,6 +374,9 @@ pub const StreamAccumulator = struct {
         }
         if (delta.tool_calls) |tcs| {
             for (tcs, 0..) |tc, i| {
+                // Some providers emit deltas carrying only an index; skip them
+                // so they don't materialize as empty tool calls.
+                if (tc.id == null and tc.function == null) continue;
                 const call = try self.slot(tc.index orelse @intCast(i));
                 if (tc.id) |id| {
                     call.id.clearRetainingCapacity();

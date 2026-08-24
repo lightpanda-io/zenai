@@ -42,6 +42,8 @@ pub const ContentBlock = struct {
     name: ?[]const u8 = null,
     /// Tool input as JSON (type="tool_use").
     input: ?std.json.Value = null,
+    /// For a toolset member tool_use, the toolset family (type="tool_use").
+    toolset_name: ?[]const u8 = null,
     /// Model thinking/reasoning (type="thinking").
     thinking: ?[]const u8 = null,
     /// Opaque signature for thinking continuation (type="thinking").
@@ -66,6 +68,9 @@ pub const ContentBlockParam = struct {
     content: ?[]const u8 = null,
     /// Whether the tool result is an error (type="tool_result").
     is_error: ?bool = null,
+    /// For a toolset member tool_use, the toolset family it belongs to; for a
+    /// toolset member tool_result, the toolset family of the paired tool_use.
+    toolset_name: ?[]const u8 = null,
     /// Model thinking/reasoning (type="thinking").
     thinking: ?[]const u8 = null,
     /// Opaque signature for thinking continuation (type="thinking").

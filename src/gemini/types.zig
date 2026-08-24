@@ -21,6 +21,8 @@ pub const HarmCategory = union(enum) {
     HARM_CATEGORY_SEXUALLY_EXPLICIT,
     HARM_CATEGORY_DANGEROUS_CONTENT,
     HARM_CATEGORY_CIVIC_INTEGRITY,
+    /// Prompts designed to bypass safety filters.
+    HARM_CATEGORY_JAILBREAK,
     unknown: []const u8,
 
     pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
