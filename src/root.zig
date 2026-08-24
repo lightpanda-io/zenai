@@ -66,6 +66,10 @@ pub const search = struct {
         pub const Client = @import("search/exa/Client.zig");
         pub const types = @import("search/exa/types.zig");
     };
+    pub const keenable = struct {
+        pub const Client = @import("search/keenable/Client.zig");
+        pub const types = @import("search/keenable/types.zig");
+    };
 };
 
 pub const provider = @import("provider.zig");

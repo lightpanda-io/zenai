@@ -2,7 +2,9 @@ const std = @import("std");
 const retry = @import("retry.zig");
 
 /// Error set returned by `fetchJsonWithRetry`. Each provider's `ApiError`
-/// is a superset (it adds `MissingApiKey`).
+/// is a superset, adding its own preflight errors (`MissingApiKey` for the
+/// keyed providers; keenable, which supports keyless calls, adds
+/// `MissingAppTitle` instead).
 pub const FetchError = error{
     ApiError,
     EmptyResponse,
@@ -259,8 +261,9 @@ fn fetchCapturingRetryAfter(
     return response.head.status;
 }
 
-/// Error set returned by `streamSse`. Each provider's `StreamError` is a
-/// superset (it adds `MissingApiKey`, which callers check before streaming).
+/// Error set returned by `streamSse`. Each streaming provider's
+/// `StreamError` is a superset (it adds `MissingApiKey`, which callers
+/// check before streaming).
 pub const SseError = error{
     ApiError,
     InvalidSseData,
