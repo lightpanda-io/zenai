@@ -99,6 +99,51 @@ pub fn armInterrupt(interrupt: ?*Interrupt, req: *std.http.Client.Request) Inter
     return .{ .interrupt = interrupt, .req = req };
 }
 
+/// Bounds one request's wall-clock time from an established connection to
+/// the end of the response body. A private `Interrupt` shuts the socket
+/// down at the deadline, exactly as a Ctrl-C would, so the blocking read
+/// fails instead of waiting on the server. The connect phase is out of
+/// reach: std's `ConnectTcpOptions.timeout` is declared but unimplemented.
+const Watchdog = struct {
+    interrupt: Interrupt = .{},
+    done: std.Io.Event = .unset,
+    io: std.Io = undefined,
+    thread: ?std.Thread = null,
+
+    fn start(self: *Watchdog, io: std.Io, req: *const std.http.Client.Request, timeout_ms: u32) error{SystemResources}!void {
+        const conn = req.connection orelse return;
+        self.io = io;
+        self.interrupt.arm(&conn.stream_reader);
+        const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
+        self.thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, run, .{ self, deadline }) catch return error.SystemResources;
+    }
+
+    fn run(self: *Watchdog, deadline: std.Io.Clock.Timestamp) void {
+        while (!self.done.isSet()) {
+            self.done.waitTimeout(self.io, .{ .deadline = deadline }) catch |err| switch (err) {
+                error.Canceled => return,
+                // Spurious wakeups also report Timeout; only the deadline counts.
+                error.Timeout => if (deadline.durationFromNow(self.io).raw.nanoseconds <= 0) {
+                    self.interrupt.fire();
+                    return;
+                },
+            };
+        }
+    }
+
+    /// Must run before `req.deinit`: joins the thread so a late `fire` can't
+    /// hit a recycled socket, and drops a connection the deadline shut down
+    /// just after the body had already completed.
+    fn stop(self: *Watchdog, req: *std.http.Client.Request) void {
+        const thread = self.thread orelse return;
+        self.done.set(self.io);
+        thread.join();
+        if (self.interrupt.isFired()) {
+            if (req.connection) |conn| conn.closing = true;
+        }
+    }
+};
+
 /// Common HTTP fetch + retry + JSON parse pipeline shared by all provider
 /// clients. On a non-retryable HTTP error response, calls
 /// `error_handler.setErrorDetail(status, body)` so the caller can record
@@ -118,6 +163,10 @@ pub fn fetchJsonWithRetry(
         error_handler.interrupt
     else
         null;
+    const timeout_ms: ?u32 = if (@hasField(@TypeOf(error_handler.*), "request_timeout_ms"))
+        error_handler.request_timeout_ms
+    else
+        null;
     var attempt: u8 = 0;
     while (true) : (attempt += 1) {
         var response_buf: std.Io.Writer.Allocating = .init(allocator);
@@ -125,7 +174,7 @@ pub fn fetchJsonWithRetry(
         defer if (!keep_buf) response_buf.deinit();
 
         var retry_after_ms: ?u32 = null;
-        const status = fetchCapturingRetryAfter(allocator, http_client, options, &response_buf.writer, interrupt, &retry_after_ms) catch |err| {
+        const status = fetchCapturingRetryAfter(allocator, http_client, options, &response_buf.writer, interrupt, timeout_ms, &retry_after_ms) catch |err| {
             // Don't retry a request the user cancelled.
             if (interrupt) |it| if (it.isFired()) return err;
             if (retry.isRetryableFetchError(err) and attempt + 1 < policy.max_attempts) {
@@ -165,7 +214,7 @@ pub fn fetchInterruptible(
     interrupt: ?*Interrupt,
 ) std.http.Client.FetchError!std.http.Status {
     var retry_after_ms: ?u32 = null;
-    return fetchCapturingRetryAfter(allocator, client, options, response_writer, interrupt, &retry_after_ms);
+    return fetchCapturingRetryAfter(allocator, client, options, response_writer, interrupt, null, &retry_after_ms);
 }
 
 /// Server-provided retry hint from a response head: `Retry-After-Ms`
@@ -187,13 +236,16 @@ fn retryAfterFromHead(head: std.http.Client.Response.Head) ?u32 {
 
 /// `fetchInterruptible` plus capture of the response's Retry-After hint into
 /// `retry_after_ms` (read from the head before the body is streamed, while
-/// the header bytes are still valid) so `fetchJsonWithRetry` can honor it.
+/// the header bytes are still valid) so `fetchJsonWithRetry` can honor it,
+/// and an optional `timeout_ms` after which the exchange fails with
+/// `error.Timeout` (see `Watchdog`).
 fn fetchCapturingRetryAfter(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     options: std.http.Client.FetchOptions,
     response_writer: *std.Io.Writer,
     interrupt: ?*Interrupt,
+    timeout_ms: ?u32,
     retry_after_ms: *?u32,
 ) std.http.Client.FetchError!std.http.Status {
     const uri = switch (options.location) {
@@ -224,6 +276,24 @@ fn fetchCapturingRetryAfter(
     defer guard.deinit();
     errdefer guard.poison();
 
+    var watchdog: Watchdog = .{};
+    if (timeout_ms) |ms| try watchdog.start(client.io, &req, ms);
+    defer watchdog.stop(&req);
+
+    return exchange(allocator, &req, redirect_behavior, options, response_writer, retry_after_ms) catch |err| {
+        if (watchdog.interrupt.isFired()) return error.Timeout;
+        return err;
+    };
+}
+
+fn exchange(
+    allocator: std.mem.Allocator,
+    req: *std.http.Client.Request,
+    redirect_behavior: std.http.Client.Request.RedirectBehavior,
+    options: std.http.Client.FetchOptions,
+    response_writer: *std.Io.Writer,
+    retry_after_ms: *?u32,
+) std.http.Client.FetchError!std.http.Status {
     if (options.payload) |payload| {
         req.transfer_encoding = .{ .content_length = payload.len };
         var body = try req.sendBodyUnflushed(&.{});
@@ -470,4 +540,40 @@ pub fn appendListParams(allocator: std.mem.Allocator, base_url: []const u8, opti
         return std.fmt.allocPrint(allocator, "{s}?pageSize={d}", .{ base_url, ps });
     }
     return std.fmt.allocPrint(allocator, "{s}?pageToken={s}", .{ base_url, options.pageToken.? });
+}
+
+test "watchdog turns a stalled response into error.Timeout" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const loopback: std.Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var server = try loopback.listen(io, .{});
+    defer server.deinit(io);
+
+    // Accept the request and hold the connection open without answering
+    // until the client side has given up.
+    var release: std.Io.Event = .unset;
+    const Stall = struct {
+        fn run(srv: *std.Io.net.Server, ev: *std.Io.Event, ioo: std.Io) void {
+            const stream = srv.accept(ioo) catch return;
+            defer stream.close(ioo);
+            ev.waitUncancelable(ioo);
+        }
+    };
+    const staller = try std.Thread.spawn(.{}, Stall.run, .{ &server, &release, io });
+    defer staller.join();
+    defer release.set(io);
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{server.socket.address.getPort()});
+    defer allocator.free(url);
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var retry_after_ms: ?u32 = null;
+    try std.testing.expectError(
+        error.Timeout,
+        fetchCapturingRetryAfter(allocator, &client, .{ .location = .{ .url = url } }, &out.writer, null, 200, &retry_after_ms),
+    );
 }

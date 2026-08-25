@@ -21,11 +21,16 @@ api_key: []const u8,
 base_url: []const u8,
 http_client: std.http.Client,
 retry_policy: RetryPolicy,
+request_timeout_ms: ?u32,
 last_error: http.ErrorDetail = .{},
 
 pub const InitOptions = struct {
     base_url: []const u8 = "https://api.exa.ai",
     retry_policy: RetryPolicy = .{},
+    /// Per-attempt bound from an established connection to the end of the
+    /// response body, failing with `error.Timeout`; the connect phase is
+    /// not covered. `null` waits indefinitely.
+    request_timeout_ms: ?u32 = null,
 };
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
@@ -35,6 +40,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
         .base_url = options.base_url,
         .http_client = .{ .allocator = allocator, .io = io },
         .retry_policy = options.retry_policy,
+        .request_timeout_ms = options.request_timeout_ms,
     };
 }
 
