@@ -21,11 +21,16 @@ api_key: []const u8,
 base_url: []const u8,
 http_client: std.http.Client,
 retry_policy: RetryPolicy,
+request_timeout_ms: ?u32,
 last_error: http.ErrorDetail = .{},
 
 pub const InitOptions = struct {
     base_url: []const u8 = "https://api.tavily.com",
     retry_policy: RetryPolicy = .{},
+    /// Per-attempt wall-clock bound on non-streaming requests, from an
+    /// established connection to the end of the body (connect excluded);
+    /// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
+    request_timeout_ms: ?u32 = null,
 };
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
@@ -35,6 +40,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
         .base_url = options.base_url,
         .http_client = .{ .allocator = allocator, .io = io },
         .retry_policy = options.retry_policy,
+        .request_timeout_ms = options.request_timeout_ms,
     };
 }
 
@@ -75,7 +81,7 @@ pub fn search(
         .{ .name = "Authorization", .value = auth },
     };
 
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, .{
+    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
         .location = .{ .url = url },
         .method = .POST,
         .payload = payload_buf.written(),

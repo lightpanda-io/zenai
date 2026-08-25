@@ -125,7 +125,7 @@ fn fetchModelContextLength(client: *Client, model: []const u8) !?i32 {
         return error.OutOfMemory;
 
     const auth = [_]std.http.Header{.{ .name = "Authorization", .value = client.api_key }};
-    var response = try http.fetchJsonWithRetry(client.allocator, &client.http_client, client.retry_policy, .{
+    var response = try http.fetchJsonWithRetry(client.allocator, &client.http_client, client.retry_policy, client.request_timeout_ms, .{
         .location = .{ .url = url },
         .method = .POST,
         .payload = payload_buf.written(),
@@ -229,7 +229,7 @@ pub fn chat(
 
     // Local Ollama ignores auth; harmless, and supports an authenticating proxy.
     const auth = [_]std.http.Header{.{ .name = "Authorization", .value = client.api_key }};
-    return http.fetchJsonWithRetry(client.allocator, &client.http_client, client.retry_policy, .{
+    return http.fetchJsonWithRetry(client.allocator, &client.http_client, client.retry_policy, client.request_timeout_ms, .{
         .location = .{ .url = url },
         .method = .POST,
         .payload = payload_buf.written(),

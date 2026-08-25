@@ -27,6 +27,10 @@ bill_to: ?[]const u8,
 http_client: std.http.Client,
 /// Retry policy applied to every non-streaming request.
 retry_policy: RetryPolicy,
+/// Per-attempt wall-clock bound on non-streaming requests, from an
+/// established connection to the end of the body (connect excluded);
+/// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
+request_timeout_ms: ?u32,
 /// Human-readable message from the most recent API error, owned by the client
 /// and freed on the next failure or `deinit`. Set on `error.ApiError`.
 last_error_message: ?[]u8 = null,
@@ -53,6 +57,10 @@ pub const InitOptions = struct {
     /// Retry policy for transient HTTP failures (5xx, 429, and known
     /// flaky network errors). Pass `RetryPolicy.disabled` to opt out.
     retry_policy: RetryPolicy = .{},
+    /// Per-attempt wall-clock bound on non-streaming requests, from an
+    /// established connection to the end of the body (connect excluded);
+    /// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
+    request_timeout_ms: ?u32 = null,
 };
 
 /// Create a new OpenAI API client.
@@ -66,6 +74,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
         .bill_to = options.bill_to,
         .http_client = .{ .allocator = allocator, .io = io },
         .retry_policy = options.retry_policy,
+        .request_timeout_ms = options.request_timeout_ms,
         .last_error_message = null,
         .last_error_status = null,
     };
@@ -119,7 +128,7 @@ pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
 fn fetchGet(self: *Client, url: []const u8, comptime T: type) ApiError!Response(T) {
     var hdr_buf: [4]std.http.Header = undefined;
     const auth = try self.authHeaders(&hdr_buf);
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, .{
+    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
         .location = .{ .url = url },
         .extra_headers = auth,
     }, T, self);
@@ -133,7 +142,7 @@ fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) Ap
 
     var hdr_buf: [4]std.http.Header = undefined;
     const auth = try self.authHeaders(&hdr_buf);
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, .{
+    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
         .location = .{ .url = url },
         .method = .POST,
         .payload = payload_buf.written(),

@@ -452,6 +452,10 @@ pub const Client = union(enum) {
         /// `ollama_default_base_url` when null; the others use their own.
         base_url: ?[:0]const u8 = null,
         retry_policy: retry.RetryPolicy = .{},
+        /// Per-attempt wall-clock bound on non-streaming requests, from an
+        /// established connection to the end of the body (connect excluded);
+        /// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
+        request_timeout_ms: ?u32 = null,
         /// Hugging Face org to bill via `X-HF-Bill-To`. Only applied to the
         /// OpenAI-compatible clients; ignored by gemini/anthropic.
         bill_to: ?[]const u8 = null,
@@ -489,7 +493,7 @@ pub const Client = union(enum) {
                     .openai_compatible => options.environ.getPosix("OPENAI_BASE_URL") orelse return error.MissingBaseUrl,
                     else => if (openAiPreset(tag)) |p| p.base_url else null,
                 };
-                var impl_opts: Impl.InitOptions = .{ .retry_policy = options.retry_policy };
+                var impl_opts: Impl.InitOptions = .{ .retry_policy = options.retry_policy, .request_timeout_ms = options.request_timeout_ms };
                 if (base_url) |u| impl_opts.base_url = u;
                 if (@hasField(Impl.InitOptions, "bill_to")) impl_opts.bill_to = options.bill_to;
                 if (@hasField(Impl.InitOptions, "account_id")) impl_opts.account_id = options.account_id;
