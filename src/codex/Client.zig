@@ -40,8 +40,10 @@ pub const InitOptions = struct {
     session_id: ?[]const u8 = null,
     originator: []const u8 = "lightpanda",
     user_agent: []const u8 = "lightpanda",
-    /// Accepted for uniform provider init; the streaming-only path never retries.
+    /// Accepted for uniform provider init; the streaming-only path never
+    /// retries and is not bounded by `request_timeout_ms`.
     retry_policy: RetryPolicy = .{},
+    request_timeout_ms: ?u32 = null,
 };
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, access_token: []const u8, options: InitOptions) !Client {

@@ -29,9 +29,9 @@ last_error: http.ErrorDetail = .{},
 pub const InitOptions = struct {
     base_url: []const u8 = "https://api.search.brave.com",
     retry_policy: RetryPolicy = .{},
-    /// Per-attempt bound from an established connection to the end of the
-    /// response body, failing with `error.Timeout`; the connect phase is
-    /// not covered. `null` waits indefinitely.
+    /// Per-attempt wall-clock bound on non-streaming requests, from an
+    /// established connection to the end of the body (connect excluded);
+    /// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
     request_timeout_ms: ?u32 = null,
 };
 
@@ -75,7 +75,7 @@ pub fn search(
         .{ .name = "Accept", .value = "application/json" },
     };
 
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, .{
+    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
         .location = .{ .url = url },
         .method = .GET,
         .extra_headers = &extra_headers,

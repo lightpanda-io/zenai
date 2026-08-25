@@ -104,43 +104,39 @@ pub fn armInterrupt(interrupt: ?*Interrupt, req: *std.http.Client.Request) Inter
 /// down at the deadline, exactly as a Ctrl-C would, so the blocking read
 /// fails instead of waiting on the server. The connect phase is out of
 /// reach: std's `ConnectTcpOptions.timeout` is declared but unimplemented.
+///
+/// A raw `std.Thread` rather than `io.concurrent`: consumers run a
+/// single-threaded `Io.Threaded`, where `concurrent` is unavailable and
+/// cancellation is a no-op. One fixed deadline for the whole exchange, so
+/// not suitable for long-lived streams without a resettable deadline.
 const Watchdog = struct {
     interrupt: Interrupt = .{},
     done: std.Io.Event = .unset,
-    io: std.Io = undefined,
     thread: ?std.Thread = null,
 
-    fn start(self: *Watchdog, io: std.Io, req: *const std.http.Client.Request, timeout_ms: u32) error{SystemResources}!void {
-        const conn = req.connection orelse return;
-        self.io = io;
-        self.interrupt.arm(&conn.stream_reader);
+    fn start(self: *Watchdog, io: std.Io, req: *std.http.Client.Request, timeout_ms: u32) error{SystemResources}!void {
+        _ = armInterrupt(&self.interrupt, req);
         const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
-        self.thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, run, .{ self, deadline }) catch return error.SystemResources;
+        self.thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, run, .{ self, io, deadline }) catch return error.SystemResources;
     }
 
-    fn run(self: *Watchdog, deadline: std.Io.Clock.Timestamp) void {
-        while (!self.done.isSet()) {
-            self.done.waitTimeout(self.io, .{ .deadline = deadline }) catch |err| switch (err) {
-                error.Canceled => return,
-                // Spurious wakeups also report Timeout; only the deadline counts.
-                error.Timeout => if (deadline.durationFromNow(self.io).raw.nanoseconds <= 0) {
-                    self.interrupt.fire();
-                    return;
-                },
-            };
+    fn run(self: *Watchdog, io: std.Io, deadline: std.Io.Clock.Timestamp) void {
+        // Spurious wakeups (e.g. EINTR) also report Timeout; only the deadline counts.
+        while (true) {
+            if (self.done.waitTimeout(io, .{ .deadline = deadline })) |_| return else |_| {}
+            if (deadline.compare(.lte, .now(io, .awake))) break;
         }
+        self.interrupt.fire();
     }
 
     /// Must run before `req.deinit`: joins the thread so a late `fire` can't
-    /// hit a recycled socket, and drops a connection the deadline shut down
+    /// hit a recycled socket, and poisons a connection the deadline shut down
     /// just after the body had already completed.
-    fn stop(self: *Watchdog, req: *std.http.Client.Request) void {
+    fn stop(self: *Watchdog, io: std.Io, guard: InterruptGuard) void {
         const thread = self.thread orelse return;
-        self.done.set(self.io);
+        self.done.set(io);
         thread.join();
-        if (self.interrupt.isFired()) {
-            if (req.connection) |conn| conn.closing = true;
-        }
+        if (self.interrupt.isFired()) guard.poison();
     }
 };
 
@@ -148,11 +144,14 @@ const Watchdog = struct {
 /// clients. On a non-retryable HTTP error response, calls
 /// `error_handler.setErrorDetail(status, body)` so the caller can record
 /// provider-specific error detail before this function returns
-/// `error.ApiError`.
+/// `error.ApiError`. `timeout_ms` bounds each attempt from an established
+/// connection to the end of the body (see `Watchdog`); null waits
+/// indefinitely.
 pub fn fetchJsonWithRetry(
     allocator: std.mem.Allocator,
     http_client: *std.http.Client,
     policy: retry.RetryPolicy,
+    timeout_ms: ?u32,
     options: std.http.Client.FetchOptions,
     comptime T: type,
     error_handler: anytype,
@@ -161,10 +160,6 @@ pub fn fetchJsonWithRetry(
     // in-flight read; clients without the field (e.g. tavily) opt out at comptime.
     const interrupt: ?*Interrupt = if (@hasField(@TypeOf(error_handler.*), "interrupt"))
         error_handler.interrupt
-    else
-        null;
-    const timeout_ms: ?u32 = if (@hasField(@TypeOf(error_handler.*), "request_timeout_ms"))
-        error_handler.request_timeout_ms
     else
         null;
     var attempt: u8 = 0;
@@ -278,7 +273,7 @@ fn fetchCapturingRetryAfter(
 
     var watchdog: Watchdog = .{};
     if (timeout_ms) |ms| try watchdog.start(client.io, &req, ms);
-    defer watchdog.stop(&req);
+    defer watchdog.stop(client.io, guard);
 
     return exchange(allocator, &req, redirect_behavior, options, response_writer, retry_after_ms) catch |err| {
         if (watchdog.interrupt.isFired()) return error.Timeout;
@@ -286,6 +281,9 @@ fn fetchCapturingRetryAfter(
     };
 }
 
+/// The send/receive half of `fetchCapturingRetryAfter`, split out so its
+/// caller can map any failure that lands while the watchdog has fired to
+/// `error.Timeout`.
 fn exchange(
     allocator: std.mem.Allocator,
     req: *std.http.Client.Request,
@@ -550,19 +548,9 @@ test "watchdog turns a stalled response into error.Timeout" {
     var server = try loopback.listen(io, .{});
     defer server.deinit(io);
 
-    // Accept the request and hold the connection open without answering
-    // until the client side has given up.
-    var release: std.Io.Event = .unset;
-    const Stall = struct {
-        fn run(srv: *std.Io.net.Server, ev: *std.Io.Event, ioo: std.Io) void {
-            const stream = srv.accept(ioo) catch return;
-            defer stream.close(ioo);
-            ev.waitUncancelable(ioo);
-        }
-    };
-    const staller = try std.Thread.spawn(.{}, Stall.run, .{ &server, &release, io });
-    defer staller.join();
-    defer release.set(io);
+    // Never accept: the kernel completes the handshake into the backlog and
+    // buffers the request, so the client blocks in receiveHead until the
+    // watchdog shuts the socket down.
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{server.socket.address.getPort()});
     defer allocator.free(url);
@@ -574,6 +562,6 @@ test "watchdog turns a stalled response into error.Timeout" {
     var retry_after_ms: ?u32 = null;
     try std.testing.expectError(
         error.Timeout,
-        fetchCapturingRetryAfter(allocator, &client, .{ .location = .{ .url = url } }, &out.writer, null, 200, &retry_after_ms),
+        fetchCapturingRetryAfter(allocator, &client, .{ .location = .{ .url = url } }, &out.writer, null, 50, &retry_after_ms),
     );
 }
