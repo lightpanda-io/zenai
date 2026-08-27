@@ -204,7 +204,11 @@ fn dupeContentBlocks(self: *Chat, blocks: []const ContentBlockParam) std.mem.All
         if (block.name) |v| duped[i].name = try a.dupe(u8, v);
         if (block.input) |v| duped[i].input = try json.dupeValue(a, v);
         if (block.tool_use_id) |v| duped[i].tool_use_id = try a.dupe(u8, v);
-        if (block.content) |v| duped[i].content = try a.dupe(u8, v);
+        if (block.content) |v| duped[i].content = switch (v) {
+            .text => |t| .{ .text = try a.dupe(u8, t) },
+            .blocks => |b| .{ .blocks = try self.dupeContentBlocks(b) },
+        };
+        if (block.source) |v| duped[i].source = .{ .media_type = try a.dupe(u8, v.media_type), .data = try a.dupe(u8, v.data) };
         if (block.toolset_name) |v| duped[i].toolset_name = try a.dupe(u8, v);
         if (block.thinking) |v| duped[i].thinking = try a.dupe(u8, v);
         if (block.signature) |v| duped[i].signature = try a.dupe(u8, v);

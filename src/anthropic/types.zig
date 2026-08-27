@@ -64,8 +64,11 @@ pub const ContentBlockParam = struct {
     input: ?std.json.Value = null,
     /// The tool_use ID this result responds to (type="tool_result").
     tool_use_id: ?[]const u8 = null,
-    /// Text content for tool result (type="tool_result").
-    content: ?[]const u8 = null,
+    /// Tool result content (type="tool_result"): plain text, or blocks when
+    /// the result carries images.
+    content: ?ToolResultContent = null,
+    /// Inline image (type="image").
+    source: ?ImageSource = null,
     /// Whether the tool result is an error (type="tool_result").
     is_error: ?bool = null,
     /// For a toolset member tool_use, the toolset family it belongs to; for a
@@ -75,6 +78,24 @@ pub const ContentBlockParam = struct {
     thinking: ?[]const u8 = null,
     /// Opaque signature for thinking continuation (type="thinking").
     signature: ?[]const u8 = null,
+};
+
+pub const ToolResultContent = union(enum) {
+    text: []const u8,
+    blocks: []const ContentBlockParam,
+
+    pub fn jsonStringify(self: ToolResultContent, jws: anytype) !void {
+        switch (self) {
+            .text => |t| try jws.write(t),
+            .blocks => |b| try jws.write(b),
+        }
+    }
+};
+
+pub const ImageSource = struct {
+    type: []const u8 = "base64",
+    media_type: []const u8,
+    data: []const u8,
 };
 
 /// A text block used for system prompts.

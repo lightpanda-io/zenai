@@ -31,6 +31,8 @@ pub const Message = struct {
     /// Names the tool a `role: "tool"` message answers (request only).
     tool_name: ?[]const u8 = null,
     tool_calls: ?[]const ToolCall = null,
+    /// Base64 images attached to the message (request only).
+    images: ?[]const []const u8 = null,
 };
 
 /// Request `options`. `num_ctx` is the field the `/v1` shim lacks.
