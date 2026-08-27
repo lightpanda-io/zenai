@@ -985,9 +985,12 @@ pub const Client = union(enum) {
         /// What the tool callback returns: the string content the model should
         /// see, plus whether the call errored. `is_error` is the authoritative
         /// failure signal — the content may legitimately describe an error.
+        /// `parts` adds images for backends that can carry them (see
+        /// `ToolResult.parts`).
         pub const Result = struct {
             content: []const u8,
             is_error: bool = false,
+            parts: ?[]const ContentPart = null,
         };
 
         pub fn call(self: ToolHandler, allocator: std.mem.Allocator, name: []const u8, args: ?std.json.Value) Result {
@@ -1155,6 +1158,7 @@ pub const Client = union(enum) {
                         .id = try data_alloc.dupe(u8, tc.id),
                         .name = try data_alloc.dupe(u8, tc.name),
                         .content = try data_alloc.dupe(u8, handler_result.content),
+                        .parts = if (handler_result.parts) |p| try dupeParts(data_alloc, p) else null,
                         .is_error = handler_result.is_error,
                         .thought_signature = if (tc.thought_signature) |ts| try data_alloc.dupe(u8, ts) else null,
                     });
