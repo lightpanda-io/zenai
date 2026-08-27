@@ -35,10 +35,9 @@ pub const ToolResult = struct {
     id: []const u8,
     name: []const u8, // Required specifically by Gemini
     content: []const u8, // String representation of the result
-    /// Images the tool produced, alongside `content`. Anthropic and Gemini
-    /// carry them in the result itself; the OpenAI-style APIs only accept
-    /// text there, so they follow as a user message.
-    images: ?[]const ImageData = null,
+    /// Rich content (text + images) for backends that can carry it in the
+    /// result; `content` stays the text-only form. See `splitToolImages`.
+    parts: ?[]const ContentPart = null,
     /// Signals that the tool call failed. Propagated to Anthropic's native
     /// `is_error` wire field; providers without an equivalent ignore it.
     is_error: bool = false,
@@ -225,20 +224,9 @@ pub fn dupeToolResults(alloc: std.mem.Allocator, results: []const ToolResult) ![
             .id = try alloc.dupe(u8, tr.id),
             .name = try alloc.dupe(u8, tr.name),
             .content = try alloc.dupe(u8, tr.content),
-            .images = if (tr.images) |imgs| try dupeImages(alloc, imgs) else null,
+            .parts = if (tr.parts) |ps| try dupeParts(alloc, ps) else null,
             .is_error = tr.is_error,
             .thought_signature = if (tr.thought_signature) |ts| try alloc.dupe(u8, ts) else null,
-        };
-    }
-    return out;
-}
-
-pub fn dupeImages(alloc: std.mem.Allocator, images: []const ImageData) ![]const ImageData {
-    const out = try alloc.alloc(ImageData, images.len);
-    for (images, 0..) |img, i| {
-        out[i] = .{
-            .data = try alloc.dupe(u8, img.data),
-            .mime_type = try alloc.dupe(u8, img.mime_type),
         };
     }
     return out;
@@ -1735,9 +1723,10 @@ fn separateSystemMessages(allocator: std.mem.Allocator, messages: []const Messag
                     },
                     .thoughtSignature = res.thought_signature,
                 });
-                for (res.images orelse &.{}) |img| {
-                    try parts.append(allocator, .{ .inlineData = .{ .data = img.data, .mimeType = img.mime_type } });
-                }
+                for (res.parts orelse &.{}) |cp| switch (cp) {
+                    .image => |img| try parts.append(allocator, .{ .inlineData = .{ .data = img.data, .mimeType = img.mime_type } }),
+                    .text => {},
+                };
             }
         }
 
@@ -1758,56 +1747,77 @@ fn messageText(msg: Message) ?[]const u8 {
     return null;
 }
 
+/// The OpenAI-style APIs accept only text in a tool message. Move each tool
+/// turn's image parts into a user turn right after it, captioned with the
+/// tool's name; the tool message keeps `content`. Returns the input when no
+/// tool result carries an image.
+fn splitToolImages(allocator: std.mem.Allocator, messages: []const Message) ![]const Message {
+    var any = false;
+    for (messages) |msg| {
+        for (msg.tool_results orelse &.{}) |res| any = any or hasImage(res.parts orelse &.{});
+    }
+    if (!any) return messages;
+
+    var out: std.ArrayList(Message) = .empty;
+    for (messages) |msg| {
+        const results = msg.tool_results orelse {
+            try out.append(allocator, msg);
+            continue;
+        };
+        const stripped = try allocator.alloc(ToolResult, results.len);
+        var images: std.ArrayList(ContentPart) = .empty;
+        for (results, 0..) |res, i| {
+            stripped[i] = res;
+            stripped[i].parts = null;
+            if (!hasImage(res.parts orelse &.{})) continue;
+            try images.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "Image returned by {s}", .{res.name}) });
+            for (res.parts.?) |cp| {
+                if (cp == .image) try images.append(allocator, cp);
+            }
+        }
+        var tool_msg = msg;
+        tool_msg.tool_results = stripped;
+        try out.append(allocator, tool_msg);
+        if (images.items.len > 0) {
+            try out.append(allocator, .{ .role = .user, .parts = try images.toOwnedSlice(allocator) });
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn hasImage(parts: []const ContentPart) bool {
     for (parts) |cp| if (cp == .image) return true;
     return false;
 }
 
-fn dataUrl(allocator: std.mem.Allocator, img: ImageData) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ img.mime_type, img.data });
-}
-
-/// Caption for images that can't ride in the tool result itself.
-fn toolImageCaption(allocator: std.mem.Allocator, tool_name: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "Image returned by {s}", .{tool_name});
-}
-
 fn openAIContentParts(allocator: std.mem.Allocator, parts: []const ContentPart) ![]const openai_types.ContentPart {
-    var out: std.ArrayList(openai_types.ContentPart) = .empty;
-    for (parts) |cp| switch (cp) {
-        .text => |t| try out.append(allocator, .{ .type = "text", .text = t }),
-        .image => |img| try out.append(allocator, .{ .type = "image_url", .image_url = .{ .url = try dataUrl(allocator, img) } }),
+    const out = try allocator.alloc(openai_types.ContentPart, parts.len);
+    for (parts, 0..) |cp, i| out[i] = switch (cp) {
+        .text => |t| .{ .type = "text", .text = t },
+        .image => |img| .{ .type = "image_url", .image_url = .{ .url = .{ .mime_type = img.mime_type, .data = img.data } } },
     };
-    return out.toOwnedSlice(allocator);
-}
-
-fn openAIImageParts(allocator: std.mem.Allocator, caption: []const u8, images: []const ImageData) ![]const openai_types.ContentPart {
-    var out: std.ArrayList(openai_types.ContentPart) = .empty;
-    try out.append(allocator, .{ .type = "text", .text = caption });
-    for (images) |img| {
-        try out.append(allocator, .{ .type = "image_url", .image_url = .{ .url = try dataUrl(allocator, img) } });
-    }
-    return out.toOwnedSlice(allocator);
+    return out;
 }
 
 fn responsesContentParts(allocator: std.mem.Allocator, parts: []const ContentPart) ![]const openai_types.ResponseContentPart {
-    var out: std.ArrayList(openai_types.ResponseContentPart) = .empty;
-    for (parts) |cp| switch (cp) {
-        .text => |t| try out.append(allocator, .{ .type = "input_text", .text = t }),
-        .image => |img| try out.append(allocator, .{ .type = "input_image", .image_url = try dataUrl(allocator, img) }),
+    const out = try allocator.alloc(openai_types.ResponseContentPart, parts.len);
+    for (parts, 0..) |cp, i| out[i] = switch (cp) {
+        .text => |t| .{ .type = "input_text", .text = t },
+        .image => |img| .{ .type = "input_image", .image_url = .{ .mime_type = img.mime_type, .data = img.data } },
     };
-    return out.toOwnedSlice(allocator);
+    return out;
 }
 
-fn responsesImageParts(allocator: std.mem.Allocator, caption: []const u8, images: []const ImageData) ![]const openai_types.ResponseContentPart {
-    var out: std.ArrayList(openai_types.ResponseContentPart) = .empty;
-    try out.append(allocator, .{ .type = "input_text", .text = caption });
-    for (images) |img| {
-        try out.append(allocator, .{ .type = "input_image", .image_url = try dataUrl(allocator, img) });
-    }
-    return out.toOwnedSlice(allocator);
+fn anthropicBlocks(allocator: std.mem.Allocator, parts: []const ContentPart) ![]const anthropic_types.ContentBlockParam {
+    const out = try allocator.alloc(anthropic_types.ContentBlockParam, parts.len);
+    for (parts, 0..) |cp, i| out[i] = switch (cp) {
+        .text => |t| .{ .type = "text", .text = t },
+        .image => |img| .{ .type = "image", .source = .{ .media_type = img.mime_type, .data = img.data } },
+    };
+    return out;
 }
 
+/// Ollama carries images beside the text, as bare base64.
 fn base64Images(allocator: std.mem.Allocator, parts: []const ContentPart) !?[]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (parts) |cp| switch (cp) {
@@ -1818,7 +1828,8 @@ fn base64Images(allocator: std.mem.Allocator, parts: []const ContentPart) !?[]co
     return try out.toOwnedSlice(allocator);
 }
 
-fn messagesToOpenAIMessages(allocator: std.mem.Allocator, messages: []const Message) ![]openai_types.Message {
+fn messagesToOpenAIMessages(allocator: std.mem.Allocator, input: []const Message) ![]openai_types.Message {
+    const messages = try splitToolImages(allocator, input);
     var out: std.ArrayList(openai_types.Message) = .empty;
 
     for (messages) |msg| {
@@ -1829,14 +1840,6 @@ fn messagesToOpenAIMessages(allocator: std.mem.Allocator, messages: []const Mess
                         .role = .tool,
                         .content = res.content,
                         .tool_call_id = res.id,
-                    });
-                }
-                // A tool message is text-only; images follow as the user's turn.
-                for (results) |res| {
-                    const images = res.images orelse continue;
-                    try out.append(allocator, .{
-                        .role = .user,
-                        .content_parts = try openAIImageParts(allocator, try toolImageCaption(allocator, res.name), images),
                     });
                 }
             } else {
@@ -1868,11 +1871,6 @@ fn messagesToOpenAIMessages(allocator: std.mem.Allocator, messages: []const Mess
             oai_tool_calls = oai_calls;
         }
 
-        const content_parts: ?[]const openai_types.ContentPart = if (msg.parts) |parts|
-            (if (hasImage(parts)) try openAIContentParts(allocator, parts) else null)
-        else
-            null;
-
         try out.append(allocator, .{
             .role = switch (msg.role) {
                 .system => .system,
@@ -1881,7 +1879,7 @@ fn messagesToOpenAIMessages(allocator: std.mem.Allocator, messages: []const Mess
                 .tool => unreachable,
             },
             .content = messageText(msg),
-            .content_parts = content_parts,
+            .content_parts = if (msg.parts) |parts| try openAIContentParts(allocator, parts) else null,
             .tool_calls = oai_tool_calls,
         });
     }
@@ -1892,7 +1890,8 @@ fn messagesToOpenAIMessages(allocator: std.mem.Allocator, messages: []const Mess
 /// Like `messagesToOpenAIMessages`, but keeps tool-call arguments as objects
 /// (not stringified) and answers tool results with `tool_name` (Ollama matches
 /// by name, not id).
-fn messagesToOllamaMessages(allocator: std.mem.Allocator, messages: []const Message) ![]ollama_native.Message {
+fn messagesToOllamaMessages(allocator: std.mem.Allocator, input: []const Message) ![]ollama_native.Message {
+    const messages = try splitToolImages(allocator, input);
     var out: std.ArrayList(ollama_native.Message) = .empty;
 
     for (messages) |msg| {
@@ -1903,16 +1902,6 @@ fn messagesToOllamaMessages(allocator: std.mem.Allocator, messages: []const Mess
                         .role = "tool",
                         .content = res.content,
                         .tool_name = res.name,
-                    });
-                }
-                for (results) |res| {
-                    const images = res.images orelse continue;
-                    var data = try allocator.alloc([]const u8, images.len);
-                    for (images, 0..) |img, i| data[i] = img.data;
-                    try out.append(allocator, .{
-                        .role = "user",
-                        .content = try toolImageCaption(allocator, res.name),
-                        .images = data,
                     });
                 }
             } else {
@@ -1958,12 +1947,7 @@ fn messagesToAnthropicMessages(allocator: std.mem.Allocator, messages: []const M
         var blocks: std.ArrayList(anthropic_types.ContentBlockParam) = .empty;
 
         if (msg.parts) |content_parts| {
-            for (content_parts) |cp| {
-                switch (cp) {
-                    .text => |t| try blocks.append(allocator, .{ .type = "text", .text = t }),
-                    .image => |img| try blocks.append(allocator, .{ .type = "image", .source = .{ .media_type = img.mime_type, .data = img.data } }),
-                }
-            }
+            try blocks.appendSlice(allocator, try anthropicBlocks(allocator, content_parts));
         } else if (msg.content) |c| {
             try blocks.append(allocator, .{ .type = "text", .text = c });
         }
@@ -1999,13 +1983,8 @@ fn messagesToAnthropicMessages(allocator: std.mem.Allocator, messages: []const M
 }
 
 fn anthropicToolResultContent(allocator: std.mem.Allocator, res: ToolResult) !anthropic_types.ToolResultContent {
-    const images = res.images orelse return .{ .text = res.content };
-    var blocks: std.ArrayList(anthropic_types.ContentBlockParam) = .empty;
-    if (res.content.len > 0) try blocks.append(allocator, .{ .type = "text", .text = res.content });
-    for (images) |img| {
-        try blocks.append(allocator, .{ .type = "image", .source = .{ .media_type = img.mime_type, .data = img.data } });
-    }
-    return .{ .blocks = try blocks.toOwnedSlice(allocator) };
+    const parts = res.parts orelse return .{ .text = res.content };
+    return .{ .blocks = try anthropicBlocks(allocator, parts) };
 }
 
 fn mapOpenAITools(allocator: std.mem.Allocator, tools: []const Tool) ![]openai_types.Tool {
@@ -2048,7 +2027,8 @@ fn codexRequest(model: []const u8, input: []const openai_types.ResponseInputItem
 /// assistant tool call becomes a `function_call` item and each tool result a
 /// `function_call_output` item, rather than the role-tagged messages chat
 /// completions uses.
-fn messagesToOpenAIResponsesInput(allocator: std.mem.Allocator, messages: []const Message, system_role: []const u8) ![]openai_types.ResponseInputItem {
+fn messagesToOpenAIResponsesInput(allocator: std.mem.Allocator, input: []const Message, system_role: []const u8) ![]openai_types.ResponseInputItem {
+    const messages = try splitToolImages(allocator, input);
     var out: std.ArrayList(openai_types.ResponseInputItem) = .empty;
 
     for (messages) |msg| {
@@ -2061,21 +2041,12 @@ fn messagesToOpenAIResponsesInput(allocator: std.mem.Allocator, messages: []cons
                         .output = res.content,
                     });
                 }
-                // A function output is text-only; images follow as the user's turn.
-                for (results) |res| {
-                    const images = res.images orelse continue;
-                    try out.append(allocator, .{
-                        .type = "message",
-                        .role = "user",
-                        .content = .{ .parts = try responsesImageParts(allocator, try toolImageCaption(allocator, res.name), images) },
-                    });
-                }
             }
             continue;
         }
 
         const content: ?openai_types.ResponseContent = if (msg.parts) |parts|
-            (if (hasImage(parts)) .{ .parts = try responsesContentParts(allocator, parts) } else if (messageText(msg)) |t| .{ .text = t } else null)
+            .{ .parts = try responsesContentParts(allocator, parts) }
         else if (msg.content) |c|
             .{ .text = c }
         else
@@ -2747,88 +2718,58 @@ test "mapEffortToAnthropic respects caller-supplied max_tokens when already larg
     try std.testing.expectEqual(@as(i32, 64000), mapEffortToAnthropic(.medium, 64000).max_tokens);
 }
 
-// Two turns: the model calls `screenshot`, the tool answers with text plus one
-// image. Each mapping must put the image where that API accepts one.
-fn imageToolResultConversation() [3]Message {
-    const images = &[_]ImageData{.{ .data = "iVBORw0KGgo=", .mime_type = "image/png" }};
-    return .{
-        .{ .role = .user, .content = "look" },
-        .{ .role = .assistant, .tool_calls = &.{.{ .id = "c1", .name = "screenshot", .arguments = null }} },
-        .{ .role = .tool, .tool_results = &.{.{ .id = "c1", .name = "screenshot", .content = "PNG, 1920px wide", .images = images }} },
-    };
-}
-
 fn stringifyForTest(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
     var buf: std.Io.Writer.Allocating = .init(allocator);
     try std.json.Stringify.value(value, .{ .emit_null_optional_fields = false }, &buf.writer);
     return buf.written();
 }
 
-test "tool result images: anthropic puts an image block inside tool_result" {
+test "tool result parts land where each API accepts an image" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const msgs = imageToolResultConversation();
-    const out = try messagesToAnthropicMessages(a, &msgs);
-    const json_out = try stringifyForTest(a, out);
-    try std.testing.expect(std.mem.find(u8, json_out, "\"type\":\"tool_result\",\"tool_use_id\":\"c1\",\"content\":[{\"type\":\"text\",\"text\":\"PNG, 1920px wide\"},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"iVBORw0KGgo=\"}}]") != null);
-}
+    // The model calls `screenshot`; the tool answers with text plus one image.
+    const msgs = [_]Message{
+        .{ .role = .user, .content = "look" },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "c1", .name = "screenshot", .arguments = null }} },
+        .{ .role = .tool, .tool_results = &.{.{
+            .id = "c1",
+            .name = "screenshot",
+            .content = "PNG, 1920px wide",
+            .parts = &.{ .{ .text = "PNG, 1920px wide" }, .{ .image = .{ .data = "iVBORw0KGgo=", .mime_type = "image/png" } } },
+        }} },
+    };
 
-test "tool result images: gemini appends inlineData after the functionResponse" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // Anthropic: inside the tool_result.
+    const anth = try stringifyForTest(a, try messagesToAnthropicMessages(a, &msgs));
+    try std.testing.expect(std.mem.find(u8, anth, "\"type\":\"tool_result\",\"tool_use_id\":\"c1\",\"content\":[{\"type\":\"text\",\"text\":\"PNG, 1920px wide\"},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"iVBORw0KGgo=\"}}]") != null);
 
-    const msgs = imageToolResultConversation();
-    const out = try separateSystemMessages(a, &msgs);
-    const json_out = try stringifyForTest(a, out.contents);
-    const fr = std.mem.find(u8, json_out, "\"functionResponse\"") orelse return error.TestUnexpectedResult;
-    const inline_data = std.mem.find(u8, json_out, "\"inlineData\":{\"data\":\"iVBORw0KGgo=\",\"mimeType\":\"image/png\"}") orelse return error.TestUnexpectedResult;
+    // Gemini: an inlineData part after the functionResponse.
+    const gem = try stringifyForTest(a, (try separateSystemMessages(a, &msgs)).contents);
+    const fr = std.mem.find(u8, gem, "\"functionResponse\"") orelse return error.TestUnexpectedResult;
+    const inline_data = std.mem.find(u8, gem, "\"inlineData\":{\"data\":\"iVBORw0KGgo=\",\"mimeType\":\"image/png\"}") orelse return error.TestUnexpectedResult;
     try std.testing.expect(inline_data > fr);
+
+    // OpenAI chat, Responses, Ollama: a captioned user turn after the tool message.
+    const chat = try messagesToOpenAIMessages(a, &msgs);
+    try std.testing.expectEqual(4, chat.len);
+    try std.testing.expectEqualStrings("PNG, 1920px wide", chat[2].content.?);
+    const chat_json = try stringifyForTest(a, chat[3]);
+    try std.testing.expect(std.mem.find(u8, chat_json, "\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Image returned by screenshot\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgo=\"}}]") != null);
+
+    const responses = try messagesToOpenAIResponsesInput(a, &msgs, "developer");
+    try std.testing.expectEqual(4, responses.len);
+    const responses_json = try stringifyForTest(a, responses[3]);
+    try std.testing.expect(std.mem.find(u8, responses_json, "\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Image returned by screenshot\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]") != null);
+
+    const ollama = try messagesToOllamaMessages(a, &msgs);
+    try std.testing.expectEqual(4, ollama.len);
+    const ollama_json = try stringifyForTest(a, ollama[3]);
+    try std.testing.expect(std.mem.find(u8, ollama_json, "\"role\":\"user\",\"content\":\"Image returned by screenshot\",\"images\":[\"iVBORw0KGgo=\"]") != null);
 }
 
-test "tool result images: openai chat follows the tool message with a user image" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const msgs = imageToolResultConversation();
-    const out = try messagesToOpenAIMessages(a, &msgs);
-    try std.testing.expectEqual(4, out.len);
-    try std.testing.expectEqual(openai_types.Role.tool, out[2].role.?);
-    try std.testing.expectEqual(openai_types.Role.user, out[3].role.?);
-    const json_out = try stringifyForTest(a, out[3]);
-    try std.testing.expect(std.mem.find(u8, json_out, "\"content\":[{\"type\":\"text\",\"text\":\"Image returned by screenshot\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgo=\"}}]") != null);
-    try std.testing.expect(std.mem.find(u8, json_out, "content_parts") == null);
-}
-
-test "tool result images: openai responses follows the output with an input_image" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const msgs = imageToolResultConversation();
-    const out = try messagesToOpenAIResponsesInput(a, &msgs, "developer");
-    try std.testing.expectEqual(4, out.len);
-    try std.testing.expectEqualStrings("function_call_output", out[2].type);
-    const json_out = try stringifyForTest(a, out[3]);
-    try std.testing.expect(std.mem.find(u8, json_out, "\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Image returned by screenshot\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]") != null);
-}
-
-test "tool result images: ollama follows the tool message with images" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const msgs = imageToolResultConversation();
-    const out = try messagesToOllamaMessages(a, &msgs);
-    try std.testing.expectEqual(4, out.len);
-    const json_out = try stringifyForTest(a, out[3]);
-    try std.testing.expect(std.mem.find(u8, json_out, "\"role\":\"user\",\"content\":\"Image returned by screenshot\",\"images\":[\"iVBORw0KGgo=\"]") != null);
-}
-
-test "user image parts reach anthropic, openai chat and responses" {
+test "user image parts reach every backend" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2840,7 +2781,8 @@ test "user image parts reach anthropic, openai chat and responses" {
     try std.testing.expect(std.mem.find(u8, anth, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"AAAA\"}}") != null);
 
     const chat = try stringifyForTest(a, try messagesToOpenAIMessages(a, &msgs));
-    try std.testing.expect(std.mem.find(u8, chat, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,AAAA\"}}") != null);
+    try std.testing.expect(std.mem.find(u8, chat, "\"content\":[{\"type\":\"text\",\"text\":\"what is this?\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,AAAA\"}}]") != null);
+    try std.testing.expect(std.mem.find(u8, chat, "content_parts") == null);
 
     const responses = try stringifyForTest(a, try messagesToOpenAIResponsesInput(a, &msgs, "developer"));
     try std.testing.expect(std.mem.find(u8, responses, "{\"type\":\"input_image\",\"image_url\":\"data:image/jpeg;base64,AAAA\"}") != null);

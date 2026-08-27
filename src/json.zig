@@ -53,6 +53,19 @@ pub fn StringUnionMethods(comptime U: type) type {
     };
 }
 
+/// For a union whose active payload *is* the JSON value (text or a list):
+///
+///     pub const jsonStringify = jsonutil.PayloadUnionMethods(@This()).jsonStringify;
+pub fn PayloadUnionMethods(comptime U: type) type {
+    return struct {
+        pub fn jsonStringify(self: U, jws: anytype) !void {
+            switch (self) {
+                inline else => |v| try jws.write(v),
+            }
+        }
+    };
+}
+
 /// Deep-copy a `std.json.Value`, duplicating all owned strings and containers.
 pub fn dupeValue(a: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.Error!std.json.Value {
     return switch (value) {

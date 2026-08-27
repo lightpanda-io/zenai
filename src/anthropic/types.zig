@@ -84,12 +84,7 @@ pub const ToolResultContent = union(enum) {
     text: []const u8,
     blocks: []const ContentBlockParam,
 
-    pub fn jsonStringify(self: ToolResultContent, jws: anytype) !void {
-        switch (self) {
-            .text => |t| try jws.write(t),
-            .blocks => |b| try jws.write(b),
-        }
-    }
+    pub const jsonStringify = jsonutil.PayloadUnionMethods(@This()).jsonStringify;
 };
 
 pub const ImageSource = struct {

@@ -78,34 +78,25 @@ pub const Message = struct {
     /// Refusal message from the model.
     refusal: ?[]const u8 = null,
 
+    /// Default field emission, except that `content_parts` goes out as
+    /// `content` in place of the text.
     pub fn jsonStringify(self: Message, jws: anytype) !void {
         try jws.beginObject();
-        if (self.role) |v| {
-            try jws.objectField("role");
-            try jws.write(v);
-        }
-        if (self.content_parts) |parts| {
-            try jws.objectField("content");
-            try jws.write(parts);
-        } else if (self.content) |v| {
-            try jws.objectField("content");
-            try jws.write(v);
-        }
-        if (self.name) |v| {
-            try jws.objectField("name");
-            try jws.write(v);
-        }
-        if (self.tool_calls) |v| {
-            try jws.objectField("tool_calls");
-            try jws.write(v);
-        }
-        if (self.tool_call_id) |v| {
-            try jws.objectField("tool_call_id");
-            try jws.write(v);
-        }
-        if (self.refusal) |v| {
-            try jws.objectField("refusal");
-            try jws.write(v);
+        inline for (std.meta.fields(Message)) |f| {
+            if (comptime std.mem.eql(u8, f.name, "content_parts")) {
+                // Emitted under `content` below.
+            } else if (comptime std.mem.eql(u8, f.name, "content")) {
+                if (self.content_parts) |parts| {
+                    try jws.objectField("content");
+                    try jws.write(parts);
+                } else if (self.content) |v| {
+                    try jws.objectField("content");
+                    try jws.write(v);
+                }
+            } else if (@field(self, f.name)) |v| {
+                try jws.objectField(f.name);
+                try jws.write(v);
+            }
         }
         try jws.endObject();
     }
@@ -119,8 +110,24 @@ pub const ContentPart = struct {
 };
 
 pub const ImageUrl = struct {
-    /// An https URL or a `data:<mime>;base64,<data>` URL.
-    url: []const u8,
+    url: DataUrl,
+};
+
+/// Serializes as `data:<mime>;base64,<data>` without building the string:
+/// the payload is written in place, so an image costs no extra copy.
+pub const DataUrl = struct {
+    mime_type: []const u8,
+    data: []const u8,
+
+    pub fn jsonStringify(self: DataUrl, jws: anytype) !void {
+        try jws.beginWriteRaw();
+        try jws.writer.writeAll("\"data:");
+        try jws.writer.writeAll(self.mime_type);
+        try jws.writer.writeAll(";base64,");
+        try jws.writer.writeAll(self.data);
+        try jws.writer.writeByte('"');
+        jws.endWriteRaw();
+    }
 };
 
 // --- Tools ---
@@ -360,20 +367,14 @@ pub const ResponseContent = union(enum) {
     text: []const u8,
     parts: []const ResponseContentPart,
 
-    pub fn jsonStringify(self: ResponseContent, jws: anytype) !void {
-        switch (self) {
-            .text => |t| try jws.write(t),
-            .parts => |p| try jws.write(p),
-        }
-    }
+    pub const jsonStringify = jsonutil.PayloadUnionMethods(@This()).jsonStringify;
 };
 
 /// `input_text` or `input_image`.
 pub const ResponseContentPart = struct {
     type: []const u8,
     text: ?[]const u8 = null,
-    /// An https URL or a `data:<mime>;base64,<data>` URL.
-    image_url: ?[]const u8 = null,
+    image_url: ?DataUrl = null,
 };
 
 /// Request body for the responses endpoint.
