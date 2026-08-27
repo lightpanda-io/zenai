@@ -1789,7 +1789,7 @@ fn splitToolImages(allocator: std.mem.Allocator, messages: []const Message) ![]c
     return out.toOwnedSlice(allocator);
 }
 
-fn hasImage(parts: []const ContentPart) bool {
+pub fn hasImage(parts: []const ContentPart) bool {
     for (parts) |cp| if (cp == .image) return true;
     return false;
 }
