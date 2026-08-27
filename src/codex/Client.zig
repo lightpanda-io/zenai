@@ -180,7 +180,7 @@ test "setApiKey rebuilds the cached bearer value" {
 }
 
 test "Codex ResponsesRequest serializes store/include/reasoning.summary, omits max_output_tokens" {
-    const input = [_]types.ResponseInputItem{.{ .type = "message", .role = "user", .content = "hi" }};
+    const input = [_]types.ResponseInputItem{.{ .type = "message", .role = "user", .content = .{ .text = "hi" } }};
     const req: ResponsesRequest = .{
         .model = "gpt-5-codex",
         .input = &input,

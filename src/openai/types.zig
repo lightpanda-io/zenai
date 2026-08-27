@@ -66,6 +66,9 @@ pub const Message = struct {
     role: ?Role = null,
     /// The text content of the message.
     content: ?[]const u8 = null,
+    /// Multimodal content (request only). Serialized as `content` in place
+    /// of the plain text when set.
+    content_parts: ?[]const ContentPart = null,
     /// Optional participant name.
     name: ?[]const u8 = null,
     /// Tool calls requested by the assistant (only for role=assistant).
@@ -74,6 +77,57 @@ pub const Message = struct {
     tool_call_id: ?[]const u8 = null,
     /// Refusal message from the model.
     refusal: ?[]const u8 = null,
+
+    /// Default field emission, except that `content_parts` goes out as
+    /// `content` in place of the text.
+    pub fn jsonStringify(self: Message, jws: anytype) !void {
+        try jws.beginObject();
+        inline for (std.meta.fields(Message)) |f| {
+            if (comptime std.mem.eql(u8, f.name, "content_parts")) {
+                // Emitted under `content` below.
+            } else if (comptime std.mem.eql(u8, f.name, "content")) {
+                if (self.content_parts) |parts| {
+                    try jws.objectField("content");
+                    try jws.write(parts);
+                } else if (self.content) |v| {
+                    try jws.objectField("content");
+                    try jws.write(v);
+                }
+            } else if (@field(self, f.name)) |v| {
+                try jws.objectField(f.name);
+                try jws.write(v);
+            }
+        }
+        try jws.endObject();
+    }
+};
+
+/// One entry of a multimodal `content` array: `text` or `image_url`.
+pub const ContentPart = struct {
+    type: []const u8,
+    text: ?[]const u8 = null,
+    image_url: ?ImageUrl = null,
+};
+
+pub const ImageUrl = struct {
+    url: DataUrl,
+};
+
+/// Serializes as `data:<mime>;base64,<data>` without building the string:
+/// the payload is written in place, so an image costs no extra copy.
+pub const DataUrl = struct {
+    mime_type: []const u8,
+    data: []const u8,
+
+    pub fn jsonStringify(self: DataUrl, jws: anytype) !void {
+        try jws.beginWriteRaw();
+        try jws.writer.writeAll("\"data:");
+        try jws.writer.writeAll(self.mime_type);
+        try jws.writer.writeAll(";base64,");
+        try jws.writer.writeAll(self.data);
+        try jws.writer.writeByte('"');
+        jws.endWriteRaw();
+    }
 };
 
 // --- Tools ---
@@ -301,11 +355,26 @@ pub const ResponseReasoning = struct {
 pub const ResponseInputItem = struct {
     type: []const u8,
     role: ?[]const u8 = null,
-    content: ?[]const u8 = null,
+    content: ?ResponseContent = null,
     call_id: ?[]const u8 = null,
     name: ?[]const u8 = null,
     arguments: ?[]const u8 = null,
     output: ?[]const u8 = null,
+};
+
+/// `message` item content: plain text, or parts when it carries images.
+pub const ResponseContent = union(enum) {
+    text: []const u8,
+    parts: []const ResponseContentPart,
+
+    pub const jsonStringify = jsonutil.PayloadUnionMethods(@This()).jsonStringify;
+};
+
+/// `input_text` or `input_image`.
+pub const ResponseContentPart = struct {
+    type: []const u8,
+    text: ?[]const u8 = null,
+    image_url: ?DataUrl = null,
 };
 
 /// Request body for the responses endpoint.
@@ -559,7 +628,7 @@ test "ResponsesResponse extracts text and tool calls" {
 }
 
 test "ResponsesRequest serializes flat tools and reasoning" {
-    const input = [_]ResponseInputItem{.{ .type = "message", .role = "user", .content = "hi" }};
+    const input = [_]ResponseInputItem{.{ .type = "message", .role = "user", .content = .{ .text = "hi" } }};
     const tools = [_]ResponseTool{.{ .name = "goto", .description = "navigate" }};
     const req = ResponsesRequest{
         .model = "gpt-5.5",
