@@ -1,6 +1,6 @@
 # zenai
 
-Zig client for AI APIs, supporting [Google Gemini](https://ai.google.dev/gemini-api/docs) (Developer API and [Vertex AI](https://cloud.google.com/vertex-ai/generative-ai/docs)), [OpenAI](https://platform.openai.com/docs/api-reference), and [Anthropic](https://docs.anthropic.com/en/docs/about-claude/models). OpenAI-compatible endpoints — [Ollama](https://github.com/ollama/ollama/blob/main/docs/openai.md), [Hugging Face Inference](https://huggingface.co/docs/inference-providers/index), and [llama.cpp](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) (`llama-server`) — are supported through the OpenAI client. Ported from the official [Go Gen AI SDK](https://github.com/googleapis/go-genai), [openai-go](https://github.com/openai/openai-go), and [anthropic-sdk-go](https://github.com/anthropics/anthropic-sdk-go). Also ships an `agent infrastructure` namespace under `zenai.search` — currently [Tavily](https://docs.tavily.com/) and [Brave Search](https://brave.com/search/api/), with room for sibling providers.
+Zig client for AI APIs, supporting [Google Gemini](https://ai.google.dev/gemini-api/docs) (Developer API and [Vertex AI](https://cloud.google.com/vertex-ai/generative-ai/docs)), [OpenAI](https://platform.openai.com/docs/api-reference), and [Anthropic](https://docs.anthropic.com/en/docs/about-claude/models). OpenAI-compatible endpoints — [Ollama](https://github.com/ollama/ollama/blob/main/docs/openai.md), [Hugging Face Inference](https://huggingface.co/docs/inference-providers/index), and [llama.cpp](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) (`llama-server`) — are supported through the OpenAI client. Ported from the official [Go Gen AI SDK](https://github.com/googleapis/go-genai), [openai-go](https://github.com/openai/openai-go), and [anthropic-sdk-go](https://github.com/anthropics/anthropic-sdk-go). Also ships an `agent infrastructure` namespace under `zenai.search` — currently [Tavily](https://docs.tavily.com/), [Brave Search](https://brave.com/search/api/), [Exa](https://exa.ai/docs/reference/search) and [Keenable](https://docs.keenable.ai/), with room for sibling providers.
 
 <img width="1024" height="1024" alt="Meditating panda with incense smoke" src="https://github.com/user-attachments/assets/b9c82960-05ec-4aa1-b171-092ee2126551" />
 
@@ -321,8 +321,8 @@ export BRAVE_API_KEY='BSA...'
 ```zig
 const zenai = @import("zenai");
 
-const api_key = std.posix.getenv("BRAVE_API_KEY") orelse return error.MissingApiKey;
-var client = zenai.search.brave.Client.init(allocator, api_key, .{});
+const api_key = environ.getPosix("BRAVE_API_KEY") orelse return error.MissingApiKey;
+var client = zenai.search.brave.Client.init(io, allocator, api_key, .{});
 defer client.deinit();
 
 // text_decorations=false strips <strong> highlight markup from descriptions.
@@ -333,6 +333,59 @@ if (response.value.web) |web| {
     for (web.results) |r| {
         std.debug.print("{s} — {s}\n", .{ r.title, r.url });
     }
+}
+```
+
+## Exa (search)
+
+Exa is an embeddings-based search API aimed at agents. Snippet text is opt-in: a bare search returns metadata only, so request `contents` to get any. Set your API key ([get one here](https://dashboard.exa.ai/)):
+
+```bash
+export EXA_API_KEY='...'
+```
+
+```zig
+const zenai = @import("zenai");
+
+const api_key = environ.getPosix("EXA_API_KEY") orelse return error.MissingApiKey;
+var client = zenai.search.exa.Client.init(io, allocator, api_key, .{});
+defer client.deinit();
+
+// Without `contents` the results carry no text at all; highlights are the cheapest form.
+var response = try client.search("what is zig", .{
+    .numResults = 5,
+    .contents = .{ .highlights = .{ .numSentences = 3 } },
+});
+defer response.deinit();
+
+for (response.value.results) |r| {
+    // `title` is nullable here — Exa returns null for pages it could not title.
+    std.debug.print("{s} — {s}\n", .{ r.title orelse "(untitled)", r.url });
+}
+```
+
+## Keenable (search)
+
+Keenable is an AI-friendly search API returning `{title, url, snippet}` JSON. Unlike the other providers here it also answers **without** an API key: pass `null` and the client calls the public endpoint (rate-limited per client IP). A key ([get one here](https://keenable.ai/console)) lifts the limits; it is not a prerequisite.
+
+```bash
+export KEENABLE_API_KEY='keen_...'   # optional
+```
+
+```zig
+const zenai = @import("zenai");
+
+// `null` selects the public endpoint. `app_title` has no default: it is sent as
+// `X-Keenable-Title`, required keyless, and only the embedder knows its own name.
+const api_key = environ.getPosix("KEENABLE_API_KEY");
+var client = zenai.search.keenable.Client.init(io, allocator, api_key, .{ .app_title = "my-app" });
+defer client.deinit();
+
+var response = try client.search("what is zig", .{ .max_results = 5 });
+defer response.deinit();
+
+for (response.value.results) |r| {
+    std.debug.print("{s} — {s}\n", .{ r.title, r.snippet });
 }
 ```
 
@@ -434,6 +487,8 @@ switch (ai) {
 **Search providers:**
 - Tavily (`zenai.search.tavily`) — JSON search API with optional synthesized answers, domain include/exclude, news/general topic, time-range filtering
 - Brave (`zenai.search.brave`) — independent-index web search with country/language targeting, safesearch, freshness and section filtering, extra snippets
+- Exa (`zenai.search.exa`) — embeddings-based search with search-type selection, category focus, domain include/exclude, published-date windows, and opt-in contents (highlights/text/summary)
+- Keenable (`zenai.search.keenable`) — web search that also works keyless through a public endpoint, with site restriction, published-date windows and a snippet-length hint
 
 **Provider abstraction:**
 - Unified text generation, streaming, and embeddings
