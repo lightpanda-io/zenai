@@ -1319,7 +1319,7 @@ pub fn defaultModel(tag: Tag) []const u8 {
     return switch (tag) {
         .anthropic => "claude-sonnet-5",
         .openai, .codex => "gpt-5.5",
-        .gemini, .vertex => "gemini-3.6-flash",
+        .gemini, .vertex => "gemini-3.8-flash",
         .openai_compatible => "",
         else => unreachable,
     };
