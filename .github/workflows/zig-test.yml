@@ -1,0 +1,63 @@
+name: zig-test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/**"
+      - "src/**"
+      - "build.zig"
+      - "build.zig.zon"
+
+  pull_request:
+    # By default GH trigger on types opened, synchronize and reopened.
+    # see https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#pull_request
+    # Since we skip the job when the PR is in draft state, we want to force CI
+    # running when the PR is marked ready_for_review w/o other change.
+    # see https://github.com/orgs/community/discussions/25722#discussioncomment-3248917
+    types: [opened, synchronize, reopened, ready_for_review]
+
+    paths:
+      - ".github/**"
+      - "src/**"
+      - "build.zig"
+      - "build.zig.zon"
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  zig-fmt:
+    name: zig fmt
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    if: github.event.pull_request.draft == false
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # Zig version used from the `minimum_zig_version` field in build.zig.zon
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - name: Run zig fmt
+        run: zig fmt --check ./
+
+  zig-test:
+    name: zig test
+    needs: zig-fmt
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    if: github.event.pull_request.draft == false
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # Zig version used from the `minimum_zig_version` field in build.zig.zon
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - name: zig build test
+        run: zig build test
