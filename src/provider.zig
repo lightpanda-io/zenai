@@ -693,10 +693,14 @@ pub const Client = union(enum) {
                 else
                     null;
 
-                const tools = if (config.tools) mapGeminiTools(req_alloc, config.tools.?) catch return error.OutOfMemory else null;
+                const tools = if (config.tools) |t| mapGeminiTools(req_alloc, t) catch return error.OutOfMemory else null;
 
-                const Wrapper = struct {
-                    fn wrap(ctx: struct { user_ctx: @TypeOf(context), user_cb: *const fn (@TypeOf(context), GenerateResult) void, alloc: std.mem.Allocator }, response: gemini_types.GenerateContentResponse) void {
+                const Ctx = struct {
+                    user_ctx: @TypeOf(context),
+                    user_cb: *const fn (@TypeOf(context), GenerateResult) void,
+                    alloc: std.mem.Allocator,
+
+                    fn wrap(ctx: @This(), response: gemini_types.GenerateContentResponse) void {
                         var result = GenerateResult.init(ctx.alloc);
                         defer result.deinit();
                         result.text = response.text();
@@ -710,7 +714,7 @@ pub const Client = union(enum) {
                     .systemInstruction = sys_instruction,
                     .tools = tools,
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
-                }, .{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Wrapper.wrap);
+                }, Ctx{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Ctx.wrap);
             },
             .openai, .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
@@ -718,10 +722,14 @@ pub const Client = union(enum) {
                 const req_alloc = req_arena.allocator();
 
                 const oai_messages = messagesToOpenAIMessages(req_alloc, messages) catch return error.OutOfMemory;
-                const tools = if (config.tools) mapOpenAITools(req_alloc, config.tools.?) catch return error.OutOfMemory else null;
+                const tools = if (config.tools) |t| mapOpenAITools(req_alloc, t) catch return error.OutOfMemory else null;
 
-                const Wrapper = struct {
-                    fn wrap(ctx: struct { user_ctx: @TypeOf(context), user_cb: *const fn (@TypeOf(context), GenerateResult) void, alloc: std.mem.Allocator }, response: openai_types.ChatCompletionResponse) void {
+                const Ctx = struct {
+                    user_ctx: @TypeOf(context),
+                    user_cb: *const fn (@TypeOf(context), GenerateResult) void,
+                    alloc: std.mem.Allocator,
+
+                    fn wrap(ctx: @This(), response: openai_types.ChatCompletionResponse) void {
                         var result = GenerateResult.init(ctx.alloc);
                         defer result.deinit();
                         result.text = response.text();
@@ -731,7 +739,7 @@ pub const Client = union(enum) {
                     }
                 };
 
-                try o.chatCompletionStream(model, oai_messages, mapOpenAICompletionConfig(config, tools), .{ .user_ctx = context, .user_cb = callback, .alloc = o.allocator }, &Wrapper.wrap);
+                try o.chatCompletionStream(model, oai_messages, mapOpenAICompletionConfig(config, tools), Ctx{ .user_ctx = context, .user_cb = callback, .alloc = o.allocator }, &Ctx.wrap);
             },
             // Ollama's native chat is non-streaming; codex reuses this one-shot
             // fallback since the agent drives it via generateContentStreamAccumulate.
@@ -756,11 +764,15 @@ pub const Client = union(enum) {
                 else
                     null;
 
-                const tools = if (config.tools) mapAnthropicTools(req_alloc, config.tools.?) catch return error.OutOfMemory else null;
+                const tools = if (config.tools) |t| mapAnthropicTools(req_alloc, t) catch return error.OutOfMemory else null;
                 const reasoning = mapEffortToAnthropic(config.effort, config.max_tokens orelse 4096);
 
-                const Wrapper = struct {
-                    fn wrap(ctx: struct { user_ctx: @TypeOf(context), user_cb: *const fn (@TypeOf(context), GenerateResult) void, alloc: std.mem.Allocator }, event: anthropic_types.StreamEvent) void {
+                const Ctx = struct {
+                    user_ctx: @TypeOf(context),
+                    user_cb: *const fn (@TypeOf(context), GenerateResult) void,
+                    alloc: std.mem.Allocator,
+
+                    fn wrap(ctx: @This(), event: anthropic_types.StreamEvent) void {
                         const text_content = if (event.delta) |delta| delta.text else null;
                         var result = GenerateResult.init(ctx.alloc);
                         defer result.deinit();
@@ -785,7 +797,7 @@ pub const Client = union(enum) {
                     .thinking = reasoning.thinking,
                     .output_config = reasoning.output_config,
                     // Anthropic has no native JSON mode; response_format is ignored.
-                }, .{ .user_ctx = context, .user_cb = callback, .alloc = a.allocator }, &Wrapper.wrap);
+                }, Ctx{ .user_ctx = context, .user_cb = callback, .alloc = a.allocator }, &Ctx.wrap);
             },
         }
     }
@@ -2695,6 +2707,23 @@ test "GenerateResult deinit with no backing response" {
     result.text = "test";
     result.finish_reason = .stop;
     result.deinit(); // Should not crash
+}
+
+test "generateContentStream: generic body is analyzed for every backend" {
+    // The function is generic over `context`, so Zig only type-checks its
+    // body once something instantiates it. Nothing in the library did, which
+    // let broken optional captures ship (issue #14). Instantiate it behind a
+    // runtime-false guard so every provider prong is analyzed without doing
+    // a network call.
+    const Cb = struct {
+        fn onDelta(_: void, _: GenerateResult) void {}
+    };
+    var run = false;
+    _ = &run;
+    if (run) {
+        var client: Client = undefined;
+        try client.generateContentStream("model", &.{}, .{}, {}, &Cb.onDelta);
+    }
 }
 
 test "mapEffortToAnthropic: null and none omit thinking and leave max_tokens alone" {
