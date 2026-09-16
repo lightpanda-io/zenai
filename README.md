@@ -1,6 +1,6 @@
 # zenai
 
-Zig client for AI APIs, supporting [Google Gemini](https://ai.google.dev/gemini-api/docs) (Developer API and [Vertex AI](https://cloud.google.com/vertex-ai/generative-ai/docs)), [OpenAI](https://platform.openai.com/docs/api-reference), and [Anthropic](https://docs.anthropic.com/en/docs/about-claude/models). OpenAI-compatible endpoints — [Ollama](https://github.com/ollama/ollama/blob/main/docs/openai.md), [Hugging Face Inference](https://huggingface.co/docs/inference-providers/index), and [llama.cpp](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) (`llama-server`) — are supported through the OpenAI client. Ported from the official [Go Gen AI SDK](https://github.com/googleapis/go-genai), [openai-go](https://github.com/openai/openai-go), and [anthropic-sdk-go](https://github.com/anthropics/anthropic-sdk-go). Also ships an `agent infrastructure` namespace under `zenai.search` — currently [Tavily](https://docs.tavily.com/), [Brave Search](https://brave.com/search/api/), [Exa](https://exa.ai/docs/reference/search) and [Keenable](https://docs.keenable.ai/), with room for sibling providers.
+Zig client for AI APIs, supporting [Google Gemini](https://ai.google.dev/gemini-api/docs) (Developer API and [Vertex AI](https://cloud.google.com/vertex-ai/generative-ai/docs)), [OpenAI](https://platform.openai.com/docs/api-reference), and [Anthropic](https://docs.anthropic.com/en/docs/about-claude/models). OpenAI-compatible endpoints — [Ollama](https://github.com/ollama/ollama/blob/main/docs/openai.md), [Hugging Face Inference](https://huggingface.co/docs/inference-providers/index), [llama.cpp](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) (`llama-server`), [Vercel AI Gateway](https://vercel.com/docs/ai-gateway), [Mistral](https://docs.mistral.ai/), [OpenRouter](https://openrouter.ai/docs), and [OrcaRouter](https://docs.orcarouter.ai) — are supported through the OpenAI client. Ported from the official [Go Gen AI SDK](https://github.com/googleapis/go-genai), [openai-go](https://github.com/openai/openai-go), and [anthropic-sdk-go](https://github.com/anthropics/anthropic-sdk-go). Also ships an `agent infrastructure` namespace under `zenai.search` — currently [Tavily](https://docs.tavily.com/), [Brave Search](https://brave.com/search/api/), [Exa](https://exa.ai/docs/reference/search) and [Keenable](https://docs.keenable.ai/), with room for sibling providers.
 
 <img width="1024" height="1024" alt="Meditating panda with incense smoke" src="https://github.com/user-attachments/assets/b9c82960-05ec-4aa1-b171-092ee2126551" />
 
@@ -429,6 +429,13 @@ const ai: zenai.provider.Client = .{ .gemini = &gemini_client };
 // });
 // const ai: zenai.provider.Client = .{ .llama_cpp = &llama_client };
 
+// Or a multi-lab gateway (OpenRouter, OrcaRouter, Vercel AI Gateway); model ids
+// are provider-prefixed, e.g. "anthropic/claude-sonnet-5":
+// var router_client = zenai.openrouter.Client.init(io, allocator, openrouter_key, .{
+//     .base_url = "https://openrouter.ai/api/v1",
+// });
+// const ai: zenai.provider.Client = .{ .openrouter = &router_client };
+
 // Or any OpenAI-compatible server (vLLM, LiteLLM, Together, Groq, etc.).
 // Auto-detected by `provider.Client.init` when OPENAI_BASE_URL is set; the
 // key comes from OPENAI_API_KEY. With the raw client, pass `.base_url`:
@@ -492,7 +499,7 @@ switch (ai) {
 
 **Provider abstraction:**
 - Unified text generation, streaming, and embeddings
-- OpenAI-compatible backends: Ollama, Hugging Face, llama.cpp (`llama-server`), and any custom server via `OPENAI_BASE_URL`
+- OpenAI-compatible backends: Ollama, Hugging Face, llama.cpp (`llama-server`), Vercel AI Gateway, Mistral, OpenRouter, OrcaRouter, and any custom server via `OPENAI_BASE_URL`
 - `lastError()` to surface the status and message behind a failed request
 - Escape hatches to provider-specific APIs
 

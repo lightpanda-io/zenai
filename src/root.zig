@@ -46,10 +46,12 @@ pub const llama_cpp = openai;
 /// chat completions wire format (vLLM, LiteLLM, Together, Groq, etc.).
 pub const openai_compatible = openai;
 
-/// Vercel AI Gateway and Mistral both use the OpenAI-compatible Chat Completions
-/// API with their own default base URLs.
+/// Vercel AI Gateway, Mistral, OpenRouter and OrcaRouter all use the
+/// OpenAI-compatible Chat Completions API with their own default base URLs.
 pub const vercel = openai;
 pub const mistral = openai;
+pub const openrouter = openai;
+pub const orcarouter = openai;
 
 /// Search providers — separate namespace from the LLM clients above.
 /// Serper/Google CSE could land as siblings here.
