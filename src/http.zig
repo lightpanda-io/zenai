@@ -1,4 +1,5 @@
 const std = @import("std");
+const json = @import("json.zig");
 const retry = @import("retry.zig");
 
 /// Error set returned by `fetchJsonWithRetry`. Each provider's `ApiError`
@@ -11,19 +12,30 @@ pub const FetchError = error{
 } || std.http.Client.FetchError || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error || std.Uri.ParseError;
 
 /// Non-2xx detail captured via a client's `setErrorDetail` for later
-/// inspection. Owns `body`; `set` frees the previous body, `deinit` the last.
+/// inspection. `message` is the body's `error.message` when the body is a
+/// provider JSON error, otherwise the raw body; null when the body was empty.
+/// Owns `message`; `set` frees the previous message, `deinit` the last.
 pub const ErrorDetail = struct {
     status: ?u10 = null,
-    body: ?[]const u8 = null,
+    message: ?[]u8 = null,
 
     pub fn set(self: *ErrorDetail, allocator: std.mem.Allocator, status: u10, body: []const u8) void {
+        self.setLogged(allocator, status, body, null);
+    }
+
+    pub fn setLogged(self: *ErrorDetail, allocator: std.mem.Allocator, status: u10, body: []const u8, log_tag: ?[]const u8) void {
         self.status = status;
-        if (self.body) |old| allocator.free(old);
-        self.body = if (body.len == 0) null else allocator.dupe(u8, body) catch null;
+        if (self.message) |old| allocator.free(old);
+        self.message = null;
+        if (body.len > 0) {
+            if (log_tag) |tag| std.log.err("{s} API error (HTTP {d}): {s}", .{ tag, status, body });
+            self.message = extractErrorMessage(allocator, body) orelse (allocator.dupe(u8, body) catch null);
+        }
     }
 
     pub fn deinit(self: *ErrorDetail, allocator: std.mem.Allocator) void {
-        if (self.body) |b| allocator.free(b);
+        if (self.message) |b| allocator.free(b);
+        self.* = .{};
     }
 };
 
@@ -210,6 +222,37 @@ pub fn fetchInterruptible(
 ) std.http.Client.FetchError!std.http.Status {
     var retry_after_ms: ?u32 = null;
     return fetchCapturingRetryAfter(allocator, client, options, response_writer, interrupt, null, &retry_after_ms);
+}
+
+/// JSON-encode a request body the way every provider expects it: optional
+/// fields set to null are omitted rather than sent as `null`.
+fn encodeBody(allocator: std.mem.Allocator, body: anytype) std.mem.Allocator.Error![]u8 {
+    return json.stringifyAlloc(allocator, body, .{ .emit_null_optional_fields = false });
+}
+
+/// `fetchJsonWithRetry` for a JSON POST: encodes `body` with `encodeBody`
+/// and sets the content type.
+pub fn postJsonWithRetry(
+    allocator: std.mem.Allocator,
+    http_client: *std.http.Client,
+    policy: retry.RetryPolicy,
+    timeout_ms: ?u32,
+    url: []const u8,
+    extra_headers: []const std.http.Header,
+    body: anytype,
+    comptime T: type,
+    error_handler: anytype,
+) FetchError!Response(T) {
+    const payload = try encodeBody(allocator, body);
+    defer allocator.free(payload);
+
+    return fetchJsonWithRetry(allocator, http_client, policy, timeout_ms, .{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = payload,
+        .extra_headers = extra_headers,
+        .headers = .{ .content_type = .{ .override = "application/json" } },
+    }, T, error_handler);
 }
 
 /// Server-provided retry hint from a response head: `Retry-After-Ms`
@@ -489,6 +532,40 @@ pub fn streamNdjson(
     return streamLines(allocator, http_client, url, extra_headers, payload, EventT, error_handler, context, callback, frameNdjson);
 }
 
+/// `streamSse` with `body` JSON-encoded by `encodeBody`.
+pub fn streamSseValue(
+    allocator: std.mem.Allocator,
+    http_client: *std.http.Client,
+    url: []const u8,
+    extra_headers: []const std.http.Header,
+    body: anytype,
+    comptime EventT: type,
+    error_handler: anytype,
+    context: anytype,
+    callback: *const fn (@TypeOf(context), EventT) void,
+) SseError!void {
+    const payload = try encodeBody(allocator, body);
+    defer allocator.free(payload);
+    return streamSse(allocator, http_client, url, extra_headers, payload, EventT, error_handler, context, callback);
+}
+
+/// `streamNdjson` with `body` JSON-encoded by `encodeBody`.
+pub fn streamNdjsonValue(
+    allocator: std.mem.Allocator,
+    http_client: *std.http.Client,
+    url: []const u8,
+    extra_headers: []const std.http.Header,
+    body: anytype,
+    comptime EventT: type,
+    error_handler: anytype,
+    context: anytype,
+    callback: *const fn (@TypeOf(context), EventT) void,
+) SseError!void {
+    const payload = try encodeBody(allocator, body);
+    defer allocator.free(payload);
+    return streamNdjson(allocator, http_client, url, extra_headers, payload, EventT, error_handler, context, callback);
+}
+
 /// Extract an owned copy of `error.message` from a provider JSON error body, or
 /// null if absent or unparseable. Caller frees the result with `allocator`.
 ///
@@ -528,16 +605,16 @@ pub const ListOptions = struct {
 };
 
 pub fn appendListParams(allocator: std.mem.Allocator, base_url: []const u8, options: ListOptions) ![]u8 {
-    if (options.pageSize == null and options.pageToken == null) {
-        return allocator.dupe(u8, base_url);
-    }
-    if (options.pageSize != null and options.pageToken != null) {
-        return std.fmt.allocPrint(allocator, "{s}?pageSize={d}&pageToken={s}", .{ base_url, options.pageSize.?, options.pageToken.? });
-    }
     if (options.pageSize) |ps| {
+        if (options.pageToken) |pt| {
+            return std.fmt.allocPrint(allocator, "{s}?pageSize={d}&pageToken={s}", .{ base_url, ps, pt });
+        }
         return std.fmt.allocPrint(allocator, "{s}?pageSize={d}", .{ base_url, ps });
     }
-    return std.fmt.allocPrint(allocator, "{s}?pageToken={s}", .{ base_url, options.pageToken.? });
+    if (options.pageToken) |pt| {
+        return std.fmt.allocPrint(allocator, "{s}?pageToken={s}", .{ base_url, pt });
+    }
+    return allocator.dupe(u8, base_url);
 }
 
 test "watchdog turns a stalled response into error.Timeout" {

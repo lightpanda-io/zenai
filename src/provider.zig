@@ -551,7 +551,7 @@ pub const Client = union(enum) {
 
     pub fn lastError(self: Client) LastError {
         return switch (self) {
-            inline else => |client| .{ .status = client.last_error_status, .message = client.last_error_message },
+            inline else => |client| .{ .status = client.last_error.status, .message = client.last_error.message },
         };
     }
 
@@ -562,12 +562,16 @@ pub const Client = union(enum) {
         messages: []const Message,
         config: GenerationConfig,
     ) Error!GenerateResult {
+        // The Codex backend rejects `stream:false`, so one-shot is the
+        // streaming path accumulated into a discard-text sink.
+        if (self == .codex) return self.generateContentStreamAccumulate(model, messages, config, .{ .context = undefined, .onText = noopOnText });
+
+        var req_arena = std.heap.ArenaAllocator.init(self.clientAllocator());
+        defer req_arena.deinit();
+        const req_alloc = req_arena.allocator();
+
         switch (self) {
             .gemini, .vertex => |g| {
-                var req_arena = std.heap.ArenaAllocator.init(g.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
-
                 const separated = try separateSystemMessages(req_alloc, messages);
                 const contents = separated.contents;
                 const sys_instruction: ?gemini_types.Content = if (separated.system_text) |sys|
@@ -587,10 +591,6 @@ pub const Client = union(enum) {
                 return geminiResult(g.allocator, response.value);
             },
             .openai => |o| {
-                var req_arena = std.heap.ArenaAllocator.init(o.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
-
                 const input = try messagesToOpenAIResponsesInput(req_alloc, messages, "system");
                 const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
 
@@ -610,14 +610,11 @@ pub const Client = union(enum) {
 
                 return openAiResponsesResult(o.allocator, response.value);
             },
-            // The Codex backend rejects `stream:false`, so one-shot is the
-            // streaming path accumulated into a discard-text sink.
-            .codex => return self.generateContentStreamAccumulate(model, messages, config, .{ .context = undefined, .onText = noopOnText }),
+            // Handled by the early return above, before the arena is created.
+            .codex => unreachable,
             // Native `/api/chat` so `num_ctx` can be sized — see `openai/ollama.zig`.
             .ollama => |o| {
-                var req_arena = std.heap.ArenaAllocator.init(o.allocator);
-                defer req_arena.deinit();
-                const call = try mapOllamaCall(req_arena.allocator(), messages, config);
+                const call = try mapOllamaCall(req_alloc, messages, config);
 
                 var response = try ollama_native.chat(o, model, call.messages, call.tools, call.think, call.format, call.options);
                 defer response.deinit();
@@ -627,10 +624,6 @@ pub const Client = union(enum) {
             // Hugging Face speaks OpenAI-compatible Chat Completions, not the
             // Responses API the `.openai` arm uses — so it gets its own arm.
             .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral, .openrouter, .orcarouter => |o| {
-                var req_arena = std.heap.ArenaAllocator.init(o.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
-
                 const oai_messages = try messagesToOpenAIMessages(req_alloc, messages);
                 const tools = if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
 
@@ -640,10 +633,6 @@ pub const Client = union(enum) {
                 return openAiChatResult(o.allocator, response.value);
             },
             .anthropic => |a| {
-                var req_arena = std.heap.ArenaAllocator.init(a.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
-
                 const system_text = try extractSystemText(req_alloc, messages);
                 const ant_messages = try messagesToAnthropicMessages(req_alloc, messages);
 
@@ -673,6 +662,28 @@ pub const Client = union(enum) {
         }
     }
 
+    fn StreamAdapter(
+        comptime CtxT: type,
+        comptime ResponseT: type,
+        comptime mapFinish: fn (ResponseT) FinishReason,
+        comptime mapUsage: fn (ResponseT) Usage,
+    ) type {
+        return struct {
+            user_ctx: CtxT,
+            user_cb: *const fn (CtxT, GenerateResult) void,
+            alloc: std.mem.Allocator,
+
+            fn wrap(ctx: @This(), response: ResponseT) void {
+                var result = GenerateResult.init(ctx.alloc);
+                defer result.deinit();
+                result.text = response.text();
+                result.finish_reason = mapFinish(response);
+                result.usage = mapUsage(response);
+                ctx.user_cb(ctx.user_ctx, result);
+            }
+        };
+    }
+
     /// Stream generated content from a list of messages.
     pub fn generateContentStream(
         self: Client,
@@ -682,12 +693,24 @@ pub const Client = union(enum) {
         context: anytype,
         callback: *const fn (@TypeOf(context), GenerateResult) void,
     ) StreamError!void {
+        // Ollama's native chat is non-streaming; codex reuses this one-shot
+        // fallback since the agent drives it via generateContentStreamAccumulate.
+        if (self == .ollama or self == .codex) {
+            var result = self.generateContent(model, messages, config) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.ApiError,
+            };
+            defer result.deinit();
+            callback(context, result);
+            return;
+        }
+
+        var req_arena = std.heap.ArenaAllocator.init(self.clientAllocator());
+        defer req_arena.deinit();
+        const req_alloc = req_arena.allocator();
+
         switch (self) {
             .gemini, .vertex => |g| {
-                var req_arena = std.heap.ArenaAllocator.init(g.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
-
                 const separated = separateSystemMessages(req_alloc, messages) catch return error.OutOfMemory;
                 const contents = separated.contents;
                 const sys_instruction: ?gemini_types.Content = if (separated.system_text) |sys|
@@ -697,67 +720,23 @@ pub const Client = union(enum) {
 
                 const tools = if (config.tools) |t| mapGeminiTools(req_alloc, t) catch return error.OutOfMemory else null;
 
-                const Ctx = struct {
-                    user_ctx: @TypeOf(context),
-                    user_cb: *const fn (@TypeOf(context), GenerateResult) void,
-                    alloc: std.mem.Allocator,
-
-                    fn wrap(ctx: @This(), response: gemini_types.GenerateContentResponse) void {
-                        var result = GenerateResult.init(ctx.alloc);
-                        defer result.deinit();
-                        result.text = response.text();
-                        result.finish_reason = mapGeminiFinishReason(response);
-                        result.usage = mapGeminiUsage(response);
-                        ctx.user_cb(ctx.user_ctx, result);
-                    }
-                };
-
+                const Adapter = StreamAdapter(@TypeOf(context), gemini_types.GenerateContentResponse, mapGeminiFinishReason, mapGeminiUsage);
                 try g.generateContentStream(model, contents, mapGeminiGenerationConfig(model, config), .{
                     .systemInstruction = sys_instruction,
                     .tools = tools,
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
-                }, Ctx{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Ctx.wrap);
+                }, Adapter{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Adapter.wrap);
             },
             .openai, .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral, .openrouter, .orcarouter => |o| {
-                var req_arena = std.heap.ArenaAllocator.init(o.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
-
                 const oai_messages = messagesToOpenAIMessages(req_alloc, messages) catch return error.OutOfMemory;
                 const tools = if (config.tools) |t| mapOpenAITools(req_alloc, t) catch return error.OutOfMemory else null;
 
-                const Ctx = struct {
-                    user_ctx: @TypeOf(context),
-                    user_cb: *const fn (@TypeOf(context), GenerateResult) void,
-                    alloc: std.mem.Allocator,
-
-                    fn wrap(ctx: @This(), response: openai_types.ChatCompletionResponse) void {
-                        var result = GenerateResult.init(ctx.alloc);
-                        defer result.deinit();
-                        result.text = response.text();
-                        result.finish_reason = mapOpenAIFinishReason(response);
-                        result.usage = mapOpenAIUsage(response);
-                        ctx.user_cb(ctx.user_ctx, result);
-                    }
-                };
-
-                try o.chatCompletionStream(model, oai_messages, mapOpenAICompletionConfig(config, tools), Ctx{ .user_ctx = context, .user_cb = callback, .alloc = o.allocator }, &Ctx.wrap);
+                const Adapter = StreamAdapter(@TypeOf(context), openai_types.ChatCompletionResponse, mapOpenAIFinishReason, mapOpenAIUsage);
+                try o.chatCompletionStream(model, oai_messages, mapOpenAICompletionConfig(config, tools), Adapter{ .user_ctx = context, .user_cb = callback, .alloc = o.allocator }, &Adapter.wrap);
             },
-            // Ollama's native chat is non-streaming; codex reuses this one-shot
-            // fallback since the agent drives it via generateContentStreamAccumulate.
-            .ollama, .codex => {
-                var result = self.generateContent(model, messages, config) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.ApiError,
-                };
-                defer result.deinit();
-                callback(context, result);
-            },
+            // Handled by the early return above, before the arena is created.
+            .ollama, .codex => unreachable,
             .anthropic => |a| {
-                var req_arena = std.heap.ArenaAllocator.init(a.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
-
                 const system_text = extractSystemText(req_alloc, messages) catch return error.OutOfMemory;
                 const ant_messages = messagesToAnthropicMessages(req_alloc, messages) catch return error.OutOfMemory;
 
@@ -816,12 +795,12 @@ pub const Client = union(enum) {
         config: GenerationConfig,
         on_text: TextDeltaHook,
     ) Error!GenerateResult {
+        var req_arena = std.heap.ArenaAllocator.init(self.clientAllocator());
+        defer req_arena.deinit();
+        const req_alloc = req_arena.allocator();
+
         switch (self) {
             .anthropic => |a| {
-                var req_arena = std.heap.ArenaAllocator.init(a.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
-
                 const system_text = try extractSystemText(req_alloc, messages);
                 const ant_messages = try messagesToAnthropicMessages(req_alloc, messages);
                 const system_blocks: ?[]const anthropic_types.TextBlock = if (system_text) |sys|
@@ -849,10 +828,6 @@ pub const Client = union(enum) {
                 return anthropicResult(a.allocator, try acc.response());
             },
             .huggingface, .openai_compatible, .llama_cpp, .vercel, .mistral, .openrouter, .orcarouter => |o| {
-                var req_arena = std.heap.ArenaAllocator.init(o.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
-
                 const oai_messages = try messagesToOpenAIMessages(req_alloc, messages);
                 const tools = if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
 
@@ -865,10 +840,6 @@ pub const Client = union(enum) {
                 return openAiChatResult(o.allocator, try acc.response());
             },
             .gemini, .vertex => |g| {
-                var req_arena = std.heap.ArenaAllocator.init(g.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
-
                 const separated = try separateSystemMessages(req_alloc, messages);
                 const contents = separated.contents;
                 const sys_instruction: ?gemini_types.Content = if (separated.system_text) |sys|
@@ -893,10 +864,6 @@ pub const Client = union(enum) {
             // on function tools + reasoning for the gpt-5 family, and the buffered
             // path already uses Responses, so streaming stays consistent with it.
             .openai => |o| {
-                var req_arena = std.heap.ArenaAllocator.init(o.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
-
                 const input = try messagesToOpenAIResponsesInput(req_alloc, messages, "system");
                 const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
 
@@ -917,10 +884,6 @@ pub const Client = union(enum) {
                 return openAiResponsesResult(o.allocator, try acc.response());
             },
             .codex => |c| {
-                var req_arena = std.heap.ArenaAllocator.init(c.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
-
                 const input = try messagesToOpenAIResponsesInput(req_alloc, messages, codex_system_role);
                 const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
 
@@ -936,9 +899,6 @@ pub const Client = union(enum) {
             // that the OpenAI-compatible `/v1` shim (used by the other local
             // arms) lacks — it defaults to 4096 and silently truncates.
             .ollama => |o| {
-                var req_arena = std.heap.ArenaAllocator.init(o.allocator);
-                defer req_arena.deinit();
-                const req_alloc = req_arena.allocator();
                 const call = try mapOllamaCall(req_alloc, messages, config);
 
                 var acc = ollama_native.StreamAccumulator.init(req_alloc, on_text.context, on_text.onText);

@@ -223,21 +223,9 @@ pub fn chat(
     defer client.allocator.free(url);
 
     const req = try buildChatRequest(client, model, messages, tools, think, format, options, false);
-
-    var payload_buf: std.Io.Writer.Allocating = .init(client.allocator);
-    defer payload_buf.deinit();
-    std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
-        return error.OutOfMemory;
-
     // Local Ollama ignores auth; harmless, and supports an authenticating proxy.
     const auth = [_]std.http.Header{.{ .name = "Authorization", .value = client.api_key }};
-    return http.fetchJsonWithRetry(client.allocator, &client.http_client, client.retry_policy, client.request_timeout_ms, .{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = payload_buf.written(),
-        .extra_headers = &auth,
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-    }, ChatResponse, client);
+    return http.postJsonWithRetry(client.allocator, &client.http_client, client.retry_policy, client.request_timeout_ms, url, &auth, req, ChatResponse, client);
 }
 
 /// Streaming counterpart of `chat`: sets `stream: true` and invokes `callback`
@@ -261,14 +249,8 @@ pub fn chatStream(
     defer client.allocator.free(url);
 
     const req = try buildChatRequest(client, model, messages, tools, think, format, options, true);
-
-    var payload_buf: std.Io.Writer.Allocating = .init(client.allocator);
-    defer payload_buf.deinit();
-    std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
-        return error.OutOfMemory;
-
     const auth = [_]std.http.Header{.{ .name = "Authorization", .value = client.api_key }};
-    return http.streamNdjson(client.allocator, &client.http_client, url, &auth, payload_buf.written(), ChatResponse, client, context, callback);
+    return http.streamNdjsonValue(client.allocator, &client.http_client, url, &auth, req, ChatResponse, client, context, callback);
 }
 
 /// Reassembles a streamed `/api/chat` response — forwarding each text delta to

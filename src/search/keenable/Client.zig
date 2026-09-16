@@ -92,23 +92,13 @@ pub fn search(
 
     var request = options;
     request.query = query;
-    var payload_buf: std.Io.Writer.Allocating = .init(self.allocator);
-    defer payload_buf.deinit();
-    std.json.Stringify.value(request, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
-        return error.OutOfMemory;
 
     const headers = [_]std.http.Header{
         .{ .name = "X-Keenable-Title", .value = self.app_title },
         .{ .name = "X-API-Key", .value = self.api_key orelse "" },
     };
 
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = payload_buf.written(),
-        .extra_headers = headers[0..if (self.api_key == null) 1 else 2],
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-    }, SearchResponse, self);
+    return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, headers[0..if (self.api_key == null) 1 else 2], request, SearchResponse, self);
 }
 
 test "null api key routes to the public endpoint" {

@@ -36,10 +36,7 @@ request_timeout_ms: ?u32,
 /// Cached "Bearer {token}" header value for Vertex project/location mode.
 /// Built on first request; owned, freed in `deinit`.
 bearer_value: ?[]u8 = null,
-/// Human-readable message from the most recent API error, owned by the client
-/// and freed on the next failure or `deinit`. Set on `error.ApiError`.
-last_error_message: ?[]u8 = null,
-last_error_status: ?u10 = null,
+last_error: http.ErrorDetail = .{},
 /// Set by the host so a SIGINT can abort an in-flight request mid-read.
 interrupt: ?*http.Interrupt = null,
 
@@ -93,14 +90,12 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
         .http_client = .{ .allocator = allocator, .io = io },
         .retry_policy = options.retry_policy,
         .request_timeout_ms = options.request_timeout_ms,
-        .last_error_message = null,
-        .last_error_status = null,
     };
 }
 
 /// Release all resources held by the client, including HTTP connections.
 pub fn deinit(self: *Client) void {
-    if (self.last_error_message) |m| self.allocator.free(m);
+    self.last_error.deinit(self.allocator);
     if (self.bearer_value) |b| self.allocator.free(b);
     self.http_client.deinit();
 }
@@ -135,15 +130,7 @@ pub const ApiError = error{
 // --- Internal helpers ---
 
 pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error_status = status_code;
-    if (self.last_error_message) |m| {
-        self.allocator.free(m);
-        self.last_error_message = null;
-    }
-    if (body.len > 0) {
-        std.log.err("Gemini API error (HTTP {d}): {s}", .{ status_code, body });
-        self.last_error_message = http.extractErrorMessage(self.allocator, body);
-    }
+    self.last_error.setLogged(self.allocator, status_code, body, "Gemini");
 }
 
 const default_base_url = "https://generativelanguage.googleapis.com";
@@ -242,19 +229,8 @@ fn fetchGet(self: *Client, url: []const u8, comptime T: type) ApiError!Response(
 }
 
 fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) ApiError!Response(T) {
-    var payload_buf: std.Io.Writer.Allocating = .init(self.allocator);
-    defer payload_buf.deinit();
-    std.json.Stringify.value(body, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
-        return error.OutOfMemory;
-
     const auth = [1]std.http.Header{try self.authHeader()};
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = payload_buf.written(),
-        .extra_headers = &auth,
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-    }, T, self);
+    return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, &auth, body, T, self);
 }
 
 /// Pagination options for list operations.
@@ -334,13 +310,8 @@ pub fn generateContentStream(
         .modelArmorConfig = options.modelArmorConfig,
         .serviceTier = options.serviceTier,
     };
-    var payload_buf: std.Io.Writer.Allocating = .init(self.allocator);
-    defer payload_buf.deinit();
-    std.json.Stringify.value(req_body, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
-        return error.OutOfMemory;
-
     const auth = [1]std.http.Header{try self.authHeader()};
-    return http.streamSse(self.allocator, &self.http_client, url, &auth, payload_buf.written(), GenerateContentResponse, self, context, callback);
+    return http.streamSseValue(self.allocator, &self.http_client, url, &auth, req_body, GenerateContentResponse, self, context, callback);
 }
 
 /// Convenience: stream content generation from a single text prompt.

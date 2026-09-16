@@ -109,14 +109,8 @@ pub fn sendStream(
         alloc: std.mem.Allocator,
 
         fn handle(s: *const @This(), response: ChatCompletionResponse) void {
-            if (response.choices) |choices| {
-                if (choices.len > 0) {
-                    if (choices[0].delta) |delta| {
-                        if (delta.content) |c| {
-                            s.content.appendSlice(s.alloc, c) catch {};
-                        }
-                    }
-                }
+            if (response.text()) |c| {
+                s.content.appendSlice(s.alloc, c) catch {};
             }
             s.user_cb(s.user_ctx, response);
         }

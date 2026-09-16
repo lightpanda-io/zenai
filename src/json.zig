@@ -91,9 +91,15 @@ pub fn dupeValue(a: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.
     };
 }
 
+/// Serialize any value to a JSON string, allocated with `allocator`.
+pub fn stringifyAlloc(allocator: std.mem.Allocator, value: anytype, options: std.json.Stringify.Options) std.mem.Allocator.Error![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    std.json.Stringify.value(value, options, &aw.writer) catch return error.OutOfMemory;
+    return aw.toOwnedSlice();
+}
+
 /// Serialize a `std.json.Value` to a JSON string, allocated with `a`.
 pub fn valueToString(a: std.mem.Allocator, val: std.json.Value) std.mem.Allocator.Error![]const u8 {
-    var aw: std.Io.Writer.Allocating = .init(a);
-    std.json.Stringify.value(val, .{}, &aw.writer) catch return error.OutOfMemory;
-    return aw.written();
+    return stringifyAlloc(a, val, .{});
 }

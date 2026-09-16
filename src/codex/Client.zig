@@ -28,8 +28,7 @@ user_agent: []const u8,
 /// Sent as `session-id`; null omits it.
 session_id: ?[]const u8,
 http_client: std.http.Client,
-last_error_message: ?[]u8 = null,
-last_error_status: ?u10 = null,
+last_error: http.ErrorDetail = .{},
 interrupt: ?*http.Interrupt = null,
 /// Cached "Bearer {token}" header value, built on first request.
 authorization: ?[]const u8 = null,
@@ -62,7 +61,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, access_token: []const u8, 
 pub fn deinit(self: *Client) void {
     if (self.account_id) |a| self.allocator.free(a);
     if (self.authorization) |a| self.allocator.free(a);
-    if (self.last_error_message) |m| self.allocator.free(m);
+    self.last_error.deinit(self.allocator);
     self.http_client.deinit();
 }
 
@@ -103,15 +102,7 @@ fn authHeaders(self: *Client, buf: *[5]std.http.Header) ![]const std.http.Header
 }
 
 pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error_status = status_code;
-    if (self.last_error_message) |m| {
-        self.allocator.free(m);
-        self.last_error_message = null;
-    }
-    if (body.len > 0) {
-        std.log.err("Codex API error (HTTP {d}): {s}", .{ status_code, body });
-        self.last_error_message = http.extractErrorMessage(self.allocator, body);
-    }
+    self.last_error.setLogged(self.allocator, status_code, body, "Codex");
 }
 
 /// Stream a model response via the Responses API; `request.stream` is forced on
@@ -129,14 +120,9 @@ pub fn createResponseStream(
     var req_body = request;
     req_body.stream = true;
 
-    var payload_buf: std.Io.Writer.Allocating = .init(self.allocator);
-    defer payload_buf.deinit();
-    std.json.Stringify.value(req_body, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
-        return error.OutOfMemory;
-
     var hdr_buf: [5]std.http.Header = undefined;
     const auth = try self.authHeaders(&hdr_buf);
-    return http.streamSse(self.allocator, &self.http_client, url, auth, payload_buf.written(), ResponseStreamEvent, self, context, callback);
+    return http.streamSseValue(self.allocator, &self.http_client, url, auth, req_body, ResponseStreamEvent, self, context, callback);
 }
 
 fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {

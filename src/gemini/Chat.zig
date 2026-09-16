@@ -109,12 +109,8 @@ pub fn sendStream(
         alloc: std.mem.Allocator,
 
         fn handle(s: *const @This(), response: GenerateContentResponse) void {
-            if (response.candidates) |candidates| {
-                if (candidates.len > 0) {
-                    if (candidates[0].content) |content| {
-                        s.parts.appendSlice(s.alloc, content.parts) catch {};
-                    }
-                }
+            if (response.parts()) |pts| {
+                s.parts.appendSlice(s.alloc, pts) catch {};
             }
             s.user_cb(s.user_ctx, response);
         }

@@ -70,10 +70,6 @@ pub fn search(
 
     var request = options;
     request.query = query;
-    var payload_buf: std.Io.Writer.Allocating = .init(self.allocator);
-    defer payload_buf.deinit();
-    std.json.Stringify.value(request, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
-        return error.OutOfMemory;
 
     const auth = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key});
     defer self.allocator.free(auth);
@@ -81,13 +77,7 @@ pub fn search(
         .{ .name = "Authorization", .value = auth },
     };
 
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = payload_buf.written(),
-        .extra_headers = &extra_headers,
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-    }, SearchResponse, self);
+    return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, &extra_headers, request, SearchResponse, self);
 }
 
 test "search rejects empty api key" {
