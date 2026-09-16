@@ -440,6 +440,8 @@ pub const Client = union(enum) {
     openai_compatible: *openai_mod,
     vercel: *openai_mod,
     mistral: *openai_mod,
+    openrouter: *openai_mod,
+    orcarouter: *openai_mod,
     codex: *codex_mod,
 
     pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError || codex_mod.ApiError;
@@ -624,7 +626,7 @@ pub const Client = union(enum) {
             },
             // Hugging Face speaks OpenAI-compatible Chat Completions, not the
             // Responses API the `.openai` arm uses — so it gets its own arm.
-            .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral => |o| {
+            .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral, .openrouter, .orcarouter => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
@@ -716,7 +718,7 @@ pub const Client = union(enum) {
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
                 }, Ctx{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Ctx.wrap);
             },
-            .openai, .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral => |o| {
+            .openai, .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral, .openrouter, .orcarouter => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
@@ -846,7 +848,7 @@ pub const Client = union(enum) {
                 if (acc.err) |e| return e;
                 return anthropicResult(a.allocator, try acc.response());
             },
-            .huggingface, .openai_compatible, .llama_cpp, .vercel, .mistral => |o| {
+            .huggingface, .openai_compatible, .llama_cpp, .vercel, .mistral, .openrouter, .orcarouter => |o| {
                 var req_arena = std.heap.ArenaAllocator.init(o.allocator);
                 defer req_arena.deinit();
                 const req_alloc = req_arena.allocator();
@@ -968,7 +970,7 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
-            .openai, .ollama, .huggingface, .openai_compatible, .llama_cpp, .vercel, .mistral => |o| {
+            .openai, .ollama, .huggingface, .openai_compatible, .llama_cpp, .vercel, .mistral, .openrouter, .orcarouter => |o| {
                 var response = try o.embedText(model, text);
                 defer response.deinit();
                 var result = EmbedResult.init(o.allocator);
@@ -1254,6 +1256,8 @@ fn openAiPreset(tag: Tag) ?OpenAiPreset {
         .llama_cpp => .{ .base_url = "http://localhost:8080/v1", .placeholder_key = "llama.cpp", .default_model = "", .local = true },
         .vercel => .{ .base_url = "https://ai-gateway.vercel.sh/v1", .env_var = "AI_GATEWAY_API_KEY", .default_model = "openai/gpt-5.5" },
         .mistral => .{ .base_url = "https://api.mistral.ai/v1", .env_var = "MISTRAL_API_KEY", .default_model = "mistral-medium-3.5" },
+        .openrouter => .{ .base_url = "https://openrouter.ai/api/v1", .env_var = "OPENROUTER_API_KEY", .default_model = "openai/gpt-5.5" },
+        .orcarouter => .{ .base_url = "https://api.orcarouter.ai/v1", .env_var = "ORCAROUTER_API_KEY", .default_model = "openai/gpt-5.5" },
         .anthropic, .gemini, .vertex, .openai, .codex => null,
     };
 }
@@ -1579,19 +1583,14 @@ test "llama_cpp: placeholder key, loopback default, excluded from auto-detect" {
     }
 }
 
-test "vercel/mistral: real-key cloud presets, auto-detectable" {
-    try std.testing.expectEqualStrings("AI_GATEWAY_API_KEY", openAiPreset(.vercel).?.env_var.?);
-    try std.testing.expectEqualStrings("MISTRAL_API_KEY", openAiPreset(.mistral).?.env_var.?);
-    try std.testing.expect(defaultModel(.vercel).len > 0 and defaultModel(.mistral).len > 0);
-    // Real keys, so both join env auto-detection; the keyless local servers don't.
-    var saw_vercel = false;
-    var saw_mistral = false;
-    for (default_candidates) |t| {
-        if (t == .vercel) saw_vercel = true;
-        if (t == .mistral) saw_mistral = true;
-        try std.testing.expect(t != .ollama and t != .llama_cpp);
+test "cloud gateway presets: real key, default model, auto-detectable" {
+    for ([_]Tag{ .vercel, .mistral, .openrouter, .orcarouter }) |tag| {
+        try std.testing.expect(openAiPreset(tag).?.env_var != null);
+        try std.testing.expect(defaultModel(tag).len > 0);
+        // Real keys, so they join env auto-detection; the keyless local servers don't.
+        try std.testing.expect(std.mem.indexOfScalar(Tag, default_candidates, tag) != null);
     }
-    try std.testing.expect(saw_vercel and saw_mistral);
+    for (default_candidates) |t| try std.testing.expect(t != .ollama and t != .llama_cpp);
 }
 
 test "openai_compatible: no static preset, env-gated key detection" {
