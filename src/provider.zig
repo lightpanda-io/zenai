@@ -603,7 +603,7 @@ pub const Client = union(enum) {
                         .{ .effort = mapEffortToOpenAI(tl) }
                     else
                         null,
-                    .max_output_tokens = config.max_tokens,
+                    .max_output_tokens = flooredMaxTokens(config.effort, config.max_tokens),
                     .temperature = config.temperature,
                 });
                 defer response.deinit();
@@ -874,7 +874,7 @@ pub const Client = union(enum) {
                     .tools = tools,
                     .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
                     .reasoning = if (config.effort) |tl| .{ .effort = mapEffortToOpenAI(tl) } else null,
-                    .max_output_tokens = config.max_tokens,
+                    .max_output_tokens = flooredMaxTokens(config.effort, config.max_tokens),
                     .temperature = config.temperature,
                 }, &acc, openai_mod.ResponsesStreamAccumulator.onEvent) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -2330,7 +2330,7 @@ fn mapOllamaCall(allocator: std.mem.Allocator, messages: []const Message, config
         .think = mapOllamaThink(config.effort),
         .format = if (config.response_format) |rf| (if (rf == .json) "json" else null) else null,
         .options = .{
-            .num_predict = config.max_tokens,
+            .num_predict = flooredMaxTokens(config.effort, config.max_tokens),
             .temperature = config.temperature,
             .top_p = config.top_p,
             .seed = config.seed,
@@ -2535,7 +2535,7 @@ fn convertAnthropicUsage(usage_opt: ?anthropic_types.Usage) Usage {
 fn mapGeminiGenerationConfig(model: []const u8, config: GenerationConfig) gemini_types.GenerationConfig {
     return .{
         .temperature = config.temperature,
-        .maxOutputTokens = config.max_tokens,
+        .maxOutputTokens = flooredMaxTokens(config.effort, config.max_tokens),
         .topP = config.top_p,
         .stopSequences = config.stop,
         .frequencyPenalty = config.frequency_penalty,
@@ -2563,9 +2563,19 @@ fn mapEffortToGeminiConfig(model: []const u8, level: Effort) gemini_types.Thinki
     return .{ .thinkingLevel = mapEffortToGemini(level) };
 }
 
+/// Note that `.none` does **not** turn reasoning off on Gemini 3: returning
+/// null here serializes as `"thinkingConfig": {}` (requests omit null fields),
+/// which is the model default, i.e. dynamic thinking. Only the Gemini 2.5
+/// `thinkingBudget: 0` path is a real off switch, so treat `max_tokens` as
+/// shared with reasoning at every effort level on Gemini 3.
+///
+/// Some models reject a level outright -- gemini-3.8-flash answers
+/// `thinkingLevel: MINIMAL` with HTTP 400. Deliberately not sniffed: the
+/// API's error surfaces as-is, and `.low` is accepted everywhere `.minimal`
+/// is not.
 fn mapEffortToGemini(level: Effort) ?gemini_types.ThinkingLevel {
     return switch (level) {
-        .none => null, // Should we disable? Gemini uses ThinkingConfig presence.
+        .none => null,
         .minimal => .MINIMAL,
         .low => .LOW,
         .medium => .MEDIUM,
@@ -2591,7 +2601,7 @@ fn mapEffortToGeminiBudget(level: Effort) i32 {
 fn mapOpenAICompletionConfig(config: GenerationConfig, tools: ?[]const openai_types.Tool) openai_mod.ChatCompletionConfig {
     return .{
         .temperature = config.temperature,
-        .max_tokens = config.max_tokens,
+        .max_tokens = flooredMaxTokens(config.effort, config.max_tokens),
         .top_p = config.top_p,
         .stop = config.stop,
         .frequency_penalty = config.frequency_penalty,
@@ -2625,20 +2635,39 @@ const AnthropicReasoning = struct {
 /// Reasoning tokens share `max_tokens` with the answer; a tight cap yields
 /// mostly thinking followed by a truncated answer, so `max_tokens` is floored
 /// per effort level.
+/// Reasoning tokens are drawn from the same output budget as the answer on
+/// every provider here, so a tight `max_tokens` buys mostly thinking and a
+/// truncated answer -- which reads as a model that replied badly rather than
+/// one that was never given room. The floor is per effort level and never
+/// lowers a caller's own number.
+///
+/// Null `max_tokens` means "provider default", which is generous, so it is
+/// left alone rather than pinned to the floor.
+fn flooredMaxTokens(effort: ?Effort, max_tokens: ?i32) ?i32 {
+    const headroom: i32 = switch (effort orelse return max_tokens) {
+        .none => return max_tokens,
+        .minimal, .low => 1024,
+        .medium => 4096,
+        .high => 16384,
+        .xhigh => 32768,
+    };
+    const requested = max_tokens orelse return null;
+    return @max(requested, headroom +| 4096);
+}
+
 fn mapEffortToAnthropic(effort: ?Effort, max_tokens: i32) AnthropicReasoning {
     const off: AnthropicReasoning = .{ .thinking = null, .output_config = null, .max_tokens = max_tokens };
-    const Params = struct { wire: []const u8, thinking_headroom: i32 };
-    const p: Params = switch (effort orelse return off) {
+    const wire: []const u8 = switch (effort orelse return off) {
         .none => return off,
-        .minimal, .low => .{ .wire = "low", .thinking_headroom = 1024 },
-        .medium => .{ .wire = "medium", .thinking_headroom = 4096 },
-        .high => .{ .wire = "high", .thinking_headroom = 16384 },
-        .xhigh => .{ .wire = "xhigh", .thinking_headroom = 32768 },
+        .minimal, .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "xhigh",
     };
     return .{
         .thinking = .{ .type = "adaptive" },
-        .output_config = .{ .effort = p.wire },
-        .max_tokens = @max(max_tokens, p.thinking_headroom +| 4096),
+        .output_config = .{ .effort = wire },
+        .max_tokens = flooredMaxTokens(effort, max_tokens).?,
     };
 }
 
@@ -2683,6 +2712,31 @@ test "generateContentStream: generic body is analyzed for every backend" {
         var client: Client = undefined;
         try client.generateContentStream("model", &.{}, .{}, {}, &Cb.onDelta);
     }
+}
+
+test "flooredMaxTokens: a tight cap gets reasoning headroom" {
+    // The bug this exists for: 256 tokens at any thinking level returns
+    // deliberation and a cut-off answer.
+    try std.testing.expectEqual(@as(?i32, 5120), flooredMaxTokens(.low, 256));
+    try std.testing.expectEqual(@as(?i32, 8192), flooredMaxTokens(.medium, 256));
+    try std.testing.expectEqual(@as(?i32, 20480), flooredMaxTokens(.high, 256));
+    try std.testing.expectEqual(@as(?i32, 36864), flooredMaxTokens(.xhigh, 256));
+}
+
+test "flooredMaxTokens: a caller asking for more keeps it" {
+    try std.testing.expectEqual(@as(?i32, 64000), flooredMaxTokens(.medium, 64000));
+}
+
+test "flooredMaxTokens: no reasoning, no floor" {
+    try std.testing.expectEqual(@as(?i32, 256), flooredMaxTokens(null, 256));
+    try std.testing.expectEqual(@as(?i32, 256), flooredMaxTokens(.none, 256));
+}
+
+test "flooredMaxTokens: null stays the provider default" {
+    // Pinning it to the floor would *lower* the budget on providers whose
+    // default is larger.
+    try std.testing.expectEqual(@as(?i32, null), flooredMaxTokens(.high, null));
+    try std.testing.expectEqual(@as(?i32, null), flooredMaxTokens(null, null));
 }
 
 test "mapEffortToAnthropic: null and none omit thinking and leave max_tokens alone" {
