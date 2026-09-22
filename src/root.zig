@@ -80,6 +80,9 @@ pub const search = struct {
 pub const typesafe = struct {
     pub const Client = @import("typesafe/Client.zig");
     pub const types = @import("typesafe/types.zig");
+    /// Where a request can be sent, and which env var carries the key —
+    /// `provider.openAiPreset`'s counterpart for the judgement side.
+    pub const channels = @import("typesafe/channels.zig");
 };
 
 pub const provider = @import("provider.zig");

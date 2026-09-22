@@ -292,6 +292,21 @@ pub const AskResponse = struct {
     pub fn answer(self: AskResponse, id: []const u8) ?Answer {
         return self.answers.get(id);
     }
+
+    /// The `choice` under `id`, checked against the criteria that question was
+    /// sent with. Pass the same `questions` as the request: holding a second
+    /// copy of the option set is how a caller ends up validating an answer
+    /// against a stale one.
+    pub fn choice(self: AskResponse, id: []const u8, questions: Questions) ChoiceError![]const u8 {
+        const question = questions.get(id) orelse return error.QuestionNotAsked;
+        const criteria = switch (question) {
+            .choice => |c| c.criteria,
+            else => return error.NotAChoice,
+        };
+        const found = self.answer(id) orelse return error.AnswerMissing;
+        try validateChoice(found, criteria);
+        return found.choice.choice;
+    }
 };
 
 pub const Model = struct {
@@ -309,6 +324,8 @@ pub const ListModelsResponse = struct {
 // --- Validation ---
 
 pub const ChoiceError = error{
+    QuestionNotAsked,
+    AnswerMissing,
     NotAChoice,
     ChoiceNotOffered,
     ProbabilityKeyMismatch,
@@ -578,4 +595,28 @@ test "choices and choiceText build the README's question list" {
     try std.testing.expectEqualStrings(
         \\{"state":"The pizza arrived cold.","model":"jev-latest","questions":{"is_complaint":{"type":"noul","instructions":"Is the customer complaining?"},"topic":{"type":"choice","instructions":"What is this message about?","criteria":{"billing":null,"delivery":null,"other":null}},"anger":{"type":"score","instructions":"How angry is the customer?","criteria":["Calm","Annoyed","Furious"]}}}
     , buf.written());
+}
+
+test "choice: validated against the criteria the question carried" {
+    const questions: Questions = .init(&.{
+        .{ .key = "route", .value = .choiceText("Where to?", choices(&.{ "a", "b" })) },
+        .{ .key = "urgent", .value = .noulText("Is it urgent?") },
+    });
+    const response: AskResponse = .{ .answers = .init(&.{
+        .{ .key = "route", .value = .{ .choice = .{ .choice = "b", .probabilities = .init(&.{
+            .{ .key = "a", .value = 0.1 },
+            .{ .key = "b", .value = 0.9 },
+        }) } } },
+        .{ .key = "strayed", .value = .{ .choice = .{ .choice = "z", .probabilities = .init(&.{
+            .{ .key = "z", .value = 1 },
+        }) } } },
+    }) };
+
+    try std.testing.expectEqualStrings("b", try response.choice("route", questions));
+    // Each failure names itself rather than collapsing into one error.
+    try std.testing.expectError(error.QuestionNotAsked, response.choice("strayed", questions));
+    try std.testing.expectError(error.NotAChoice, response.choice("urgent", questions));
+    try std.testing.expectError(error.AnswerMissing, response.choice("missing", .init(&.{
+        .{ .key = "missing", .value = .choiceText("?", choices(&.{"a"})) },
+    })));
 }
