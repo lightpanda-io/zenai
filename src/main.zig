@@ -151,9 +151,9 @@ fn functionCallingExample(client: *zenai.gemini.Client) !void {
             .description = "Get the current weather for a given city.",
             .parameters = .{
                 .type = .OBJECT,
-                .properties = &.{
+                .properties = .init(&.{
                     .{ .key = "city", .value = .{ .type = .STRING, .description = "The city name" } },
-                },
+                }),
                 .required = &.{"city"},
             },
         }},

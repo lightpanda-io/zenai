@@ -350,10 +350,11 @@ pub const Content = struct {
 // --- Schema ---
 
 /// A key-value pair for defining object properties in a `Schema`.
-pub const Property = struct {
-    key: []const u8,
-    value: Schema,
-};
+pub const Property = Properties.Entry;
+
+/// Property name -> schema. An object with runtime keys, which is why
+/// `Schema` cannot use std's default struct serialization.
+pub const Properties = jsonutil.StringMap(Schema);
 
 /// Defines the format of input/output data. Represents a subset of an
 /// OpenAPI 3.0 schema object.
@@ -368,7 +369,7 @@ pub const Schema = struct {
     /// If type is ARRAY, specifies the schema of elements in the array.
     items: ?*const Schema = null,
     /// If type is OBJECT, maps property names to their schema definitions.
-    properties: ?[]const Property = null,
+    properties: ?Properties = null,
     /// If type is OBJECT, lists property names that must be present.
     required: ?[]const []const u8 = null,
     /// Indicates if the value can be null.
@@ -392,36 +393,11 @@ pub const Schema = struct {
     /// Regex pattern that a string must match.
     pattern: ?[]const u8 = null,
 
-    /// Custom JSON serialization: emits `properties` as a JSON object instead of an array.
+    /// std has no way to emit `properties` as an object, so the whole struct
+    /// is written by hand; `StringMap` handles the `properties` field itself.
     pub fn jsonStringify(self: *const Schema, jw: *std.json.Stringify) !void {
         try jw.beginObject();
-        inline for (std.meta.fields(Schema)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "properties")) {
-                if (self.properties) |props| {
-                    try jw.objectField("properties");
-                    try jw.beginObject();
-                    for (props) |prop| {
-                        try jw.objectField(prop.key);
-                        try jw.write(prop.value);
-                    }
-                    try jw.endObject();
-                }
-            } else {
-                const val = @field(self, field.name);
-                if (comptime @typeInfo(field.type) == .optional) {
-                    if (val) |unwrapped| {
-                        try jw.objectField(field.name);
-                        try jw.write(unwrapped);
-                    } else if (jw.options.emit_null_optional_fields) {
-                        try jw.objectField(field.name);
-                        try jw.write(null);
-                    }
-                } else {
-                    try jw.objectField(field.name);
-                    try jw.write(val);
-                }
-            }
-        }
+        try jsonutil.writeStructFields(self.*, jw);
         try jw.endObject();
     }
 };
