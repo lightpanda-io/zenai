@@ -560,8 +560,9 @@ pub const Client = union(enum) {
         self: Client,
         model: []const u8,
         messages: []const Message,
-        config: GenerationConfig,
+        config_in: GenerationConfig,
     ) Error!GenerateResult {
+        const config = flooredConfig(config_in);
         // The Codex backend rejects `stream:false`, so one-shot is the
         // streaming path accumulated into a discard-text sink.
         if (self == .codex) return self.generateContentStreamAccumulate(model, messages, config, .{ .context = undefined, .onText = noopOnText });
@@ -689,10 +690,11 @@ pub const Client = union(enum) {
         self: Client,
         model: []const u8,
         messages: []const Message,
-        config: GenerationConfig,
+        config_in: GenerationConfig,
         context: anytype,
         callback: *const fn (@TypeOf(context), GenerateResult) void,
     ) StreamError!void {
+        const config = flooredConfig(config_in);
         // Ollama's native chat is non-streaming; codex reuses this one-shot
         // fallback since the agent drives it via generateContentStreamAccumulate.
         if (self == .ollama or self == .codex) {
@@ -792,9 +794,10 @@ pub const Client = union(enum) {
         self: Client,
         model: []const u8,
         messages: []const Message,
-        config: GenerationConfig,
+        config_in: GenerationConfig,
         on_text: TextDeltaHook,
     ) Error!GenerateResult {
+        const config = flooredConfig(config_in);
         var req_arena = std.heap.ArenaAllocator.init(self.clientAllocator());
         defer req_arena.deinit();
         const req_alloc = req_arena.allocator();
@@ -2563,9 +2566,14 @@ fn mapEffortToGeminiConfig(model: []const u8, level: Effort) gemini_types.Thinki
     return .{ .thinkingLevel = mapEffortToGemini(level) };
 }
 
+/// `.none` does not turn reasoning off on Gemini 3: null serializes as
+/// `"thinkingConfig": {}` (requests omit null fields), which is the model
+/// default. Only Gemini 2.5's `thinkingBudget: 0` is a real off switch.
+/// Some models also reject a level outright -- gemini-3.8-flash answers
+/// `MINIMAL` with HTTP 400 where `.low` works.
 fn mapEffortToGemini(level: Effort) ?gemini_types.ThinkingLevel {
     return switch (level) {
-        .none => null, // Should we disable? Gemini uses ThinkingConfig presence.
+        .none => null,
         .minimal => .MINIMAL,
         .low => .LOW,
         .medium => .MEDIUM,
@@ -2616,29 +2624,46 @@ const AnthropicReasoning = struct {
     max_tokens: i32,
 };
 
+/// Reasoning tokens share the output budget with the answer, so a tight cap
+/// yields mostly thinking followed by a truncated answer.
+fn floorMaxTokens(effort: ?Effort, max_tokens: i32) i32 {
+    const answer_room = 4096;
+    const floor: i32 = switch (effort orelse .none) {
+        .none => return max_tokens,
+        .minimal, .low => 1024 + answer_room,
+        .medium => 4096 + answer_room,
+        .high => 16384 + answer_room,
+        .xhigh => 32768 + answer_room,
+    };
+    return @max(max_tokens, floor);
+}
+
+/// Null `max_tokens` means "provider default", which is generous, so it is
+/// left alone rather than pinned to the floor.
+fn flooredConfig(config: GenerationConfig) GenerationConfig {
+    var floored = config;
+    if (config.max_tokens) |requested| floored.max_tokens = floorMaxTokens(config.effort, requested);
+    return floored;
+}
+
 /// Adaptive thinking + `output_config.effort` is the only on-mode on current
 /// models (`enabled` + `budget_tokens` is HTTP 400 on Opus 4.7+/Sonnet 5);
 /// legacy models (Sonnet 4.5, Haiku 4.5) reject adaptive/effort instead.
 /// Deliberately no model sniffing: the API's error surfaces as-is, and
 /// `.none` (omit both fields) works everywhere.
-///
-/// Reasoning tokens share `max_tokens` with the answer; a tight cap yields
-/// mostly thinking followed by a truncated answer, so `max_tokens` is floored
-/// per effort level.
 fn mapEffortToAnthropic(effort: ?Effort, max_tokens: i32) AnthropicReasoning {
     const off: AnthropicReasoning = .{ .thinking = null, .output_config = null, .max_tokens = max_tokens };
-    const Params = struct { wire: []const u8, thinking_headroom: i32 };
-    const p: Params = switch (effort orelse return off) {
+    const wire: []const u8 = switch (effort orelse return off) {
         .none => return off,
-        .minimal, .low => .{ .wire = "low", .thinking_headroom = 1024 },
-        .medium => .{ .wire = "medium", .thinking_headroom = 4096 },
-        .high => .{ .wire = "high", .thinking_headroom = 16384 },
-        .xhigh => .{ .wire = "xhigh", .thinking_headroom = 32768 },
+        .minimal, .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "xhigh",
     };
     return .{
         .thinking = .{ .type = "adaptive" },
-        .output_config = .{ .effort = p.wire },
-        .max_tokens = @max(max_tokens, p.thinking_headroom +| 4096),
+        .output_config = .{ .effort = wire },
+        .max_tokens = floorMaxTokens(effort, max_tokens),
     };
 }
 
@@ -2683,6 +2708,25 @@ test "generateContentStream: generic body is analyzed for every backend" {
         var client: Client = undefined;
         try client.generateContentStream("model", &.{}, .{}, {}, &Cb.onDelta);
     }
+}
+
+test "floorMaxTokens: a tight cap gets reasoning headroom, a generous one is left alone" {
+    const cases = .{
+        .{ .effort = @as(?Effort, .low), .in = @as(i32, 256), .want = @as(i32, 5120) },
+        .{ .effort = @as(?Effort, .medium), .in = @as(i32, 256), .want = @as(i32, 8192) },
+        .{ .effort = @as(?Effort, .high), .in = @as(i32, 256), .want = @as(i32, 20480) },
+        .{ .effort = @as(?Effort, .xhigh), .in = @as(i32, 256), .want = @as(i32, 36864) },
+        .{ .effort = @as(?Effort, .medium), .in = @as(i32, 64000), .want = @as(i32, 64000) },
+        .{ .effort = @as(?Effort, .none), .in = @as(i32, 256), .want = @as(i32, 256) },
+        .{ .effort = @as(?Effort, null), .in = @as(i32, 256), .want = @as(i32, 256) },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(c.want, floorMaxTokens(c.effort, c.in));
+}
+
+test "flooredConfig: null max_tokens stays the provider default" {
+    // Pinning it to the floor would *lower* the budget where the default is larger.
+    try std.testing.expectEqual(@as(?i32, null), flooredConfig(.{ .effort = .high }).max_tokens);
+    try std.testing.expectEqual(@as(?i32, 20480), flooredConfig(.{ .effort = .high, .max_tokens = 256 }).max_tokens);
 }
 
 test "mapEffortToAnthropic: null and none omit thinking and leave max_tokens alone" {

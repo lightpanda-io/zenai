@@ -71,7 +71,7 @@ pub const Response = http.Response;
 pub const ApiError = error{MissingAppTitle} || http.FetchError;
 
 pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error.set(self.allocator, status_code, body);
+    self.last_error.setLogged(self.allocator, status_code, body, "Keenable");
 }
 
 /// `/v1/search` keyed, `/v1/search/public` keyless.
