@@ -73,6 +73,14 @@ pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
     self.last_error.set(self.allocator, status_code, body);
 }
 
+/// Caller frees `[0].value`.
+fn authHeader(self: *Client) std.mem.Allocator.Error![1]std.http.Header {
+    return .{.{
+        .name = "Authorization",
+        .value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key}),
+    }};
+}
+
 /// Ask Jev one or more typed questions about `state`. Each entry's `key` is an
 /// id you choose, and the matching answer comes back under that same id
 /// (`response.value.answer(id)`).
@@ -101,13 +109,10 @@ pub fn ask(
     request.state = state;
     request.questions = .init(questions);
 
-    const auth = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key});
-    defer self.allocator.free(auth);
-    const extra_headers = [_]std.http.Header{
-        .{ .name = "Authorization", .value = auth },
-    };
+    const auth = try self.authHeader();
+    defer self.allocator.free(auth[0].value);
 
-    return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, &extra_headers, request, AskResponse, self);
+    return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, &auth, request, AskResponse, self);
 }
 
 /// List the model names and aliases this key may send in `AskOptions.model`.
@@ -118,16 +123,13 @@ pub fn listModels(self: *Client) ApiError!Response(ListModelsResponse) {
     const url = try std.fmt.allocPrint(self.allocator, "{s}/v1/models", .{self.base_url});
     defer self.allocator.free(url);
 
-    const auth = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key});
-    defer self.allocator.free(auth);
-    const extra_headers = [_]std.http.Header{
-        .{ .name = "Authorization", .value = auth },
-    };
+    const auth = try self.authHeader();
+    defer self.allocator.free(auth[0].value);
 
     return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
         .location = .{ .url = url },
         .method = .GET,
-        .extra_headers = &extra_headers,
+        .extra_headers = &auth,
     }, ListModelsResponse, self);
 }
 

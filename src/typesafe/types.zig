@@ -18,11 +18,6 @@ pub const StringMap = jsonutil.StringMap;
 /// work; `Client.listModels` enumerates them.
 pub const default_model = "jev-latest";
 
-/// Jev's context budget: 64k tokens per request, of which `state` plus the
-/// single longest question must fit in 32k. Overruns come back as HTTP 422.
-pub const max_context_tokens = 64_000;
-pub const max_state_tokens = 32_000;
-
 /// A field the API accepts as a string, an object, or an array — `state`,
 /// `instructions`, and every criteria description.
 ///
@@ -190,8 +185,8 @@ pub const ScoreAnswer = struct {
     confidence: f64 = 0,
 };
 
-/// One answer, discriminated by the wire's `"type"`. Every slice borrows the
-/// owning `Response`.
+/// One answer, discriminated by the wire's `"type"`. Parse-only: nothing here
+/// is ever sent. Every slice borrows the owning `Response`.
 pub const Answer = union(enum) {
     noul: NoulAnswer,
     choice: ChoiceAnswer,
@@ -235,10 +230,6 @@ pub const Answer = union(enum) {
             }
         }
         return error.UnknownField;
-    }
-
-    pub fn jsonStringify(self: Answer, jw: *std.json.Stringify) !void {
-        return writeTagged(self, jw);
     }
 
     /// The `noul` probability, or null for another answer type.
@@ -332,24 +323,24 @@ pub const ChoiceError = error{
 pub const probability_sum_tolerance = 0.02;
 
 /// Reject a `choice` answer that strayed outside the option set it was given,
-/// before anything acts on it. `offered` is the exact criteria list sent for
-/// that question: the choice must be one of them, `probabilities` must cover
-/// exactly that set with finite values in [0,1] summing to 1 (within
+/// before anything acts on it. Pass the same `criteria` the question carried:
+/// the choice must be one of them, `probabilities` must cover exactly that set
+/// with finite values in [0,1] summing to 1 (within
 /// `probability_sum_tolerance`), and the chosen option must be the argmax —
 /// `>=`, so ties are accepted.
-pub fn validateChoice(answer: Answer, offered: []const []const u8) ChoiceError!void {
+pub fn validateChoice(answer: Answer, offered: ChoiceCriteria) ChoiceError!void {
     const a = switch (answer) {
         .choice => |c| c,
         else => return error.NotAChoice,
     };
-    if (indexOfString(offered, a.choice) == null) return error.ChoiceNotOffered;
-    if (a.probabilities.count() != offered.len) return error.ProbabilityKeyMismatch;
+    if (!offered.has(a.choice)) return error.ChoiceNotOffered;
+    if (a.probabilities.count() != offered.count()) return error.ProbabilityKeyMismatch;
 
     var sum: f64 = 0;
     var chosen: f64 = 0;
     var max: f64 = 0;
     for (a.probabilities.entries) |entry| {
-        if (indexOfString(offered, entry.key) == null) return error.ProbabilityKeyMismatch;
+        if (!offered.has(entry.key)) return error.ProbabilityKeyMismatch;
         if (!std.math.isFinite(entry.value)) return error.ProbabilityNotFinite;
         if (entry.value < 0 or entry.value > 1) return error.ProbabilityOutOfRange;
         sum += entry.value;
@@ -361,13 +352,6 @@ pub fn validateChoice(answer: Answer, offered: []const []const u8) ChoiceError!v
 }
 
 // --- Internal ---
-
-fn indexOfString(haystack: []const []const u8, needle: []const u8) ?usize {
-    for (haystack, 0..) |candidate, i| {
-        if (std.mem.eql(u8, candidate, needle)) return i;
-    }
-    return null;
-}
 
 /// Emit a tagged union as one flat object: the active tag under `"type"`, then
 /// the payload struct's own fields, honouring `emit_null_optional_fields` the
@@ -486,7 +470,7 @@ test "AskOptions passes a structured state through untouched" {
 }
 
 test "validateChoice accepts a well-formed answer" {
-    const offered = [_][]const u8{ "a", "b", "c" };
+    const offered = choices(&.{ "a", "b", "c" });
     const answer: Answer = .{ .choice = .{
         .choice = "b",
         .probabilities = .init(&.{
@@ -496,11 +480,11 @@ test "validateChoice accepts a well-formed answer" {
         }),
         .confidence = 0.6,
     } };
-    try validateChoice(answer, &offered);
+    try validateChoice(answer, offered);
 }
 
 test "validateChoice rejects every way an answer can stray" {
-    const offered = [_][]const u8{ "a", "b" };
+    const offered = choices(&.{ "a", "b" });
     const cases = [_]struct { expected: ChoiceError, answer: Answer }{
         .{
             .expected = error.NotAChoice,
@@ -558,17 +542,17 @@ test "validateChoice rejects every way an answer can stray" {
         },
     };
     for (cases) |case| {
-        try std.testing.expectError(case.expected, validateChoice(case.answer, &offered));
+        try std.testing.expectError(case.expected, validateChoice(case.answer, offered));
     }
 }
 
 test "validateChoice accepts a tie on the chosen option" {
-    const offered = [_][]const u8{ "a", "b" };
+    const offered = choices(&.{ "a", "b" });
     const answer: Answer = .{ .choice = .{ .choice = "a", .probabilities = .init(&.{
         .{ .key = "a", .value = 0.5 },
         .{ .key = "b", .value = 0.5 },
     }) } };
-    try validateChoice(answer, &offered);
+    try validateChoice(answer, offered);
 }
 
 test "choices and choiceText build the README's question list" {

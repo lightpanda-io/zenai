@@ -101,6 +101,13 @@ pub fn StringMap(comptime V: type) type {
             return self.entries.len;
         }
 
+        pub fn has(self: Self, key: []const u8) bool {
+            for (self.entries) |entry| {
+                if (std.mem.eql(u8, entry.key, key)) return true;
+            }
+            return false;
+        }
+
         pub fn jsonParse(
             allocator: std.mem.Allocator,
             source: anytype,
@@ -159,6 +166,27 @@ pub fn StringMap(comptime V: type) type {
             try jw.endObject();
         }
     };
+}
+
+/// Write a struct's fields into an already-open JSON object, honouring
+/// `emit_null_optional_fields` the way std does for a plain struct. For hooks
+/// that emit something around a struct and cannot delegate to `jws.write`.
+pub fn writeStructFields(payload: anytype, jw: *std.json.Stringify) !void {
+    inline for (@typeInfo(@TypeOf(payload)).@"struct".fields) |field| {
+        const value = @field(payload, field.name);
+        if (comptime @typeInfo(field.type) == .optional) {
+            if (value) |unwrapped| {
+                try jw.objectField(field.name);
+                try jw.write(unwrapped);
+            } else if (jw.options.emit_null_optional_fields) {
+                try jw.objectField(field.name);
+                try jw.write(null);
+            }
+        } else {
+            try jw.objectField(field.name);
+            try jw.write(value);
+        }
+    }
 }
 
 /// Deep-copy a `std.json.Value`, duplicating all owned strings and containers.
