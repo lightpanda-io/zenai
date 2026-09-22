@@ -54,7 +54,7 @@ pub const Response = http.Response;
 pub const ApiError = error{MissingApiKey} || http.FetchError;
 
 pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error.set(self.allocator, status_code, body);
+    self.last_error.setLogged(self.allocator, status_code, body, "Tavily");
 }
 
 /// Run a search. Caller owns the returned `Response` and must call `deinit()`.
