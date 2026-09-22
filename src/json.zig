@@ -66,6 +66,101 @@ pub fn PayloadUnionMethods(comptime U: type) type {
     };
 }
 
+/// A JSON object whose keys are chosen at runtime rather than declared as
+/// struct fields — TypeSafe's `questions`/`answers`, Gemini's schema
+/// `properties`. Zig's std has no `json.ArrayHashMap`, so the entries are kept
+/// as an ordered slice; wire order survives both parse and stringify, and
+/// lookup is a linear scan (these maps are small).
+///
+/// Parsed keys and values borrow the parse arena and the response body, so the
+/// owning `Parsed`/`Response` must outlive the map.
+pub fn StringMap(comptime V: type) type {
+    return struct {
+        entries: []const Entry = &.{},
+
+        pub const Entry = struct {
+            key: []const u8,
+            value: V,
+        };
+
+        const Self = @This();
+
+        pub fn init(entries: []const Entry) Self {
+            return .{ .entries = entries };
+        }
+
+        /// The first value stored under `key`, or null.
+        pub fn get(self: Self, key: []const u8) ?V {
+            for (self.entries) |entry| {
+                if (std.mem.eql(u8, entry.key, key)) return entry.value;
+            }
+            return null;
+        }
+
+        pub fn count(self: Self) usize {
+            return self.entries.len;
+        }
+
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) std.json.ParseError(@TypeOf(source.*))!Self {
+            if (.object_begin != try source.next()) return error.UnexpectedToken;
+
+            var list: std.ArrayList(Entry) = .empty;
+            while (true) {
+                // Unlike std's struct parser the key is kept, not freed: it is
+                // the entry's own data.
+                const name_token = try source.nextAllocMax(allocator, options.allocate.?, options.max_value_len.?);
+                const key = switch (name_token) {
+                    inline .string, .allocated_string => |slice| slice,
+                    .object_end => break,
+                    else => return error.UnexpectedToken,
+                };
+                try list.append(allocator, .{
+                    .key = key,
+                    .value = try std.json.innerParse(V, allocator, source, options),
+                });
+            }
+            return .{ .entries = try list.toOwnedSlice(allocator) };
+        }
+
+        /// Needed alongside `jsonParse`: a containing type whose own `jsonParse`
+        /// buffers into a `std.json.Value` first reaches this map through the
+        /// value path instead of the token path.
+        pub fn jsonParseFromValue(
+            allocator: std.mem.Allocator,
+            source: std.json.Value,
+            options: std.json.ParseOptions,
+        ) std.json.ParseFromValueError!Self {
+            const object = switch (source) {
+                .object => |o| o,
+                else => return error.UnexpectedToken,
+            };
+            const entries = try allocator.alloc(Entry, object.count());
+            var i: usize = 0;
+            var it = object.iterator();
+            while (it.next()) |kv| : (i += 1) {
+                entries[i] = .{
+                    .key = kv.key_ptr.*,
+                    .value = try std.json.innerParseFromValue(V, allocator, kv.value_ptr.*, options),
+                };
+            }
+            return .{ .entries = entries };
+        }
+
+        pub fn jsonStringify(self: Self, jw: *std.json.Stringify) !void {
+            try jw.beginObject();
+            for (self.entries) |entry| {
+                try jw.objectField(entry.key);
+                try jw.write(entry.value);
+            }
+            try jw.endObject();
+        }
+    };
+}
+
 /// Deep-copy a `std.json.Value`, duplicating all owned strings and containers.
 pub fn dupeValue(a: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.Error!std.json.Value {
     return switch (value) {
@@ -102,4 +197,36 @@ pub fn stringifyAlloc(allocator: std.mem.Allocator, value: anytype, options: std
 /// Serialize a `std.json.Value` to a JSON string, allocated with `a`.
 pub fn valueToString(a: std.mem.Allocator, val: std.json.Value) std.mem.Allocator.Error![]const u8 {
     return stringifyAlloc(a, val, .{});
+}
+
+test "StringMap parses an object with dynamic keys" {
+    const parsed = try std.json.parseFromSlice(StringMap(f64), std.testing.allocator,
+        \\{"billing":0.88,"delivery":0.1,"other":0}
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.count());
+    try std.testing.expectEqualStrings("billing", parsed.value.entries[0].key);
+    try std.testing.expectEqual(@as(?f64, 0.88), parsed.value.get("billing"));
+    // An integer token still lands in an f64 value.
+    try std.testing.expectEqual(@as(?f64, 0), parsed.value.get("other"));
+    try std.testing.expectEqual(@as(?f64, null), parsed.value.get("absent"));
+}
+
+test "StringMap parses an empty object" {
+    const parsed = try std.json.parseFromSlice(StringMap(f64), std.testing.allocator, "{}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.count());
+}
+
+test "StringMap stringifies entries in order" {
+    const map: StringMap([]const u8) = .init(&.{
+        .{ .key = "0", .value = "Calm" },
+        .{ .key = "1", .value = "Furious" },
+    });
+    const out = try stringifyAlloc(std.testing.allocator, map, .{});
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(
+        \\{"0":"Calm","1":"Furious"}
+    , out);
 }
