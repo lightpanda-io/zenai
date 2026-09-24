@@ -378,23 +378,7 @@ fn writeTagged(value: anytype, jw: *std.json.Stringify) !void {
     try jw.objectField("type");
     try jw.write(@tagName(value));
     switch (value) {
-        inline else => |payload| {
-            inline for (@typeInfo(@TypeOf(payload)).@"struct".fields) |field| {
-                const field_value = @field(payload, field.name);
-                if (comptime @typeInfo(field.type) == .optional) {
-                    if (field_value) |unwrapped| {
-                        try jw.objectField(field.name);
-                        try jw.write(unwrapped);
-                    } else if (jw.options.emit_null_optional_fields) {
-                        try jw.objectField(field.name);
-                        try jw.write(null);
-                    }
-                } else {
-                    try jw.objectField(field.name);
-                    try jw.write(field_value);
-                }
-            }
-        },
+        inline else => |payload| try jsonutil.writeStructFields(payload, jw),
     }
     try jw.endObject();
 }

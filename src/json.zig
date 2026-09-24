@@ -68,8 +68,13 @@ pub fn PayloadUnionMethods(comptime U: type) type {
 
 /// A JSON object whose keys are chosen at runtime rather than declared as
 /// struct fields — TypeSafe's `questions`/`answers`, Gemini's schema
-/// `properties`. Zig's std has no `json.ArrayHashMap`, so the entries are kept
-/// as an ordered slice; wire order survives both parse and stringify, and
+/// `properties`.
+///
+/// Deliberately not `std.json.ArrayHashMap`, which wraps
+/// `StringArrayHashMapUnmanaged` and so needs an allocator to build: the
+/// request side of these maps is written as a literal (`.init(&.{ ... })`),
+/// sometimes at comptime, where there is no allocator to hand. Entries are an
+/// ordered slice instead; wire order survives both parse and stringify, and
 /// lookup is a linear scan (these maps are small).
 ///
 /// Parsed keys and values borrow the parse arena and the response body, so the
@@ -101,11 +106,8 @@ pub fn StringMap(comptime V: type) type {
             return self.entries.len;
         }
 
-        pub fn has(self: Self, key: []const u8) bool {
-            for (self.entries) |entry| {
-                if (std.mem.eql(u8, entry.key, key)) return true;
-            }
-            return false;
+        pub fn has(self: @This(), key: []const u8) bool {
+            return self.get(key) != null;
         }
 
         pub fn jsonParse(
