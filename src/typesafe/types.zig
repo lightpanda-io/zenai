@@ -51,14 +51,6 @@ pub const Content = union(enum) {
             else => .{ .json = source },
         };
     }
-
-    /// The `.text` payload, or null for a structured value.
-    pub fn asText(self: Content) ?[]const u8 {
-        return switch (self) {
-            .text => |s| s,
-            .json => null,
-        };
-    }
 };
 
 // --- Questions ---
@@ -248,14 +240,6 @@ pub const Answer = union(enum) {
         };
     }
 
-    /// The score, or null for another answer type.
-    pub fn scoreValue(self: Answer) ?f64 {
-        return switch (self) {
-            .score => |a| a.score,
-            else => null,
-        };
-    }
-
     /// `noul` answers carry no confidence.
     pub fn confidence(self: Answer) ?f64 {
         return switch (self) {
@@ -416,7 +400,7 @@ test "AskResponse parses a System One fixture" {
     switch (anger) {
         .score => |s| {
             try std.testing.expectApproxEqAbs(@as(f64, 1.05), s.score, 1e-12);
-            try std.testing.expectEqualStrings("Annoyed", s.legend.get("1").?.asText().?);
+            try std.testing.expectEqualStrings("Annoyed", s.legend.get("1").?.text);
             // An integer token still lands in an f64 probability.
             try std.testing.expectEqual(@as(?f64, 0), s.probabilities.get("0"));
         },
