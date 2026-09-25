@@ -2653,8 +2653,11 @@ fn flooredConfig(config: GenerationConfig) GenerationConfig {
 /// `.none` (omit both fields) works everywhere.
 fn mapEffortToAnthropic(effort: ?Effort, max_tokens: i32) AnthropicReasoning {
     const off: AnthropicReasoning = .{ .thinking = null, .output_config = null, .max_tokens = max_tokens };
+    // Omitting `thinking` runs adaptive thinking on Sonnet 5 / Opus 5, so an
+    // explicit `.none` must say so; models that can't disable it return a 400.
+    const disabled: AnthropicReasoning = .{ .thinking = .{ .type = "disabled" }, .output_config = null, .max_tokens = max_tokens };
     const wire: []const u8 = switch (effort orelse return off) {
-        .none => return off,
+        .none => return disabled,
         .minimal, .low => "low",
         .medium => "medium",
         .high => "high",
@@ -2729,13 +2732,16 @@ test "flooredConfig: null max_tokens stays the provider default" {
     try std.testing.expectEqual(@as(?i32, 20480), flooredConfig(.{ .effort = .high, .max_tokens = 256 }).max_tokens);
 }
 
-test "mapEffortToAnthropic: null and none omit thinking and leave max_tokens alone" {
-    for ([_]?Effort{ null, .none }) |effort| {
-        const off = mapEffortToAnthropic(effort, 4096);
-        try std.testing.expect(off.thinking == null);
-        try std.testing.expect(off.output_config == null);
-        try std.testing.expectEqual(@as(i32, 4096), off.max_tokens);
-    }
+test "mapEffortToAnthropic: null omits thinking, none disables it" {
+    const off = mapEffortToAnthropic(null, 4096);
+    try std.testing.expect(off.thinking == null);
+    try std.testing.expect(off.output_config == null);
+    try std.testing.expectEqual(@as(i32, 4096), off.max_tokens);
+
+    const none = mapEffortToAnthropic(.none, 4096);
+    try std.testing.expectEqualStrings("disabled", none.thinking.?.type);
+    try std.testing.expect(none.output_config == null);
+    try std.testing.expectEqual(@as(i32, 4096), none.max_tokens);
 }
 
 test "mapEffortToAnthropic pairs adaptive thinking with effort and headroom" {
