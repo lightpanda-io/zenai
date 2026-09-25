@@ -33,6 +33,8 @@ http_client: std.http.Client,
 retry_policy: RetryPolicy,
 request_timeout_ms: ?u32,
 last_error: http.ErrorDetail = .{},
+/// Set by the host so a SIGINT can abort an in-flight request mid-read.
+interrupt: ?*http.Interrupt = null,
 
 /// TypeSafe's own endpoint. A caller routing through something that serves the
 /// same protocol — Vercel AI Gateway does, at `/typesafe` — overrides it.
