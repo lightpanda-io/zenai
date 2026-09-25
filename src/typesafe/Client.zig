@@ -1,15 +1,8 @@
 //! TypeSafe System One API client. https://docs.typesafe.ai
 //!
-//! System One serves Jev, a judgement model rather than a chat model: post the
-//! `state` under judgement plus a map of typed questions about it and get one
-//! typed answer per question back — a probability (`noul`), a labelled
-//! `choice` with per-option probabilities, or a `score` on an ordered scale.
-//! There is no free-text completion and no tool calling, which is why this
-//! client stays out of `provider.Client`.
-//!
-//! Jev ingests the `state` once and evaluates every question against it in
-//! parallel, so packing several questions — including speculative ones the
-//! caller may discard — into one request costs far less than one call each.
+//! Post a `state` plus a map of typed questions about it; get one typed answer
+//! per question. The state is ingested once, so batching several questions
+//! into one request is much cheaper than one call each.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -19,6 +12,7 @@ const retry = @import("../retry.zig");
 pub const RetryPolicy = retry.RetryPolicy;
 
 const AskOptions = types.AskOptions;
+const AskRequest = types.AskRequest;
 const AskResponse = types.AskResponse;
 const Content = types.Content;
 const ListModelsResponse = types.ListModelsResponse;
@@ -33,11 +27,12 @@ http_client: std.http.Client,
 retry_policy: RetryPolicy,
 request_timeout_ms: ?u32,
 last_error: http.ErrorDetail = .{},
+/// `Bearer <api_key>`, built on first use.
+authorization: ?[]const u8 = null,
 /// Set by the host so a SIGINT can abort an in-flight request mid-read.
 interrupt: ?*http.Interrupt = null,
 
-/// TypeSafe's own endpoint. A caller routing through something that serves the
-/// same protocol — Vercel AI Gateway does, at `/typesafe` — overrides it.
+/// Override to reach the same protocol elsewhere (see `channels`).
 pub const default_base_url = "https://api.typesafe.ai";
 
 pub const InitOptions = struct {
@@ -65,6 +60,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
 pub fn deinit(self: *Client) void {
     self.http_client.deinit();
     self.last_error.deinit(self.allocator);
+    if (self.authorization) |a| self.allocator.free(a);
 }
 
 pub const Response = http.Response;
@@ -75,20 +71,17 @@ pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
     self.last_error.setLogged(self.allocator, status_code, body, "TypeSafe");
 }
 
-/// Caller frees `[0].value`.
 fn authHeader(self: *Client) std.mem.Allocator.Error![1]std.http.Header {
-    return .{.{
-        .name = "Authorization",
-        .value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key}),
-    }};
+    if (self.authorization == null)
+        self.authorization = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key});
+    return .{.{ .name = "Authorization", .value = self.authorization.? }};
 }
 
 /// Ask Jev one or more typed questions about `state`. Each entry's `key` is an
 /// id you choose, and the matching answer comes back under that same id
 /// (`response.value.answer(id)`).
 ///
-/// A `choice` answer is only safe to act on once `types.validateChoice` has
-/// confirmed it stayed inside the option set it was given.
+/// Validate a `choice` with `AskResponse.choice` before acting on it.
 ///
 /// 401 (bad key) and 422 (malformed question, or a state over the 32k budget)
 /// surface as `error.ApiError` with the detail in `last_error`; 429 and 529
@@ -107,12 +100,8 @@ pub fn ask(
     const url = try std.fmt.allocPrint(self.allocator, "{s}/v1/systemone", .{self.base_url});
     defer self.allocator.free(url);
 
-    var request = options;
-    request.state = state;
-    request.questions = .init(questions);
-
+    const request: AskRequest = .{ .state = state, .model = options.model, .questions = .init(questions) };
     const auth = try self.authHeader();
-    defer self.allocator.free(auth[0].value);
 
     return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, &auth, request, AskResponse, self);
 }
@@ -126,8 +115,6 @@ pub fn listModels(self: *Client) ApiError!Response(ListModelsResponse) {
     defer self.allocator.free(url);
 
     const auth = try self.authHeader();
-    defer self.allocator.free(auth[0].value);
-
     return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
         .location = .{ .url = url },
         .method = .GET,

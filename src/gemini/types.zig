@@ -352,8 +352,7 @@ pub const Content = struct {
 /// A key-value pair for defining object properties in a `Schema`.
 pub const Property = Properties.Entry;
 
-/// Property name -> schema. An object with runtime keys, which is why
-/// `Schema` cannot use std's default struct serialization.
+/// Property name -> schema, serialized as a JSON object.
 pub const Properties = jsonutil.StringMap(Schema);
 
 /// Defines the format of input/output data. Represents a subset of an
@@ -392,14 +391,6 @@ pub const Schema = struct {
     maxLength: ?i64 = null,
     /// Regex pattern that a string must match.
     pattern: ?[]const u8 = null,
-
-    /// std has no way to emit `properties` as an object, so the whole struct
-    /// is written by hand; `StringMap` handles the `properties` field itself.
-    pub fn jsonStringify(self: *const Schema, jw: *std.json.Stringify) !void {
-        try jw.beginObject();
-        try jsonutil.writeStructFields(self.*, jw);
-        try jw.endObject();
-    }
 };
 
 // --- Safety ---

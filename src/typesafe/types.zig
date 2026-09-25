@@ -12,7 +12,7 @@ const std = @import("std");
 const jsonutil = @import("../json.zig");
 
 /// A JSON object with runtime keys; see `json.StringMap`.
-pub const StringMap = jsonutil.StringMap;
+const StringMap = jsonutil.StringMap;
 
 /// The flagship alias. Concrete versions (`jev-1.13.0`) and `jev-preview` also
 /// work; `Client.listModels` enumerates them.
@@ -21,9 +21,7 @@ pub const default_model = "jev-latest";
 /// A field the API accepts as a string, an object, or an array — `state`,
 /// `instructions`, and every criteria description.
 ///
-/// `.text` covers the common case without dragging callers through
-/// `std.json.Value`; `.json` passes structured input straight through,
-/// borrowed rather than copied, so it must outlive the request.
+/// `.json` is borrowed, not copied, so it must outlive the request.
 pub const Content = union(enum) {
     text: []const u8,
     json: std.json.Value,
@@ -38,17 +36,6 @@ pub const Content = union(enum) {
         return switch (try source.peekNextTokenType()) {
             .string => .{ .text = try std.json.innerParse([]const u8, allocator, source, options) },
             else => .{ .json = try std.json.innerParse(std.json.Value, allocator, source, options) },
-        };
-    }
-
-    pub fn jsonParseFromValue(
-        _: std.mem.Allocator,
-        source: std.json.Value,
-        _: std.json.ParseOptions,
-    ) std.json.ParseFromValueError!Content {
-        return switch (source) {
-            .string => |s| .{ .text = s },
-            else => .{ .json = source },
         };
     }
 };
@@ -85,9 +72,8 @@ pub const ScoreQuestion = struct {
     criteria: ScoreCriteria,
 };
 
-/// One question. Serializes flat — `{"type": <tag>, "instructions": …,
-/// "criteria": …}` — with a separate payload per type, so a `choice` without
-/// criteria or a `score` with a criteria map cannot be built.
+/// One question. Serializes flat: `{"type": <tag>, "instructions": …,
+/// "criteria": …}`.
 pub const Question = union(enum) {
     noul: NoulQuestion,
     choice: ChoiceQuestion,
@@ -139,12 +125,15 @@ pub fn choices(comptime names: []const []const u8) ChoiceCriteria {
     }.value);
 }
 
-/// Doubles as the request body: `Client.ask` fills in `state` and `questions`.
-/// Declaration order is wire order.
 pub const AskOptions = struct {
-    state: Content = .{ .text = "" },
     model: []const u8 = default_model,
-    questions: Questions = .{},
+};
+
+/// The request body `Client.ask` sends. Declaration order is wire order.
+pub const AskRequest = struct {
+    state: Content,
+    model: []const u8 = default_model,
+    questions: Questions,
 };
 
 // --- Answers ---
@@ -152,8 +141,7 @@ pub const AskOptions = struct {
 /// Option id (`choice`) or level index (`score`) -> probability. Sums to ~1.
 pub const Probabilities = StringMap(f64);
 
-/// Level index -> the level's description, echoed back from the question's
-/// criteria — `Content`, because a level may have been an object or array.
+/// Level index -> the level's description, echoed from the question's criteria.
 pub const Legend = StringMap(Content);
 
 pub const NoulAnswer = struct {
@@ -177,65 +165,45 @@ pub const ScoreAnswer = struct {
     confidence: f64 = 0,
 };
 
-/// One answer, discriminated by the wire's `"type"`. Parse-only: nothing here
-/// is ever sent. Every slice borrows the owning `Response`.
+/// One answer, discriminated by the wire's `"type"`. Every slice borrows the
+/// owning `Response`.
 pub const Answer = union(enum) {
     noul: NoulAnswer,
     choice: ChoiceAnswer,
     score: ScoreAnswer,
 
-    /// Buffers the object into a `std.json.Value` first: `"type"` may arrive in
-    /// any position and a JSON scanner cannot rewind.
+    /// Every field any answer type carries, so one pass parses the object
+    /// whatever position `"type"` arrives in.
+    const Wire = struct {
+        type: std.meta.Tag(Answer),
+        noul: f64 = 0,
+        choice: []const u8 = "",
+        score: f64 = 0,
+        legend: Legend = .{},
+        probabilities: Probabilities = .{},
+        confidence: f64 = 0,
+    };
+
     pub fn jsonParse(
         allocator: std.mem.Allocator,
         source: anytype,
         options: std.json.ParseOptions,
     ) std.json.ParseError(@TypeOf(source.*))!Answer {
-        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
-        return jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(
-        allocator: std.mem.Allocator,
-        source: std.json.Value,
-        options: std.json.ParseOptions,
-    ) std.json.ParseFromValueError!Answer {
-        const object = switch (source) {
-            .object => |o| o,
-            else => return error.UnexpectedToken,
+        // The API may add fields, so unknown keys are always ignored here.
+        var wire_options = options;
+        wire_options.ignore_unknown_fields = true;
+        const w = try std.json.innerParse(Wire, allocator, source, wire_options);
+        return switch (w.type) {
+            .noul => .{ .noul = .{ .noul = w.noul } },
+            .choice => .{ .choice = .{ .choice = w.choice, .probabilities = w.probabilities, .confidence = w.confidence } },
+            .score => .{ .score = .{ .score = w.score, .legend = w.legend, .probabilities = w.probabilities, .confidence = w.confidence } },
         };
-        const tag = switch (object.get("type") orelse return error.MissingField) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        // The payload structs do not model `type` itself, and the API may add
-        // fields, so the discriminated re-parse always ignores unknown keys.
-        var payload_options = options;
-        payload_options.ignore_unknown_fields = true;
-        inline for (@typeInfo(Answer).@"union".fields) |field| {
-            if (std.mem.eql(u8, field.name, tag)) {
-                return @unionInit(
-                    Answer,
-                    field.name,
-                    try std.json.innerParseFromValue(field.type, allocator, source, payload_options),
-                );
-            }
-        }
-        return error.UnknownField;
     }
 
     /// The `noul` probability, or null for another answer type.
     pub fn noulValue(self: Answer) ?f64 {
         return switch (self) {
             .noul => |a| a.noul,
-            else => null,
-        };
-    }
-
-    /// The selected option id, or null for another answer type.
-    pub fn choiceValue(self: Answer) ?[]const u8 {
-        return switch (self) {
-            .choice => |a| a.choice,
             else => null,
         };
     }
@@ -277,10 +245,8 @@ pub const AskResponse = struct {
         return self.answers.get(id);
     }
 
-    /// The `choice` under `id`, checked against the criteria that question was
-    /// sent with. Pass the same `questions` as the request: holding a second
-    /// copy of the option set is how a caller ends up validating an answer
-    /// against a stale one.
+    /// The `choice` under `id`, validated against the criteria in the
+    /// `questions` that were sent.
     pub fn choice(self: AskResponse, id: []const u8, questions: Questions) ChoiceError![]const u8 {
         const question = questions.get(id) orelse return error.QuestionNotAsked;
         const criteria = switch (question) {
@@ -307,9 +273,8 @@ pub const ListModelsResponse = struct {
 
 // --- Validation ---
 
-pub const ChoiceError = error{
-    QuestionNotAsked,
-    AnswerMissing,
+/// Why `validateChoice` rejected an answer.
+pub const ValidateError = error{
     NotAChoice,
     ChoiceNotOffered,
     ProbabilityKeyMismatch,
@@ -319,17 +284,21 @@ pub const ChoiceError = error{
     ChoiceNotArgmax,
 };
 
+/// Why `AskResponse.choice` found no usable choice.
+pub const ChoiceError = ValidateError || error{
+    QuestionNotAsked,
+    AnswerMissing,
+};
+
 /// How far the probabilities may drift from summing to 1 before the answer is
 /// rejected.
 pub const probability_sum_tolerance = 0.02;
 
-/// Reject a `choice` answer that strayed outside the option set it was given,
-/// before anything acts on it. Pass the same `criteria` the question carried:
-/// the choice must be one of them, `probabilities` must cover exactly that set
-/// with finite values in [0,1] summing to 1 (within
-/// `probability_sum_tolerance`), and the chosen option must be the argmax —
-/// `>=`, so ties are accepted.
-pub fn validateChoice(answer: Answer, offered: ChoiceCriteria) ChoiceError!void {
+/// Reject a `choice` answer that strayed outside `offered`: the choice must be
+/// one of them, `probabilities` must cover exactly that set with finite values
+/// in [0,1] summing to 1 (within `probability_sum_tolerance`), and the choice
+/// must be the argmax (ties accepted).
+pub fn validateChoice(answer: Answer, offered: ChoiceCriteria) ValidateError!void {
     const a = switch (answer) {
         .choice => |c| c,
         else => return error.NotAChoice,
@@ -362,7 +331,14 @@ fn writeTagged(value: anytype, jw: *std.json.Stringify) !void {
     try jw.objectField("type");
     try jw.write(@tagName(value));
     switch (value) {
-        inline else => |payload| try jsonutil.writeStructFields(payload, jw),
+        inline else => |payload| inline for (@typeInfo(@TypeOf(payload)).@"struct".fields) |field| {
+            const v = @field(payload, field.name);
+            const skip = if (@typeInfo(field.type) == .optional) v == null and !jw.options.emit_null_optional_fields else false;
+            if (!skip) {
+                try jw.objectField(field.name);
+                try jw.write(v);
+            }
+        },
     }
     try jw.endObject();
 }
@@ -389,10 +365,9 @@ test "AskResponse parses a System One fixture" {
     const complaint = parsed.value.answer("is_complaint").?;
     try std.testing.expectApproxEqAbs(@as(f64, 0.95), complaint.noulValue().?, 1e-12);
     try std.testing.expectEqual(@as(?f64, null), complaint.confidence());
-    try std.testing.expectEqual(@as(?[]const u8, null), complaint.choiceValue());
 
     const topic = parsed.value.answer("topic").?;
-    try std.testing.expectEqualStrings("billing", topic.choiceValue().?);
+    try std.testing.expectEqualStrings("billing", topic.choice.choice);
     try std.testing.expectApproxEqAbs(@as(f64, 0.88), topic.probability("billing").?, 1e-12);
     try std.testing.expectApproxEqAbs(@as(f64, 0.81), topic.confidence().?, 1e-12);
 
@@ -410,8 +385,8 @@ test "AskResponse parses a System One fixture" {
     try std.testing.expect(parsed.value.answer("no_such_question") == null);
 }
 
-test "AskOptions stringifies the System One request body" {
-    const request: AskOptions = .{
+test "AskRequest stringifies the System One request body" {
+    const request: AskRequest = .{
         .state = .{ .text = "The pizza arrived cold." },
         .questions = .init(&.{
             .{ .key = "is_complaint", .value = .noulText("Is the customer complaining?") },
@@ -434,13 +409,13 @@ test "AskOptions stringifies the System One request body" {
     , buf.written());
 }
 
-test "AskOptions passes a structured state through untouched" {
+test "AskRequest passes a structured state through untouched" {
     const doc = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"ticket":{"id":7,"lines":["cold","late"]}}
     , .{});
     defer doc.deinit();
 
-    const request: AskOptions = .{
+    const request: AskRequest = .{
         .state = .{ .json = doc.value },
         .questions = .init(&.{
             .{ .key = "complaint", .value = .noulText("Is this a complaint?") },
@@ -470,7 +445,7 @@ test "validateChoice accepts a well-formed answer" {
 
 test "validateChoice rejects every way an answer can stray" {
     const offered = choices(&.{ "a", "b" });
-    const cases = [_]struct { expected: ChoiceError, answer: Answer }{
+    const cases = [_]struct { expected: ValidateError, answer: Answer }{
         .{
             .expected = error.NotAChoice,
             .answer = .{ .noul = .{ .noul = 0.5 } },
@@ -552,7 +527,7 @@ test "choices and choiceText build the README's question list" {
             levels(&.{ "Calm", "Annoyed", "Furious" }),
         ) },
     };
-    const request: AskOptions = .{
+    const request: AskRequest = .{
         .state = .{ .text = "The pizza arrived cold." },
         .questions = .init(&questions),
     };
@@ -581,7 +556,6 @@ test "choice: validated against the criteria the question carried" {
     }) };
 
     try std.testing.expectEqualStrings("b", try response.choice("route", questions));
-    // Each failure names itself rather than collapsing into one error.
     try std.testing.expectError(error.QuestionNotAsked, response.choice("strayed", questions));
     try std.testing.expectError(error.NotAChoice, response.choice("urgent", questions));
     try std.testing.expectError(error.AnswerMissing, response.choice("missing", .init(&.{

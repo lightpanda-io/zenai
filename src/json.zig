@@ -66,19 +66,11 @@ pub fn PayloadUnionMethods(comptime U: type) type {
     };
 }
 
-/// A JSON object whose keys are chosen at runtime rather than declared as
-/// struct fields — TypeSafe's `questions`/`answers`, Gemini's schema
-/// `properties`.
+/// A JSON object with runtime keys, stored as an ordered slice so it can be
+/// built as a literal without an allocator (unlike `std.json.ArrayHashMap`).
+/// Wire order is preserved; lookup is a linear scan.
 ///
-/// Deliberately not `std.json.ArrayHashMap`, which wraps
-/// `StringArrayHashMapUnmanaged` and so needs an allocator to build: the
-/// request side of these maps is written as a literal (`.init(&.{ ... })`),
-/// sometimes at comptime, where there is no allocator to hand. Entries are an
-/// ordered slice instead; wire order survives both parse and stringify, and
-/// lookup is a linear scan (these maps are small).
-///
-/// Parsed keys and values borrow the parse arena and the response body, so the
-/// owning `Parsed`/`Response` must outlive the map.
+/// Parsed entries borrow the owning `Parsed`/`Response`.
 pub fn StringMap(comptime V: type) type {
     return struct {
         entries: []const Entry = &.{},
@@ -106,7 +98,7 @@ pub fn StringMap(comptime V: type) type {
             return self.entries.len;
         }
 
-        pub fn has(self: @This(), key: []const u8) bool {
+        pub fn has(self: Self, key: []const u8) bool {
             return self.get(key) != null;
         }
 
@@ -119,8 +111,6 @@ pub fn StringMap(comptime V: type) type {
 
             var list: std.ArrayList(Entry) = .empty;
             while (true) {
-                // Unlike std's struct parser the key is kept, not freed: it is
-                // the entry's own data.
                 const name_token = try source.nextAllocMax(allocator, options.allocate.?, options.max_value_len.?);
                 const key = switch (name_token) {
                     inline .string, .allocated_string => |slice| slice,
@@ -135,30 +125,6 @@ pub fn StringMap(comptime V: type) type {
             return .{ .entries = try list.toOwnedSlice(allocator) };
         }
 
-        /// Needed alongside `jsonParse`: a containing type whose own `jsonParse`
-        /// buffers into a `std.json.Value` first reaches this map through the
-        /// value path instead of the token path.
-        pub fn jsonParseFromValue(
-            allocator: std.mem.Allocator,
-            source: std.json.Value,
-            options: std.json.ParseOptions,
-        ) std.json.ParseFromValueError!Self {
-            const object = switch (source) {
-                .object => |o| o,
-                else => return error.UnexpectedToken,
-            };
-            const entries = try allocator.alloc(Entry, object.count());
-            var i: usize = 0;
-            var it = object.iterator();
-            while (it.next()) |kv| : (i += 1) {
-                entries[i] = .{
-                    .key = kv.key_ptr.*,
-                    .value = try std.json.innerParseFromValue(V, allocator, kv.value_ptr.*, options),
-                };
-            }
-            return .{ .entries = entries };
-        }
-
         pub fn jsonStringify(self: Self, jw: *std.json.Stringify) !void {
             try jw.beginObject();
             for (self.entries) |entry| {
@@ -168,27 +134,6 @@ pub fn StringMap(comptime V: type) type {
             try jw.endObject();
         }
     };
-}
-
-/// Write a struct's fields into an already-open JSON object, honouring
-/// `emit_null_optional_fields` the way std does for a plain struct. For hooks
-/// that emit something around a struct and cannot delegate to `jws.write`.
-pub fn writeStructFields(payload: anytype, jw: *std.json.Stringify) !void {
-    inline for (@typeInfo(@TypeOf(payload)).@"struct".fields) |field| {
-        const value = @field(payload, field.name);
-        if (comptime @typeInfo(field.type) == .optional) {
-            if (value) |unwrapped| {
-                try jw.objectField(field.name);
-                try jw.write(unwrapped);
-            } else if (jw.options.emit_null_optional_fields) {
-                try jw.objectField(field.name);
-                try jw.write(null);
-            }
-        } else {
-            try jw.objectField(field.name);
-            try jw.write(value);
-        }
-    }
 }
 
 /// Deep-copy a `std.json.Value`, duplicating all owned strings and containers.

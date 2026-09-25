@@ -74,14 +74,11 @@ pub const search = struct {
     };
 };
 
-/// TypeSafe System One — the Jev judgement model. Not a chat model: it answers
-/// typed questions (`noul` / `choice` / `score`) about a state instead of
-/// generating text, so it is deliberately absent from `provider.Client`.
+/// TypeSafe System One — the Jev judgement model. It answers typed questions
+/// rather than generating text, so it is not part of `provider.Client`.
 pub const typesafe = struct {
     pub const Client = @import("typesafe/Client.zig");
     pub const types = @import("typesafe/types.zig");
-    /// Where a request can be sent, and which env var carries the key —
-    /// `provider.openAiPreset`'s counterpart for the judgement side.
     pub const channels = @import("typesafe/channels.zig");
 };
 
