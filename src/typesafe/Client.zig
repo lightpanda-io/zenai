@@ -16,7 +16,7 @@ const AskRequest = types.AskRequest;
 const AskResponse = types.AskResponse;
 const Content = types.Content;
 const ListModelsResponse = types.ListModelsResponse;
-const QuestionEntry = types.QuestionEntry;
+const Questions = types.Questions;
 
 const Client = @This();
 
@@ -77,7 +77,7 @@ fn authHeader(self: *Client) std.mem.Allocator.Error![1]std.http.Header {
     return .{.{ .name = "Authorization", .value = self.authorization.? }};
 }
 
-/// Ask Jev one or more typed questions about `state`. Each entry's `key` is an
+/// Ask Jev one or more typed questions about `state`. Each question's key is an
 /// id you choose, and the matching answer comes back under that same id
 /// (`response.value.answer(id)`).
 ///
@@ -92,7 +92,7 @@ fn authHeader(self: *Client) std.mem.Allocator.Error![1]std.http.Header {
 pub fn ask(
     self: *Client,
     state: Content,
-    questions: []const QuestionEntry,
+    questions: Questions,
     options: AskOptions,
 ) ApiError!Response(AskResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
@@ -100,7 +100,7 @@ pub fn ask(
     const url = try std.fmt.allocPrint(self.allocator, "{s}/v1/systemone", .{self.base_url});
     defer self.allocator.free(url);
 
-    const request: AskRequest = .{ .state = state, .model = options.model, .questions = .init(questions) };
+    const request: AskRequest = .{ .state = state, .model = options.model, .questions = questions };
     const auth = try self.authHeader();
 
     return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, &auth, request, AskResponse, self);
@@ -127,7 +127,7 @@ test "ask rejects empty api key" {
     defer client.deinit();
     try std.testing.expectError(error.MissingApiKey, client.ask(
         .{ .text = "anything" },
-        &.{.{ .key = "q", .value = .noulText("Is this a complaint?") }},
+        .init(&.{.{ .key = "q", .value = .noulText("Is this a complaint?") }}),
         .{},
     ));
 }

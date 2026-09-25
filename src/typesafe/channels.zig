@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const Client = @import("Client.zig");
+const provider = @import("../provider.zig");
 const types = @import("types.zig");
 
 pub const Channel = struct {
@@ -22,13 +23,13 @@ pub const all = [_]Channel{
     },
     .{
         .name = "vercel",
-        .api_key_env = "AI_GATEWAY_API_KEY",
+        .api_key_env = provider.vercel_api_key_env,
         .base_url = "https://ai-gateway.vercel.sh/typesafe",
         .model = "typesafe-ai/jev",
     },
 };
 
-pub const api_keys_hint = "TYPESAFE_API_KEY, or AI_GATEWAY_API_KEY to reach Jev through Vercel AI Gateway";
+pub const api_keys_hint = all[0].api_key_env ++ ", or " ++ all[1].api_key_env ++ " to reach Jev through Vercel AI Gateway";
 
 pub const Credential = struct {
     channel: Channel,
@@ -50,10 +51,6 @@ test "the documented base URLs, in precedence order" {
     try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/typesafe", all[1].base_url);
     try std.testing.expectEqualStrings("jev-latest", all[0].model);
     try std.testing.expectEqualStrings("typesafe-ai/jev", all[1].model);
-
-    for (all) |channel| {
-        try std.testing.expect(std.mem.indexOf(u8, api_keys_hint, channel.api_key_env) != null);
-    }
 }
 
 test "detect: the first channel with a key wins" {

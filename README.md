@@ -406,7 +406,7 @@ var client = zenai.typesafe.Client.init(io, allocator, api_key, .{});
 defer client.deinit();
 
 // The question ids are yours; the answers come back under the same ids.
-var response = try client.ask(.{ .text = "The pizza arrived cold and an hour late." }, &.{
+const questions: typesafe.Questions = .init(&.{
     .{ .key = "is_complaint", .value = .noulText("Is the customer complaining?") },
     .{ .key = "topic", .value = .choiceText(
         "What is this message about?",
@@ -416,7 +416,8 @@ var response = try client.ask(.{ .text = "The pizza arrived cold and an hour lat
         "How angry is the customer?",
         typesafe.levels(&.{ "Calm", "Annoyed", "Furious" }),
     ) },
-}, .{});
+});
+var response = try client.ask(.{ .text = "The pizza arrived cold and an hour late." }, questions, .{});
 defer response.deinit(); // the answers borrow it
 
 std.debug.print("complaint: {d:.2}\n", .{response.value.answer("is_complaint").?.noulValue().?});
