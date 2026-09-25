@@ -1291,7 +1291,6 @@ pub fn envVarName(tag: Tag) []const u8 {
 pub const ollama_default_base_url = openAiPreset(.ollama).?.base_url;
 pub const huggingface_default_base_url = openAiPreset(.huggingface).?.base_url;
 pub const llama_cpp_default_base_url = openAiPreset(.llama_cpp).?.base_url;
-pub const vercel_api_key_env = openAiPreset(.vercel).?.env_var.?;
 
 /// Recommended default chat model for `tag` when the user hasn't picked one.
 pub fn defaultModel(tag: Tag) []const u8 {

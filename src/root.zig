@@ -79,7 +79,6 @@ pub const search = struct {
 pub const typesafe = struct {
     pub const Client = @import("typesafe/Client.zig");
     pub const types = @import("typesafe/types.zig");
-    pub const channels = @import("typesafe/channels.zig");
 };
 
 pub const provider = @import("provider.zig");

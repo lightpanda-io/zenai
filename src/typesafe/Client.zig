@@ -32,7 +32,8 @@ authorization: ?[]const u8 = null,
 /// Set by the host so a SIGINT can abort an in-flight request mid-read.
 interrupt: ?*http.Interrupt = null,
 
-/// Override to reach the same protocol elsewhere (see `channels`).
+/// Vercel AI Gateway serves the same protocol at
+/// `https://ai-gateway.vercel.sh/typesafe`, with model `typesafe-ai/jev`.
 pub const default_base_url = "https://api.typesafe.ai";
 
 pub const InitOptions = struct {
