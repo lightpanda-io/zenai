@@ -74,6 +74,13 @@ pub const search = struct {
     };
 };
 
+/// TypeSafe System One — the Jev judgement model. It answers typed questions
+/// rather than generating text, so it is not part of `provider.Client`.
+pub const typesafe = struct {
+    pub const Client = @import("typesafe/Client.zig");
+    pub const types = @import("typesafe/types.zig");
+};
+
 pub const provider = @import("provider.zig");
 pub const retry = @import("retry.zig");
 pub const json = @import("json.zig");

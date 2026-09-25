@@ -2168,7 +2168,7 @@ fn jsonValueToGeminiSchema(allocator: std.mem.Allocator, val: std.json.Value) !g
                         };
                         i += 1;
                     }
-                    schema.properties = prop_arr;
+                    schema.properties = .init(prop_arr);
                 }
             }
             if (obj.get("items")) |items| {
