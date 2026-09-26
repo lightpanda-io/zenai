@@ -441,7 +441,6 @@ pub const Client = union(enum) {
     vercel: *openai_mod,
     mistral: *openai_mod,
     openrouter: *openai_mod,
-    orcarouter: *openai_mod,
     codex: *codex_mod,
 
     pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError || codex_mod.ApiError;
@@ -624,7 +623,7 @@ pub const Client = union(enum) {
             },
             // Hugging Face speaks OpenAI-compatible Chat Completions, not the
             // Responses API the `.openai` arm uses — so it gets its own arm.
-            .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral, .openrouter, .orcarouter => |o| {
+            .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral, .openrouter => |o| {
                 const oai_messages = try messagesToOpenAIMessages(req_alloc, messages);
                 const tools = if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
 
@@ -729,7 +728,7 @@ pub const Client = union(enum) {
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
                 }, Adapter{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Adapter.wrap);
             },
-            .openai, .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral, .openrouter, .orcarouter => |o| {
+            .openai, .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral, .openrouter => |o| {
                 const oai_messages = messagesToOpenAIMessages(req_alloc, messages) catch return error.OutOfMemory;
                 const tools = if (config.tools) |t| mapOpenAITools(req_alloc, t) catch return error.OutOfMemory else null;
 
@@ -830,7 +829,7 @@ pub const Client = union(enum) {
                 if (acc.err) |e| return e;
                 return anthropicResult(a.allocator, try acc.response());
             },
-            .huggingface, .openai_compatible, .llama_cpp, .vercel, .mistral, .openrouter, .orcarouter => |o| {
+            .huggingface, .openai_compatible, .llama_cpp, .vercel, .mistral, .openrouter => |o| {
                 const oai_messages = try messagesToOpenAIMessages(req_alloc, messages);
                 const tools = if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
 
@@ -933,7 +932,7 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
-            .openai, .ollama, .huggingface, .openai_compatible, .llama_cpp, .vercel, .mistral, .openrouter, .orcarouter => |o| {
+            .openai, .ollama, .huggingface, .openai_compatible, .llama_cpp, .vercel, .mistral, .openrouter => |o| {
                 var response = try o.embedText(model, text);
                 defer response.deinit();
                 var result = EmbedResult.init(o.allocator);
@@ -1220,7 +1219,6 @@ fn openAiPreset(tag: Tag) ?OpenAiPreset {
         .vercel => .{ .base_url = "https://ai-gateway.vercel.sh/v1", .env_var = "AI_GATEWAY_API_KEY", .default_model = "openai/gpt-5.5" },
         .mistral => .{ .base_url = "https://api.mistral.ai/v1", .env_var = "MISTRAL_API_KEY", .default_model = "mistral-medium-3.5" },
         .openrouter => .{ .base_url = "https://openrouter.ai/api/v1", .env_var = "OPENROUTER_API_KEY", .default_model = "openai/gpt-5.5" },
-        .orcarouter => .{ .base_url = "https://api.orcarouter.ai/v1", .env_var = "ORCAROUTER_API_KEY", .default_model = "openai/gpt-5.5" },
         .anthropic, .gemini, .vertex, .openai, .codex => null,
     };
 }
@@ -1547,7 +1545,7 @@ test "llama_cpp: placeholder key, loopback default, excluded from auto-detect" {
 }
 
 test "cloud gateway presets: real key, default model, auto-detectable" {
-    for ([_]Tag{ .vercel, .mistral, .openrouter, .orcarouter }) |tag| {
+    for ([_]Tag{ .vercel, .mistral, .openrouter }) |tag| {
         try std.testing.expect(openAiPreset(tag).?.env_var != null);
         try std.testing.expect(defaultModel(tag).len > 0);
         // Real keys, so they join env auto-detection; the keyless local servers don't.
