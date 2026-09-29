@@ -36,6 +36,14 @@ interrupt: ?*http.Interrupt = null,
 /// `https://ai-gateway.vercel.sh/typesafe`, with model `typesafe-ai/jev`.
 pub const default_base_url = "https://api.typesafe.ai";
 
+/// Where `envApiKey` looks. System One sits outside `provider.Client`, so it is
+/// outside `provider.envApiKey`/`envVarName` too; this is the equivalent.
+pub const env_var_name = "TYPESAFE_API_KEY";
+
+pub fn envApiKey(environ: std.process.Environ) ?[:0]const u8 {
+    return environ.getPosix(env_var_name);
+}
+
 pub const InitOptions = struct {
     base_url: []const u8 = default_base_url,
     retry_policy: RetryPolicy = .{},

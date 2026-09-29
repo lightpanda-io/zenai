@@ -125,6 +125,27 @@ pub fn choices(comptime names: []const []const u8) ChoiceCriteria {
     }.value);
 }
 
+/// `choice` options named by an enum's tags and described one line each:
+///
+///     .criteria = try enumChoices(arena, Class, &.{ .content, .captcha }, describe)
+///
+/// `values` is a slice rather than every tag, because an offered set is usually
+/// a subset: a class the caller will not act on, or an operation the page
+/// cannot do, has no business in the criteria. Pair it with
+/// `AskResponse.choiceEnum`, which maps the answer back.
+pub fn enumChoices(
+    allocator: std.mem.Allocator,
+    comptime E: type,
+    values: []const E,
+    describe: *const fn (E) []const u8,
+) std.mem.Allocator.Error!ChoiceCriteria {
+    const entries = try allocator.alloc(ChoiceCriteria.Entry, values.len);
+    for (values, entries) |value, *entry| {
+        entry.* = .{ .key = @tagName(value), .value = .{ .text = describe(value) } };
+    }
+    return .init(entries);
+}
+
 pub const AskOptions = struct {
     model: []const u8 = default_model,
 };
@@ -256,6 +277,49 @@ pub const AskResponse = struct {
         const found = self.answer(id) orelse return error.AnswerMissing;
         try validateChoice(found, criteria);
         return found.choice.choice;
+    }
+
+    /// `choice` under `id` mapped back to `E`. The criteria have to be keyed by
+    /// `E`'s tags, which `enumChoices` guarantees; a key that is not a tag
+    /// cannot be one of `E`'s values, so it fails the same way an unoffered
+    /// choice does.
+    pub fn choiceEnum(
+        self: AskResponse,
+        id: []const u8,
+        questions: Questions,
+        comptime E: type,
+    ) ChoiceError!E {
+        const name = try self.choice(id, questions);
+        return std.meta.stringToEnum(E, name) orelse error.ChoiceNotOffered;
+    }
+
+    /// The `noul` probability under `id`, or null when the question was not
+    /// answered or was not a `noul`.
+    pub fn noul(self: AskResponse, id: []const u8) ?f64 {
+        const found = self.answer(id) orelse return null;
+        return found.noulValue();
+    }
+
+    /// The confidence under `id`, or null when the question was not answered or
+    /// carries none (`noul` answers do not).
+    pub fn confidence(self: AskResponse, id: []const u8) ?f64 {
+        const found = self.answer(id) orelse return null;
+        return found.confidence();
+    }
+
+    /// The probability the answer under `id` gave one option id or level index.
+    pub fn probability(self: AskResponse, id: []const u8, key: []const u8) ?f64 {
+        const found = self.answer(id) orelse return null;
+        return found.probability(key);
+    }
+
+    /// The concrete model that answered, copied into `allocator`.
+    ///
+    /// `model` itself borrows the response, and an alias moves without notice,
+    /// so a caller recording what actually decided something needs this rather
+    /// than the alias it asked for.
+    pub fn dupeModel(self: AskResponse, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+        return allocator.dupe(u8, self.model);
     }
 };
 
@@ -561,4 +625,86 @@ test "choice: validated against the criteria the question carried" {
     try std.testing.expectError(error.AnswerMissing, response.choice("missing", .init(&.{
         .{ .key = "missing", .value = .choiceText("?", choices(&.{"a"})) },
     })));
+}
+
+const Fruit = enum { apple, pear, quince };
+
+fn describeFruit(f: Fruit) []const u8 {
+    return switch (f) {
+        .apple => "A pome, red or green.",
+        .pear => "A pome, narrower at the stem.",
+        .quince => "A pome nobody eats raw.",
+    };
+}
+
+test "enumChoices keys the criteria by tag and carries a description" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    const criteria = try enumChoices(arena.allocator(), Fruit, &.{ .apple, .quince }, describeFruit);
+
+    // The offered set is a subset on purpose: `pear` was not offered.
+    try std.testing.expectEqual(2, criteria.count());
+    try std.testing.expect(criteria.has("apple"));
+    try std.testing.expect(!criteria.has("pear"));
+    try std.testing.expectEqualStrings("A pome nobody eats raw.", criteria.get("quince").?.?.text);
+}
+
+test "choiceEnum maps a validated answer back to the enum" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    const questions: Questions = .init(&.{
+        .{ .key = "fruit", .value = .choiceText(
+            "Which one?",
+            try enumChoices(arena.allocator(), Fruit, &.{ .apple, .quince }, describeFruit),
+        ) },
+    });
+    const response: AskResponse = .{ .answers = .init(&.{
+        .{ .key = "fruit", .value = .{ .choice = .{ .choice = "quince", .probabilities = .init(&.{
+            .{ .key = "apple", .value = 0.2 },
+            .{ .key = "quince", .value = 0.8 },
+        }) } } },
+    }) };
+
+    try std.testing.expectEqual(Fruit.quince, try response.choiceEnum("fruit", questions, Fruit));
+
+    // An option that is not one of the enum's tags fails as an unoffered
+    // choice, which is what it is.
+    const Other = enum { plum };
+    try std.testing.expectError(
+        error.ChoiceNotOffered,
+        response.choiceEnum("fruit", questions, Other),
+    );
+}
+
+test "the answer accessors return null instead of unwrapping a missing answer" {
+    const response: AskResponse = .{ .answers = .init(&.{
+        .{ .key = "urgent", .value = .{ .noul = .{ .noul = 0.82 } } },
+        .{ .key = "route", .value = .{ .choice = .{
+            .choice = "a",
+            .confidence = 0.71,
+            .probabilities = .init(&.{.{ .key = "a", .value = 1 }}),
+        } } },
+    }) };
+
+    try std.testing.expectEqual(0.82, response.noul("urgent").?);
+    try std.testing.expectEqual(0.71, response.confidence("route").?);
+    try std.testing.expectEqual(1, response.probability("route", "a").?);
+
+    // A question never answered, and answers asked for the wrong thing: null
+    // throughout, never a panic.
+    try std.testing.expectEqual(null, response.noul("absent"));
+    try std.testing.expectEqual(null, response.confidence("absent"));
+    try std.testing.expectEqual(null, response.probability("absent", "a"));
+    try std.testing.expectEqual(null, response.noul("route"));
+    try std.testing.expectEqual(null, response.confidence("urgent"));
+    try std.testing.expectEqual(null, response.probability("urgent", "a"));
+}
+
+test "dupeModel outlives the response the model borrows" {
+    const response: AskResponse = .{ .model = "jev-1.13.0" };
+    const owned = try response.dupeModel(std.testing.allocator);
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqualStrings("jev-1.13.0", owned);
 }

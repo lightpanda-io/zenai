@@ -78,6 +78,18 @@ pub const search = struct {
 pub const typesafe = struct {
     pub const Client = @import("typesafe/Client.zig");
     pub const types = @import("typesafe/types.zig");
+
+    /// Re-exported so a caller building questions does not spell out
+    /// `typesafe.types.ChoiceCriteria.Entry` to name one option.
+    pub const Question = types.Question;
+    pub const Questions = types.Questions;
+    pub const QuestionEntry = types.QuestionEntry;
+    pub const ChoiceEntry = types.ChoiceCriteria.Entry;
+    pub const Content = types.Content;
+    pub const enumChoices = types.enumChoices;
+
+    pub const env_var_name = Client.env_var_name;
+    pub const envApiKey = Client.envApiKey;
 };
 
 pub const provider = @import("provider.zig");
