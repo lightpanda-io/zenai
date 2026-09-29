@@ -401,8 +401,8 @@ export TYPESAFE_API_KEY='your-api-key'
 const zenai = @import("zenai");
 const typesafe = zenai.typesafe.types;
 
-const api_key = environ.getPosix("TYPESAFE_API_KEY") orelse return error.MissingApiKey;
-var client = zenai.typesafe.Client.init(io, allocator, api_key, .{});
+const api_key = zenai.typesafe.envApiKey(environ) orelse return error.MissingApiKey;
+var client: zenai.typesafe.Client = .init(io, allocator, api_key, .{});
 defer client.deinit();
 
 // The question ids are yours; the answers come back under the same ids.
@@ -420,11 +420,13 @@ const questions: typesafe.Questions = .init(&.{
 var response = try client.ask(.{ .text = "The pizza arrived cold and an hour late." }, questions, .{});
 defer response.deinit(); // the answers borrow it
 
-std.debug.print("complaint: {d:.2}\n", .{response.value.answer("is_complaint").?.noulValue().?});
-switch (response.value.answer("topic").?) {
-    .choice => |c| std.debug.print("topic: {s} ({d:.2} confident)\n", .{ c.choice, c.confidence }),
-    else => {},
-}
+// Accessors by question id: null for a question the model left out or one
+// asked for the wrong thing, rather than an unwrap that panics.
+std.debug.print("complaint: {d:.2}\n", .{response.value.noul("is_complaint").?});
+std.debug.print("topic: {s} ({d:.2} confident)\n", .{
+    try response.value.choice("topic", questions), // validated against the criteria
+    response.value.confidence("topic").?,
+});
 ```
 
 Jev ingests the state once and evaluates every question against it in parallel, so packing several questions — including speculative ones you may discard — into one request costs far less than one call each.
@@ -443,7 +445,33 @@ Options that need their own description are written out in full; `null` means th
 
 `instructions` and every criteria description also take structured input — `.{ .json = value }` instead of `.{ .text = "…" }` — and so does `state`, which is how you judge a whole conversation or record in one call.
 
-Before acting on a `choice`, pass it through `typesafe.validateChoice(answer, offered)`: it rejects an answer whose choice was never offered, whose probabilities do not cover exactly the offered set, or whose choice is not the argmax.
+When the options are an enum you already have, `enumChoices` builds the criteria from its tags and `choiceEnum` maps the answer back, so the option set and the type that acts on it cannot drift apart:
+
+```zig
+const Verdict = enum { approve, review, reject };
+
+fn describe(v: Verdict) []const u8 {
+    return switch (v) {
+        .approve => "Nothing here needs a human.",
+        .review => "A human should look before this goes out.",
+        .reject => "Refuse it outright.",
+    };
+}
+
+const questions: typesafe.Questions = .init(&.{
+    .{ .key = "verdict", .value = .choiceText(
+        "What should happen to this message?",
+        // A subset is normal: offer only what the caller will act on.
+        try typesafe.enumChoices(arena, Verdict, &.{ .approve, .review }, describe),
+    ) },
+});
+// …
+const verdict = try response.value.choiceEnum("verdict", questions, Verdict);
+```
+
+Before acting on a `choice`, pass it through `typesafe.validateChoice(answer, offered)`: it rejects an answer whose choice was never offered, whose probabilities do not cover exactly the offered set, or whose choice is not the argmax. `response.choice(id, questions)` and `choiceEnum` both run it for you.
+
+`response.model` is the concrete version that answered, which is not the alias you asked for — aliases move without notice. It borrows the response, so `response.dupeModel(allocator)` is how you keep it.
 
 One request carries up to 64k tokens, of which the state plus the longest single question must fit in 32k; an overrun comes back as `error.ApiError` with a 422 in `client.last_error`. `client.listModels()` enumerates the concrete versions behind the `jev-latest` and `jev-preview` aliases.
 
