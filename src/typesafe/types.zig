@@ -1,8 +1,6 @@
 //! TypeSafe System One request/response shapes. https://docs.typesafe.ai
 //!
-//! One POST carries the `state` under judgement plus a map of typed questions
-//! about it, keyed by ids the caller chooses; the response carries one answer
-//! per id under the same keys. Three question types:
+//! Question types:
 //!
 //!   - `noul`   — the probability, in [0,1], that a proposition holds.
 //!   - `choice` — one option from a labelled set, with per-option probabilities.
@@ -11,11 +9,9 @@
 const std = @import("std");
 const jsonutil = @import("../json.zig");
 
-/// A JSON object with runtime keys; see `json.StringMap`.
 const StringMap = jsonutil.StringMap;
 
-/// The flagship alias. Concrete versions (`jev-1.13.0`) and `jev-preview` also
-/// work; `Client.listModels` enumerates them.
+/// `Client.listModels` lists the concrete versions and other aliases.
 pub const default_model = "jev-latest";
 
 /// A field the API accepts as a string, an object, or an array — `state`,
@@ -62,13 +58,11 @@ pub const NoulQuestion = struct {
 
 pub const ChoiceQuestion = struct {
     instructions: Content,
-    /// Required by the API.
     criteria: ChoiceCriteria,
 };
 
 pub const ScoreQuestion = struct {
     instructions: Content,
-    /// Required by the API; 2–10 ordered levels.
     criteria: ScoreCriteria,
 };
 
@@ -79,8 +73,22 @@ pub const Question = union(enum) {
     choice: ChoiceQuestion,
     score: ScoreQuestion,
 
+    /// Honours `emit_null_optional_fields` the way std does for a plain struct.
     pub fn jsonStringify(self: Question, jw: *std.json.Stringify) !void {
-        return writeTagged(self, jw);
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(@tagName(self));
+        switch (self) {
+            inline else => |payload| inline for (@typeInfo(@TypeOf(payload)).@"struct".fields) |field| {
+                const v = @field(payload, field.name);
+                const skip = if (@typeInfo(field.type) == .optional) v == null and !jw.options.emit_null_optional_fields else false;
+                if (!skip) {
+                    try jw.objectField(field.name);
+                    try jw.write(v);
+                }
+            },
+        }
+        try jw.endObject();
     }
 
     /// `.noul` from plain instruction text.
@@ -204,8 +212,7 @@ pub const Answer = union(enum) {
     choice: ChoiceAnswer,
     score: ScoreAnswer,
 
-    /// Every field any answer type carries, so one pass parses the object
-    /// whatever position `"type"` arrives in.
+    /// Every answer type's fields, so `"type"` may arrive in any position.
     const Wire = struct {
         type: std.meta.Tag(Answer),
         noul: f64 = 0,
@@ -221,15 +228,15 @@ pub const Answer = union(enum) {
         source: anytype,
         options: std.json.ParseOptions,
     ) std.json.ParseError(@TypeOf(source.*))!Answer {
-        // The API may add fields, so unknown keys are always ignored here.
-        var wire_options = options;
-        wire_options.ignore_unknown_fields = true;
-        const w = try std.json.innerParse(Wire, allocator, source, wire_options);
-        return switch (w.type) {
-            .noul => .{ .noul = .{ .noul = w.noul } },
-            .choice => .{ .choice = .{ .choice = w.choice, .probabilities = w.probabilities, .confidence = w.confidence } },
-            .score => .{ .score = .{ .score = w.score, .legend = w.legend, .probabilities = w.probabilities, .confidence = w.confidence } },
-        };
+        const w = try std.json.innerParse(Wire, allocator, source, options);
+        switch (w.type) {
+            inline else => |tag| {
+                const Payload = @FieldType(Answer, @tagName(tag));
+                var payload: Payload = .{};
+                inline for (@typeInfo(Payload).@"struct".fields) |f| @field(payload, f.name) = @field(w, f.name);
+                return @unionInit(Answer, @tagName(tag), payload);
+            },
+        }
     }
 
     /// The `noul` probability, or null for another answer type.
@@ -302,24 +309,19 @@ pub const AskResponse = struct {
         return std.meta.stringToEnum(E, name) orelse error.ChoiceNotOffered;
     }
 
-    /// The `noul` probability under `id`, or null when the question was not
-    /// answered or was not a `noul`.
+    /// Null when unanswered or not a `noul`.
     pub fn noul(self: AskResponse, id: []const u8) ?f64 {
-        const found = self.answer(id) orelse return null;
-        return found.noulValue();
+        return (self.answer(id) orelse return null).noulValue();
     }
 
-    /// The confidence under `id`, or null when the question was not answered or
-    /// carries none (`noul` answers do not).
+    /// Null when unanswered or a `noul`.
     pub fn confidence(self: AskResponse, id: []const u8) ?f64 {
-        const found = self.answer(id) orelse return null;
-        return found.confidence();
+        return (self.answer(id) orelse return null).confidence();
     }
 
-    /// The probability the answer under `id` gave one option id or level index.
+    /// Null when unanswered or a `noul`.
     pub fn probability(self: AskResponse, id: []const u8, key: []const u8) ?f64 {
-        const found = self.answer(id) orelse return null;
-        return found.probability(key);
+        return (self.answer(id) orelse return null).probability(key);
     }
 
     /// `model`, copied into `allocator` to outlive the response.
@@ -359,8 +361,7 @@ pub const ChoiceError = ValidateError || error{
     AnswerMissing,
 };
 
-/// How far the probabilities may drift from summing to 1 before the answer is
-/// rejected.
+/// Allowed drift of the probabilities' sum from 1.
 pub const probability_sum_tolerance = 0.02;
 
 /// Reject a `choice` answer that strayed outside `offered`: the choice must be
@@ -390,26 +391,11 @@ pub fn validateChoice(answer: Answer, offered: ChoiceCriteria) ValidateError!voi
     if (chosen < max) return error.ChoiceNotArgmax;
 }
 
-// --- Internal ---
-
-/// Emit a tagged union as one flat object: the active tag under `"type"`, then
-/// the payload struct's own fields, honouring `emit_null_optional_fields` the
-/// way std treats a plain struct.
-fn writeTagged(value: anytype, jw: *std.json.Stringify) !void {
-    try jw.beginObject();
-    try jw.objectField("type");
-    try jw.write(@tagName(value));
-    switch (value) {
-        inline else => |payload| inline for (@typeInfo(@TypeOf(payload)).@"struct".fields) |field| {
-            const v = @field(payload, field.name);
-            const skip = if (@typeInfo(field.type) == .optional) v == null and !jw.options.emit_null_optional_fields else false;
-            if (!skip) {
-                try jw.objectField(field.name);
-                try jw.write(v);
-            }
-        },
-    }
-    try jw.endObject();
+/// Stringify `value` with the options the client sends it with.
+fn expectJson(value: anytype, expected: []const u8) !void {
+    const out = try jsonutil.stringifyAlloc(std.testing.allocator, value, .{ .emit_null_optional_fields = false });
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(expected, out);
 }
 
 test "AskResponse parses a System One fixture" {
@@ -470,12 +456,9 @@ test "AskRequest stringifies the System One request body" {
         }),
     };
 
-    var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer buf.deinit();
-    try std.json.Stringify.value(request, .{ .emit_null_optional_fields = false }, &buf.writer);
-    try std.testing.expectEqualStrings(
+    try expectJson(request,
         \\{"state":"The pizza arrived cold.","model":"jev-latest","questions":{"is_complaint":{"type":"noul","instructions":"Is the customer complaining?"},"topic":{"type":"choice","instructions":"What is this about?","criteria":{"billing":null,"delivery":"Anything about shipping"}},"anger":{"type":"score","instructions":"How angry?","criteria":["Calm","Furious"]}}}
-    , buf.written());
+    );
 }
 
 test "AskRequest passes a structured state through untouched" {
@@ -490,12 +473,9 @@ test "AskRequest passes a structured state through untouched" {
             .{ .key = "complaint", .value = .noulText("Is this a complaint?") },
         }),
     };
-    var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer buf.deinit();
-    try std.json.Stringify.value(request, .{ .emit_null_optional_fields = false }, &buf.writer);
-    try std.testing.expectEqualStrings(
+    try expectJson(request,
         \\{"state":{"ticket":{"id":7,"lines":["cold","late"]}},"model":"jev-latest","questions":{"complaint":{"type":"noul","instructions":"Is this a complaint?"}}}
-    , buf.written());
+    );
 }
 
 test "validateChoice accepts a well-formed answer" {
@@ -601,12 +581,9 @@ test "choices and choiceText build the README's question list" {
         .questions = .init(&questions),
     };
 
-    var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer buf.deinit();
-    try std.json.Stringify.value(request, .{ .emit_null_optional_fields = false }, &buf.writer);
-    try std.testing.expectEqualStrings(
+    try expectJson(request,
         \\{"state":"The pizza arrived cold.","model":"jev-latest","questions":{"is_complaint":{"type":"noul","instructions":"Is the customer complaining?"},"topic":{"type":"choice","instructions":"What is this message about?","criteria":{"billing":null,"delivery":null,"other":null}},"anger":{"type":"score","instructions":"How angry is the customer?","criteria":["Calm","Annoyed","Furious"]}}}
-    , buf.written());
+    );
 }
 
 test "choice: validated against the criteria the question carried" {

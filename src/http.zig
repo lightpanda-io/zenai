@@ -41,7 +41,7 @@ pub const ErrorDetail = struct {
 
     /// A copy owning its own `message`, to keep past the client's next call
     /// or `deinit`.
-    pub fn clone(self: ErrorDetail, allocator: std.mem.Allocator) std.mem.Allocator.Error!ErrorDetail {
+    pub fn dupe(self: ErrorDetail, allocator: std.mem.Allocator) std.mem.Allocator.Error!ErrorDetail {
         return .{
             .status = self.status,
             .message = if (self.message) |m| try allocator.dupe(u8, m) else null,
@@ -675,15 +675,10 @@ pub fn streamNdjsonValue(
     return streamNdjson(allocator, http_client, url, extra_headers, payload, EventT, error_handler, context, callback);
 }
 
-/// Extract an owned copy of `error.message` from a provider JSON error body, or
-/// null if absent or unparseable. Caller frees the result with `allocator`.
-///
-/// Parses only `message`: sibling fields vary by provider (e.g. llama.cpp types
-/// `code` as an int where OpenAI uses a string), so a full typed parse would
-/// fail and cost us the message.
-/// The message in a JSON error body: `error.message` (OpenAI, Anthropic,
-/// Gemini), or FastAPI's `detail` as a string, as an object's `message`
-/// (TypeSafe), or as a validation list's first `msg`.
+/// An owned copy of the message in a JSON error body: `error.message` (OpenAI,
+/// Anthropic, Gemini), or FastAPI's `detail` as a string, as an object's
+/// `message` (TypeSafe), or as a validation list's first `msg`. Null if absent
+/// or unparseable. Caller frees the result with `allocator`.
 pub fn extractErrorMessage(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
     defer parsed.deinit();
@@ -727,10 +722,10 @@ test "extractErrorMessage reads each provider's error shape" {
     }
 }
 
-test "ErrorDetail.clone outlives the original" {
+test "ErrorDetail.dupe outlives the original" {
     var detail: ErrorDetail = .{};
     detail.set(std.testing.allocator, 401, "{\"detail\":{\"message\":\"nope\"}}");
-    const copy = try detail.clone(std.testing.allocator);
+    const copy = try detail.dupe(std.testing.allocator);
     defer std.testing.allocator.free(copy.message.?);
     detail.deinit(std.testing.allocator);
     try std.testing.expectEqual(401, copy.status);

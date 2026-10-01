@@ -1,8 +1,6 @@
 //! TypeSafe System One API client. https://docs.typesafe.ai
 //!
-//! Post a `state` plus a map of typed questions about it; get one typed answer
-//! per question. The state is ingested once, so batching several questions
-//! into one request is much cheaper than one call each.
+//! The state is ingested once per request, so batch questions into one `ask`.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -43,8 +41,7 @@ pub fn envApiKey(environ: std.process.Environ) ?[:0]const u8 {
     return environ.getPosix(env_var_name);
 }
 
-/// The environment variable `envBaseUrl` reads, to point the client at a
-/// gateway or a local mock.
+/// The environment variable `envBaseUrl` reads.
 pub const base_url_env_var_name = "TYPESAFE_BASE_URL";
 
 pub fn envBaseUrl(environ: std.process.Environ) []const u8 {
@@ -93,17 +90,13 @@ fn authHeader(self: *Client) std.mem.Allocator.Error![1]std.http.Header {
     return .{.{ .name = "Authorization", .value = self.authorization.? }};
 }
 
-/// Ask Jev one or more typed questions about `state`. Each question's key is an
-/// id you choose, and the matching answer comes back under that same id
-/// (`response.value.answer(id)`).
+/// Ask typed questions about `state`; each answer comes back under its
+/// question's id. Read a `choice` through `AskResponse.choice`, which validates it.
 ///
-/// Validate a `choice` with `AskResponse.choice` before acting on it.
+/// 401 and 422 (malformed question, or state over 32k) surface as
+/// `error.ApiError` with the detail in `last_error`.
 ///
-/// 401 (bad key) and 422 (malformed question, or a state over the 32k budget)
-/// surface as `error.ApiError` with the detail in `last_error`; 429 and 529
-/// are retried by `retry_policy`.
-///
-/// Caller owns the returned `Response` and must call `deinit()` — every string
+/// Caller owns the returned `Response` and must call `deinit()`; every string
 /// in the answers borrows it.
 pub fn ask(
     self: *Client,
@@ -138,7 +131,7 @@ pub fn listModels(self: *Client) ApiError!Response(ListModelsResponse) {
     }, ListModelsResponse, self);
 }
 
-test "ask rejects empty api key" {
+test "ask and listModels reject an empty api key" {
     var client = init(std.testing.io, std.testing.allocator, "", .{});
     defer client.deinit();
     try std.testing.expectError(error.MissingApiKey, client.ask(
@@ -146,10 +139,5 @@ test "ask rejects empty api key" {
         .init(&.{.{ .key = "q", .value = .noulText("Is this a complaint?") }}),
         .{},
     ));
-}
-
-test "listModels rejects empty api key" {
-    var client = init(std.testing.io, std.testing.allocator, "", .{});
-    defer client.deinit();
     try std.testing.expectError(error.MissingApiKey, client.listModels());
 }
