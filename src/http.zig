@@ -175,17 +175,29 @@ pub fn fetchJsonWithRetry(
     else
         null;
     var attempt: u8 = 0;
-    while (true) : (attempt += 1) {
+    var reconnected = false;
+    while (true) {
         var response_buf: std.Io.Writer.Allocating = .init(allocator);
         var keep_buf = false;
         defer if (!keep_buf) response_buf.deinit();
 
-        var retry_after_ms: ?u32 = null;
-        const status = fetchCapturingRetryAfter(allocator, http_client, options, &response_buf.writer, interrupt, timeout_ms, &retry_after_ms) catch |err| {
+        var head: HeadInfo = .{};
+        const status = fetchCapturingRetryAfter(allocator, http_client, options, &response_buf.writer, interrupt, timeout_ms, &head) catch |err| {
             // Don't retry a request the user cancelled.
             if (interrupt) |it| if (it.isFired()) return err;
+            // A pooled keep-alive socket the server closed while idle fails
+            // before any answer. That says nothing about the server's health,
+            // so reconnect once, at once, whatever the policy: a long-lived
+            // client with `RetryPolicy.disabled` would otherwise fail the first
+            // call after every idle gap, and one with backoff would sleep a
+            // second to save a handshake.
+            if (!reconnected and !head.received and retry.isStaleConnectionError(err)) {
+                reconnected = true;
+                continue;
+            }
             if (retry.isRetryableFetchError(err) and attempt + 1 < policy.max_attempts) {
                 retry.sleepBackoff(http_client.io, attempt, policy);
+                attempt += 1;
                 continue;
             }
             return err;
@@ -201,7 +213,8 @@ pub fn fetchJsonWithRetry(
         }
 
         if (retry.isRetryableStatus(status_code) and attempt + 1 < policy.max_attempts) {
-            retry.sleepBackoffHinted(http_client.io, attempt, policy, retry_after_ms);
+            retry.sleepBackoffHinted(http_client.io, attempt, policy, head.retry_after_ms);
+            attempt += 1;
             continue;
         }
         error_handler.setErrorDetail(status_code, body);
@@ -220,8 +233,8 @@ pub fn fetchInterruptible(
     response_writer: *std.Io.Writer,
     interrupt: ?*Interrupt,
 ) std.http.Client.FetchError!std.http.Status {
-    var retry_after_ms: ?u32 = null;
-    return fetchCapturingRetryAfter(allocator, client, options, response_writer, interrupt, null, &retry_after_ms);
+    var head: HeadInfo = .{};
+    return fetchCapturingRetryAfter(allocator, client, options, response_writer, interrupt, null, &head);
 }
 
 /// JSON-encode a request body the way every provider expects it: optional
@@ -272,10 +285,18 @@ fn retryAfterFromHead(head: std.http.Client.Response.Head) ?u32 {
     return seconds_hint;
 }
 
-/// `fetchInterruptible` plus capture of the response's Retry-After hint into
-/// `retry_after_ms` (read from the head before the body is streamed, while
-/// the header bytes are still valid) so `fetchJsonWithRetry` can honor it,
-/// and an optional `timeout_ms` after which the exchange fails with
+/// What `fetchJsonWithRetry` needs from a response head, captured before the
+/// body is streamed while the header bytes are still valid.
+const HeadInfo = struct {
+    /// A head arrived, so the connection was alive when the request went out
+    /// and a later failure is not a stale socket.
+    received: bool = false,
+    /// The response's Retry-After hint, for `fetchJsonWithRetry` to honor.
+    retry_after_ms: ?u32 = null,
+};
+
+/// `fetchInterruptible` plus capture of the response head's `HeadInfo` into
+/// `head`, and an optional `timeout_ms` after which the exchange fails with
 /// `error.Timeout` (see `Watchdog`).
 fn fetchCapturingRetryAfter(
     allocator: std.mem.Allocator,
@@ -284,7 +305,7 @@ fn fetchCapturingRetryAfter(
     response_writer: *std.Io.Writer,
     interrupt: ?*Interrupt,
     timeout_ms: ?u32,
-    retry_after_ms: *?u32,
+    head: *HeadInfo,
 ) std.http.Client.FetchError!std.http.Status {
     const uri = switch (options.location) {
         .url => |u| try std.Uri.parse(u),
@@ -318,7 +339,7 @@ fn fetchCapturingRetryAfter(
     if (timeout_ms) |ms| try watchdog.start(client.io, &req, ms);
     defer watchdog.stop(client.io, guard);
 
-    return exchange(allocator, &req, redirect_behavior, options, response_writer, retry_after_ms) catch |err| {
+    return exchange(allocator, &req, redirect_behavior, options, response_writer, head) catch |err| {
         if (watchdog.interrupt.isFired()) return error.Timeout;
         return err;
     };
@@ -333,24 +354,22 @@ fn exchange(
     redirect_behavior: std.http.Client.Request.RedirectBehavior,
     options: std.http.Client.FetchOptions,
     response_writer: *std.Io.Writer,
-    retry_after_ms: *?u32,
+    head: *HeadInfo,
 ) std.http.Client.FetchError!std.http.Status {
-    if (options.payload) |payload| {
-        req.transfer_encoding = .{ .content_length = payload.len };
-        var body = try req.sendBodyUnflushed(&.{});
-        try body.writer.writeAll(payload);
-        try body.end();
-        try req.connection.?.flush();
-    } else {
-        try req.sendBodiless();
-    }
+    send(req, options.payload) catch |err| return switch (err) {
+        error.WriteFailed => writeError(req.connection.?),
+    };
 
     const own_redirect_buffer = redirect_behavior != .unhandled and options.redirect_buffer == null;
     const redirect_buffer: []u8 = if (redirect_behavior == .unhandled) &.{} else options.redirect_buffer orelse try allocator.alloc(u8, 8 * 1024);
     defer if (own_redirect_buffer) allocator.free(redirect_buffer);
 
-    var response = try req.receiveHead(redirect_buffer);
-    retry_after_ms.* = retryAfterFromHead(response.head);
+    var response = req.receiveHead(redirect_buffer) catch |err| return switch (err) {
+        error.ReadFailed => readError(req.connection.?),
+        error.WriteFailed => writeError(req.connection.?),
+        else => |e| e,
+    };
+    head.* = .{ .received = true, .retry_after_ms = retryAfterFromHead(response.head) };
 
     const decompress_buffer: []u8 = switch (response.head.content_encoding) {
         .identity => &.{},
@@ -370,6 +389,40 @@ fn exchange(
     };
 
     return response.head.status;
+}
+
+fn send(req: *std.http.Client.Request, payload: ?[]const u8) std.Io.Writer.Error!void {
+    const p = payload orelse return req.sendBodiless();
+    req.transfer_encoding = .{ .content_length = p.len };
+    var body = try req.sendBodyUnflushed(&.{});
+    try body.writer.writeAll(p);
+    try body.end();
+    try req.connection.?.flush();
+}
+
+// std.http reports a failed send or head read only as `WriteFailed` /
+// `ReadFailed`, leaving the cause on the connection. Surface the cause when it
+// is the peer having closed or reset the socket -- the shape of a stale pooled
+// connection -- so `retry` can recognize it; anything else keeps the generic
+// error.
+
+fn writeError(connection: *std.http.Client.Connection) std.http.Client.FetchError {
+    return switch (connection.stream_writer.err orelse return error.WriteFailed) {
+        // EPIPE: the peer already closed its end.
+        error.ConnectionResetByPeer, error.SocketUnconnected => error.ConnectionResetByPeer,
+        else => error.WriteFailed,
+    };
+}
+
+fn readError(connection: *std.http.Client.Connection) std.http.Client.FetchError {
+    return switch (connection.getReadError() orelse return error.ReadFailed) {
+        error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+        // A TLS peer that closed without close_notify, which std cannot tell
+        // apart from a head cut short; plain TCP reports the former as
+        // HttpConnectionClosing, the shape of an idle keep-alive close.
+        error.TlsConnectionTruncated => error.HttpConnectionClosing,
+        else => error.ReadFailed,
+    };
 }
 
 /// Error set returned by `streamSse`. Each streaming provider's
@@ -636,9 +689,99 @@ test "watchdog turns a stalled response into error.Timeout" {
     defer client.deinit();
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    var retry_after_ms: ?u32 = null;
+    var head: HeadInfo = .{};
     try std.testing.expectError(
         error.Timeout,
-        fetchCapturingRetryAfter(allocator, &client, .{ .location = .{ .url = url } }, &out.writer, null, 50, &retry_after_ms),
+        fetchCapturingRetryAfter(allocator, &client, .{ .location = .{ .url = url } }, &out.writer, null, 50, &head),
     );
+}
+
+/// Test server half for the stale-socket tests: accept one connection and,
+/// when `respond`, answer one request with keep-alive before closing it, which
+/// leaves the client holding a pooled socket the server has already closed.
+/// Without `respond` the connection closes unanswered.
+fn serveOnce(server: *std.Io.net.Server, io: std.Io, respond: bool) void {
+    const stream = server.accept(io) catch return;
+    defer stream.close(io);
+    if (!respond) return;
+    var read_buf: [4096]u8 = undefined;
+    var write_buf: [256]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var writer = stream.writer(io, &write_buf);
+    var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
+    var request = http_server.receiveHead() catch return;
+    request.respond("{\"ok\":true}", .{ .keep_alive = true }) catch return;
+}
+
+const StaleTest = struct {
+    const Ok = struct { ok: bool };
+    const NoDetail = struct {
+        fn setErrorDetail(_: *NoDetail, _: u10, _: []const u8) void {}
+    };
+
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    server: std.Io.net.Server,
+    url: []u8,
+    client: std.http.Client,
+
+    fn init(self: *StaleTest) !void {
+        self.io = std.testing.io;
+        self.allocator = std.testing.allocator;
+        const loopback: std.Io.net.IpAddress = try .parse("127.0.0.1", 0);
+        self.server = try loopback.listen(self.io, .{});
+        self.url = try std.fmt.allocPrint(self.allocator, "http://127.0.0.1:{d}/", .{self.server.socket.address.getPort()});
+        self.client = .{ .allocator = self.allocator, .io = self.io };
+    }
+
+    fn deinit(self: *StaleTest) void {
+        self.client.deinit();
+        self.allocator.free(self.url);
+        self.server.deinit(self.io);
+    }
+
+    /// One connection served by `serveOnce(respond)` on a server thread, one
+    /// fetch against it, with retries otherwise disabled. The timeout turns a
+    /// retry that wrongly waits on a connection nobody accepts into an error
+    /// instead of a hang.
+    fn fetch(self: *StaleTest, respond: bool) FetchError!Response(Ok) {
+        const thread = std.Thread.spawn(.{}, serveOnce, .{ &self.server, self.io, respond }) catch unreachable;
+        defer thread.join();
+        // A failed fetch may never have reached `accept`; connect once so the
+        // server thread returns and the join cannot hang the test.
+        errdefer if (self.server.socket.address.connect(self.io, .{ .mode = .stream })) |s| s.close(self.io) else |_| {};
+        var detail: NoDetail = .{};
+        return fetchJsonWithRetry(self.allocator, &self.client, .disabled, 2000, .{
+            .location = .{ .url = self.url },
+        }, Ok, &detail);
+    }
+};
+
+test "a pooled socket the server closed while idle is reconnected despite RetryPolicy.disabled" {
+    var t: StaleTest = undefined;
+    try t.init();
+    defer t.deinit();
+
+    // The first call pools its socket; the server then closes it. The second
+    // call picks the dead socket from the pool, and must reconnect to the next
+    // `serveOnce` instead of failing with HttpConnectionClosing.
+    var first = try t.fetch(true);
+    first.deinit();
+    var second = try t.fetch(true);
+    defer second.deinit();
+    try std.testing.expect(second.value.ok);
+}
+
+test "the stale-socket reconnect happens once, not again on a fresh connection" {
+    var t: StaleTest = undefined;
+    try t.init();
+    defer t.deinit();
+
+    var first = try t.fetch(true);
+    first.deinit();
+
+    // The pooled socket is dead and the reconnect's fresh connection is closed
+    // unanswered too: that is the server, not a stale pool, so it surfaces.
+    // A second reconnect would sit in the listen backlog until the timeout.
+    try std.testing.expectError(error.HttpConnectionClosing, t.fetch(false));
 }
