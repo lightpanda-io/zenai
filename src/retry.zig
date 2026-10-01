@@ -18,9 +18,7 @@ pub const RetryPolicy = struct {
     /// limits. Randomness comes from the `std.Random` passed to `backoffMs`.
     jitter: bool = true,
 
-    /// No retry — return errors immediately on the first attempt. A stale
-    /// pooled socket is still reconnected once (`isStaleConnectionError`):
-    /// that request never reached the server, so it is not a retry.
+    /// No retry — return errors immediately on the first attempt.
     pub const disabled: RetryPolicy = .{ .max_attempts = 1 };
 
     /// Aggressive retry tuned for long-running agents that can afford to
@@ -70,17 +68,6 @@ pub fn isRetryableFetchError(err: anyerror) bool {
         // HTTP chunk truncation is typically a flaky upstream
         error.HttpChunkTruncated,
         => true,
-        else => false,
-    };
-}
-
-/// Whether a fetch error means the connection was dead before the request got
-/// any answer -- typically a pooled keep-alive socket the server closed while
-/// idle. `fetchJsonWithRetry` reconnects once on these, immediately and
-/// outside the `RetryPolicy`, when no response head arrived.
-pub fn isStaleConnectionError(err: anyerror) bool {
-    return switch (err) {
-        error.HttpConnectionClosing, error.ConnectionResetByPeer => true,
         else => false,
     };
 }
