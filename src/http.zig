@@ -129,7 +129,9 @@ const Watchdog = struct {
     fn start(self: *Watchdog, io: std.Io, req: *std.http.Client.Request, timeout_ms: u32) error{SystemResources}!void {
         _ = armInterrupt(&self.interrupt, req);
         const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
-        self.thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, run, .{ self, io, deadline }) catch return error.SystemResources;
+        // Default stack: under libc it also holds the host's static TLS, which
+        // can outgrow a small fixed size and fail the spawn.
+        self.thread = std.Thread.spawn(.{}, run, .{ self, io, deadline }) catch return error.SystemResources;
     }
 
     fn run(self: *Watchdog, io: std.Io, deadline: std.Io.Clock.Timestamp) void {
