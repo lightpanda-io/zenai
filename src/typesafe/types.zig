@@ -125,14 +125,9 @@ pub fn choices(comptime names: []const []const u8) ChoiceCriteria {
     }.value);
 }
 
-/// `choice` options named by an enum's tags and described one line each:
-///
+/// `choice` options keyed by the tags in `values` (the offered subset of `E`),
+/// each described by `describe`. `AskResponse.choiceEnum` maps the answer back:
 ///     .criteria = try enumChoices(arena, Class, &.{ .content, .captcha }, describe)
-///
-/// `values` is a slice rather than every tag, because an offered set is usually
-/// a subset: a class the caller will not act on, or an operation the page
-/// cannot do, has no business in the criteria. Pair it with
-/// `AskResponse.choiceEnum`, which maps the answer back.
 pub fn enumChoices(
     allocator: std.mem.Allocator,
     comptime E: type,
@@ -279,10 +274,8 @@ pub const AskResponse = struct {
         return found.choice.choice;
     }
 
-    /// `choice` under `id` mapped back to `E`. The criteria have to be keyed by
-    /// `E`'s tags, which `enumChoices` guarantees; a key that is not a tag
-    /// cannot be one of `E`'s values, so it fails the same way an unoffered
-    /// choice does.
+    /// `choice` under `id` as an `E`. A choice that is not a tag of `E` is
+    /// `error.ChoiceNotOffered`.
     pub fn choiceEnum(
         self: AskResponse,
         id: []const u8,
@@ -313,11 +306,7 @@ pub const AskResponse = struct {
         return found.probability(key);
     }
 
-    /// The concrete model that answered, copied into `allocator`.
-    ///
-    /// `model` itself borrows the response, and an alias moves without notice,
-    /// so a caller recording what actually decided something needs this rather
-    /// than the alias it asked for.
+    /// `model`, copied into `allocator` to outlive the response.
     pub fn dupeModel(self: AskResponse, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
         return allocator.dupe(u8, self.model);
     }
@@ -643,7 +632,6 @@ test "enumChoices keys the criteria by tag and carries a description" {
 
     const criteria = try enumChoices(arena.allocator(), Fruit, &.{ .apple, .quince }, describeFruit);
 
-    // The offered set is a subset on purpose: `pear` was not offered.
     try std.testing.expectEqual(2, criteria.count());
     try std.testing.expect(criteria.has("apple"));
     try std.testing.expect(!criteria.has("pear"));
@@ -669,8 +657,7 @@ test "choiceEnum maps a validated answer back to the enum" {
 
     try std.testing.expectEqual(Fruit.quince, try response.choiceEnum("fruit", questions, Fruit));
 
-    // An option that is not one of the enum's tags fails as an unoffered
-    // choice, which is what it is.
+    // A choice that is not one of the enum's tags.
     const Other = enum { plum };
     try std.testing.expectError(
         error.ChoiceNotOffered,
@@ -692,8 +679,7 @@ test "the answer accessors return null instead of unwrapping a missing answer" {
     try std.testing.expectEqual(0.71, response.confidence("route").?);
     try std.testing.expectEqual(1, response.probability("route", "a").?);
 
-    // A question never answered, and answers asked for the wrong thing: null
-    // throughout, never a panic.
+    // Unanswered, or the wrong answer type.
     try std.testing.expectEqual(null, response.noul("absent"));
     try std.testing.expectEqual(null, response.confidence("absent"));
     try std.testing.expectEqual(null, response.probability("absent", "a"));

@@ -79,8 +79,7 @@ pub const typesafe = struct {
     pub const Client = @import("typesafe/Client.zig");
     pub const types = @import("typesafe/types.zig");
 
-    /// Re-exported so a caller building questions does not spell out
-    /// `typesafe.types.ChoiceCriteria.Entry` to name one option.
+    /// Shorthands for building questions.
     pub const Question = types.Question;
     pub const Questions = types.Questions;
     pub const QuestionEntry = types.QuestionEntry;
