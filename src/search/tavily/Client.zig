@@ -23,6 +23,7 @@ http_client: std.http.Client,
 retry_policy: RetryPolicy,
 request_timeout_ms: ?u32,
 last_error: http.ErrorDetail = .{},
+bearer: http.BearerAuth = .{},
 
 pub const InitOptions = struct {
     base_url: []const u8 = "https://api.tavily.com",
@@ -47,6 +48,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
 pub fn deinit(self: *Client) void {
     self.http_client.deinit();
     self.last_error.deinit(self.allocator);
+    self.bearer.deinit(self.allocator);
 }
 
 pub const Response = http.Response;
@@ -71,11 +73,7 @@ pub fn search(
     var request = options;
     request.query = query;
 
-    const auth = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key});
-    defer self.allocator.free(auth);
-    const extra_headers = [_]std.http.Header{
-        .{ .name = "Authorization", .value = auth },
-    };
+    const extra_headers = [_]std.http.Header{try self.bearer.header(self.allocator, self.api_key)};
 
     return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, &extra_headers, request, SearchResponse, self);
 }
