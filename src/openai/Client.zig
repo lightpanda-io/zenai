@@ -34,8 +34,7 @@ request_timeout_ms: ?u32,
 last_error: http.ErrorDetail = .{},
 /// Set by the host so a SIGINT can abort an in-flight request mid-read.
 interrupt: ?*http.Interrupt = null,
-/// Cached `Bearer <api_key>` header value, built on first request.
-authorization: ?[]const u8 = null,
+bearer: http.BearerAuth = .{},
 /// Per-model cache of the Ollama context window (see `ollama.zig`), so the
 /// `/api/show` lookup runs once per model. `model` is owned by `allocator`;
 /// `len` is null when the lookup missed (cached so it isn't retried).
@@ -77,7 +76,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
 
 /// Release all resources held by the client, including HTTP connections.
 pub fn deinit(self: *Client) void {
-    if (self.authorization) |a| self.allocator.free(a);
+    self.bearer.deinit(self.allocator);
     if (self.ollama_ctx) |c| self.allocator.free(c.model);
     self.last_error.deinit(self.allocator);
     self.http_client.deinit();
@@ -96,9 +95,7 @@ pub const ApiError = error{
 /// `X-HF-Bill-To` is only emitted when `bill_to` is set, so providers that
 /// don't recognize it never see it.
 fn authHeaders(self: *Client, buf: *[4]std.http.Header) ![]const std.http.Header {
-    if (self.authorization == null)
-        self.authorization = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key});
-    buf[0] = .{ .name = "Authorization", .value = self.authorization.? };
+    buf[0] = try self.bearer.header(self.allocator, self.api_key);
     buf[1] = .{ .name = "OpenAI-Organization", .value = self.organization orelse "" };
     buf[2] = .{ .name = "OpenAI-Project", .value = self.project orelse "" };
     if (self.bill_to) |org| {

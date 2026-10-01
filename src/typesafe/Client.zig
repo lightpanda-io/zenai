@@ -25,8 +25,7 @@ http_client: std.http.Client,
 retry_policy: RetryPolicy,
 request_timeout_ms: ?u32,
 last_error: http.ErrorDetail = .{},
-/// `Bearer <api_key>`, built on first use.
-authorization: ?[]const u8 = null,
+bearer: http.BearerAuth = .{},
 /// Set by the host so a SIGINT can abort an in-flight request mid-read.
 interrupt: ?*http.Interrupt = null,
 
@@ -73,7 +72,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
 pub fn deinit(self: *Client) void {
     self.http_client.deinit();
     self.last_error.deinit(self.allocator);
-    if (self.authorization) |a| self.allocator.free(a);
+    self.bearer.deinit(self.allocator);
 }
 
 pub const Response = http.Response;
@@ -85,9 +84,7 @@ pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
 }
 
 fn authHeader(self: *Client) std.mem.Allocator.Error![1]std.http.Header {
-    if (self.authorization == null)
-        self.authorization = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key});
-    return .{.{ .name = "Authorization", .value = self.authorization.? }};
+    return .{try self.bearer.header(self.allocator, self.api_key)};
 }
 
 /// Ask typed questions about `state`; each answer comes back under its

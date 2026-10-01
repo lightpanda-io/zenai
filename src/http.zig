@@ -49,6 +49,24 @@ pub const ErrorDetail = struct {
     }
 };
 
+/// An `Authorization: Bearer <token>` header whose value is built on first use
+/// and cached.
+pub const BearerAuth = struct {
+    value: ?[]const u8 = null,
+
+    pub fn header(self: *BearerAuth, allocator: std.mem.Allocator, token: []const u8) std.mem.Allocator.Error!std.http.Header {
+        if (self.value == null) self.value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+        return .{ .name = "Authorization", .value = self.value.? };
+    }
+
+    /// Frees the cached value; the next `header` call rebuilds it, so this
+    /// also discards a stale token.
+    pub fn deinit(self: *BearerAuth, allocator: std.mem.Allocator) void {
+        if (self.value) |v| allocator.free(v);
+        self.* = .{};
+    }
+};
+
 /// Cross-thread trigger for aborting an in-flight HTTP request. A request path
 /// arms it with the active connection's stream around the blocking read (see
 /// `armInterrupt`); another thread (the SIGINT handler) calls `fire` to

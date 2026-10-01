@@ -33,9 +33,8 @@ retry_policy: RetryPolicy,
 /// established connection to the end of the body (connect excluded);
 /// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
 request_timeout_ms: ?u32,
-/// Cached "Bearer {token}" header value for Vertex project/location mode.
-/// Built on first request; owned, freed in `deinit`.
-bearer_value: ?[]u8 = null,
+/// Used in Vertex project/location mode.
+bearer: http.BearerAuth = .{},
 last_error: http.ErrorDetail = .{},
 /// Set by the host so a SIGINT can abort an in-flight request mid-read.
 interrupt: ?*http.Interrupt = null,
@@ -96,7 +95,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
 /// Release all resources held by the client, including HTTP connections.
 pub fn deinit(self: *Client) void {
     self.last_error.deinit(self.allocator);
-    if (self.bearer_value) |b| self.allocator.free(b);
+    self.bearer.deinit(self.allocator);
     self.http_client.deinit();
 }
 
@@ -138,16 +137,8 @@ const default_base_url = "https://generativelanguage.googleapis.com";
 /// The auth header for this client's backend: `x-goog-api-key` for the
 /// Developer API and Vertex express mode, or `Authorization: Bearer` in
 /// Vertex project/location mode where `api_key` holds an OAuth access token.
-/// The Bearer value is built once and cached on the client.
 fn authHeader(self: *Client) error{OutOfMemory}!std.http.Header {
-    if (self.vertex) |v| if (v.project != null) {
-        const value = self.bearer_value orelse blk: {
-            const b = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key});
-            self.bearer_value = b;
-            break :blk b;
-        };
-        return .{ .name = "authorization", .value = value };
-    };
+    if (self.vertex) |v| if (v.project != null) return self.bearer.header(self.allocator, self.api_key);
     return .{ .name = "x-goog-api-key", .value = self.api_key };
 }
 
@@ -996,7 +987,7 @@ test "authHeader: api key vs cached bearer token" {
     var project = Client.init(std.testing.io, std.testing.allocator, "tok", .{ .vertex = .{ .project = "p" } });
     defer project.deinit();
     const first = try project.authHeader();
-    try std.testing.expectEqualStrings("authorization", first.name);
+    try std.testing.expectEqualStrings("Authorization", first.name);
     try std.testing.expectEqualStrings("Bearer tok", first.value);
     // Built once and cached; deinit frees it (leak-checked by the test allocator).
     const second = try project.authHeader();

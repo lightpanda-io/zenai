@@ -30,8 +30,7 @@ session_id: ?[]const u8,
 http_client: std.http.Client,
 last_error: http.ErrorDetail = .{},
 interrupt: ?*http.Interrupt = null,
-/// Cached "Bearer {token}" header value, built on first request.
-authorization: ?[]const u8 = null,
+bearer: http.BearerAuth = .{},
 
 pub const InitOptions = struct {
     base_url: []const u8 = "https://chatgpt.com/backend-api/codex",
@@ -60,7 +59,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, access_token: []const u8, 
 
 pub fn deinit(self: *Client) void {
     if (self.account_id) |a| self.allocator.free(a);
-    if (self.authorization) |a| self.allocator.free(a);
+    self.bearer.deinit(self.allocator);
     self.last_error.deinit(self.allocator);
     self.http_client.deinit();
 }
@@ -70,10 +69,7 @@ pub fn deinit(self: *Client) void {
 /// after this returns.
 pub fn setApiKey(self: *Client, token: []const u8) void {
     self.access_token = token;
-    if (self.authorization) |a| {
-        self.allocator.free(a);
-        self.authorization = null;
-    }
+    self.bearer.deinit(self.allocator);
 }
 
 // Same wire protocol and transport as the openai client, so the same failures.
@@ -81,10 +77,8 @@ pub const ApiError = openai_mod.ApiError;
 pub const StreamError = openai_mod.StreamError;
 
 fn authHeaders(self: *Client, buf: *[5]std.http.Header) ![]const std.http.Header {
-    if (self.authorization == null)
-        self.authorization = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.access_token});
     var n: usize = 0;
-    buf[n] = .{ .name = "authorization", .value = self.authorization.? };
+    buf[n] = try self.bearer.header(self.allocator, self.access_token);
     n += 1;
     buf[n] = .{ .name = "originator", .value = self.originator };
     n += 1;
@@ -138,7 +132,7 @@ test "authHeaders: bearer + account-id + originator + session-id, no api-key" {
     defer client.deinit();
     var buf: [5]std.http.Header = undefined;
     const headers = try client.authHeaders(&buf);
-    try std.testing.expectEqualStrings("Bearer tok-abc", headerValue(headers, "authorization").?);
+    try std.testing.expectEqualStrings("Bearer tok-abc", headerValue(headers, "Authorization").?);
     try std.testing.expectEqualStrings("acct-1", headerValue(headers, "ChatGPT-Account-Id").?);
     try std.testing.expectEqualStrings("sess-1", headerValue(headers, "session-id").?);
     try std.testing.expectEqualStrings("lightpanda", headerValue(headers, "originator").?);
@@ -159,10 +153,10 @@ test "setApiKey rebuilds the cached bearer value" {
     var client = try Client.init(std.testing.io, std.testing.allocator, "tok-old", .{});
     defer client.deinit();
     var buf: [5]std.http.Header = undefined;
-    try std.testing.expectEqualStrings("Bearer tok-old", headerValue(try client.authHeaders(&buf), "authorization").?);
+    try std.testing.expectEqualStrings("Bearer tok-old", headerValue(try client.authHeaders(&buf), "Authorization").?);
     client.setApiKey("tok-new");
-    try std.testing.expectEqual(@as(?[]const u8, null), client.authorization);
-    try std.testing.expectEqualStrings("Bearer tok-new", headerValue(try client.authHeaders(&buf), "authorization").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), client.bearer.value);
+    try std.testing.expectEqualStrings("Bearer tok-new", headerValue(try client.authHeaders(&buf), "Authorization").?);
 }
 
 test "Codex ResponsesRequest serializes store/include/reasoning.summary, omits max_output_tokens" {
