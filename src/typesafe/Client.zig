@@ -43,6 +43,14 @@ pub fn envApiKey(environ: std.process.Environ) ?[:0]const u8 {
     return environ.getPosix(env_var_name);
 }
 
+/// The environment variable `envBaseUrl` reads, to point the client at a
+/// gateway or a local mock.
+pub const base_url_env_var_name = "TYPESAFE_BASE_URL";
+
+pub fn envBaseUrl(environ: std.process.Environ) []const u8 {
+    return environ.getPosix(base_url_env_var_name) orelse default_base_url;
+}
+
 pub const InitOptions = struct {
     base_url: []const u8 = default_base_url,
     retry_policy: RetryPolicy = .{},

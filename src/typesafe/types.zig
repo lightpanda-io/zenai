@@ -179,6 +179,22 @@ pub const ScoreAnswer = struct {
     legend: Legend = .{},
     probabilities: Probabilities = .{},
     confidence: f64 = 0,
+
+    /// The legend entry whose level index is nearest `score`; null when the
+    /// legend is empty.
+    pub fn nearestLevel(self: ScoreAnswer) ?Legend.Entry {
+        var best: ?Legend.Entry = null;
+        var best_distance = std.math.inf(f64);
+        for (self.legend.entries) |entry| {
+            const index = std.fmt.parseFloat(f64, entry.key) catch continue;
+            const distance = @abs(index - self.score);
+            if (distance < best_distance) {
+                best = entry;
+                best_distance = distance;
+            }
+        }
+        return best;
+    }
 };
 
 /// One answer, discriminated by the wire's `"type"`. Every slice borrows the
@@ -693,4 +709,20 @@ test "dupeModel outlives the response the model borrows" {
     const owned = try response.dupeModel(std.testing.allocator);
     defer std.testing.allocator.free(owned);
     try std.testing.expectEqualStrings("jev-1.13.0", owned);
+}
+
+test "nearestLevel picks the legend entry closest to the score" {
+    var answer: ScoreAnswer = .{
+        .score = 1.64,
+        .legend = .init(&.{
+            .{ .key = "0", .value = .{ .text = "none" } },
+            .{ .key = "1", .value = .{ .text = "some" } },
+            .{ .key = "2", .value = .{ .text = "lots" } },
+        }),
+    };
+    try std.testing.expectEqualStrings("lots", answer.nearestLevel().?.value.text);
+    answer.score = 0.4;
+    try std.testing.expectEqualStrings("0", answer.nearestLevel().?.key);
+    answer.legend = .{};
+    try std.testing.expect(answer.nearestLevel() == null);
 }

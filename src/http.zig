@@ -12,8 +12,9 @@ pub const FetchError = error{
 } || std.http.Client.FetchError || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error || std.Uri.ParseError;
 
 /// Non-2xx detail captured via a client's `setErrorDetail` for later
-/// inspection. `message` is the body's `error.message` when the body is a
-/// provider JSON error, otherwise the raw body; null when the body was empty.
+/// inspection. `message` is the one-line message of a provider JSON error
+/// (see `extractErrorMessage`), otherwise the raw body; null when the body
+/// was empty.
 /// Owns `message`; `set` frees the previous message, `deinit` the last.
 pub const ErrorDetail = struct {
     status: ?u10 = null,
@@ -36,6 +37,15 @@ pub const ErrorDetail = struct {
     pub fn deinit(self: *ErrorDetail, allocator: std.mem.Allocator) void {
         if (self.message) |b| allocator.free(b);
         self.* = .{};
+    }
+
+    /// A copy owning its own `message`, to keep past the client's next call
+    /// or `deinit`.
+    pub fn clone(self: ErrorDetail, allocator: std.mem.Allocator) std.mem.Allocator.Error!ErrorDetail {
+        return .{
+            .status = self.status,
+            .message = if (self.message) |m| try allocator.dupe(u8, m) else null,
+        };
     }
 };
 
@@ -671,13 +681,60 @@ pub fn streamNdjsonValue(
 /// Parses only `message`: sibling fields vary by provider (e.g. llama.cpp types
 /// `code` as an int where OpenAI uses a string), so a full typed parse would
 /// fail and cost us the message.
+/// The message in a JSON error body: `error.message` (OpenAI, Anthropic,
+/// Gemini), or FastAPI's `detail` as a string, as an object's `message`
+/// (TypeSafe), or as a validation list's first `msg`.
 pub fn extractErrorMessage(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
-    const Body = struct { @"error": ?struct { message: ?[]const u8 = null } = null };
-    const parsed = std.json.parseFromSlice(Body, allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
     defer parsed.deinit();
-    const err = parsed.value.@"error" orelse return null;
-    const msg = err.message orelse return null;
-    return allocator.dupe(u8, msg) catch null;
+    if (parsed.value != .object) return null;
+    const root = parsed.value.object;
+    const msg = if (root.get("error")) |err|
+        stringField(err, "message")
+    else if (root.get("detail")) |detail| switch (detail) {
+        .string => |s| s,
+        .object => stringField(detail, "message"),
+        .array => |list| if (list.items.len > 0) stringField(list.items[0], "msg") else null,
+        else => null,
+    } else null;
+    return allocator.dupe(u8, msg orelse return null) catch null;
+}
+
+fn stringField(value: std.json.Value, name: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    const field = value.object.get(name) orelse return null;
+    return if (field == .string) field.string else null;
+}
+
+test "extractErrorMessage reads each provider's error shape" {
+    const cases = [_]struct { body: []const u8, want: ?[]const u8 }{
+        .{ .body = "{\"error\":{\"message\":\"bad key\",\"type\":\"auth\"}}", .want = "bad key" },
+        .{ .body = "{\"detail\":{\"error_type\":\"authentication_error\",\"message\":\"Cannot authenticate\"}}", .want = "Cannot authenticate" },
+        .{ .body = "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"body\",\"model\"],\"msg\":\"Field required\"}]}", .want = "Field required" },
+        .{ .body = "{\"detail\":\"Not Found\"}", .want = "Not Found" },
+        .{ .body = "{\"detail\":[]}", .want = null },
+        .{ .body = "{\"error\":\"plain\"}", .want = null },
+        .{ .body = "<html>502</html>", .want = null },
+    };
+    for (cases) |case| {
+        const got = extractErrorMessage(std.testing.allocator, case.body);
+        defer if (got) |g| std.testing.allocator.free(g);
+        if (case.want) |want| {
+            try std.testing.expectEqualStrings(want, got orelse return error.TestExpectedMessage);
+        } else {
+            try std.testing.expect(got == null);
+        }
+    }
+}
+
+test "ErrorDetail.clone outlives the original" {
+    var detail: ErrorDetail = .{};
+    detail.set(std.testing.allocator, 401, "{\"detail\":{\"message\":\"nope\"}}");
+    const copy = try detail.clone(std.testing.allocator);
+    defer std.testing.allocator.free(copy.message.?);
+    detail.deinit(std.testing.allocator);
+    try std.testing.expectEqual(401, copy.status);
+    try std.testing.expectEqualStrings("nope", copy.message.?);
 }
 
 /// Owns the parsed response and its backing memory.

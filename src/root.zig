@@ -89,6 +89,8 @@ pub const typesafe = struct {
 
     pub const env_var_name = Client.env_var_name;
     pub const envApiKey = Client.envApiKey;
+    pub const base_url_env_var_name = Client.base_url_env_var_name;
+    pub const envBaseUrl = Client.envBaseUrl;
 };
 
 pub const provider = @import("provider.zig");
