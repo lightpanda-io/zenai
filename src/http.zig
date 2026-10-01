@@ -367,7 +367,11 @@ fn exchange(
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
 
     _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
-        error.ReadFailed => return response.bodyErr().?,
+        // A transport failure mid-body leaves `bodyErr` null: std records only
+        // framing errors there. It stays generic rather than going through
+        // `readError`, because a reset here is not a stale socket -- the server
+        // has the request -- and must not be resent by `reconnectOnStale`.
+        error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
         else => |e| return e,
     };
 
@@ -738,11 +742,11 @@ const Loopback = struct {
         fn setErrorDetail(_: *NoDetail, _: u10, _: []const u8) void {}
     };
 
-    /// Serve one connection with `serveOnce(respond)` on a thread while `run`
+    /// Serve one connection with `serveOnce(serve)` on a thread while `run`
     /// makes one call. A failed call may never have reached `accept`, so on
     /// error connect once to let the thread return: the join cannot hang.
-    fn served(self: *Loopback, respond: bool, comptime run: anytype, args: anytype) @typeInfo(@TypeOf(run)).@"fn".return_type.? {
-        const thread = std.Thread.spawn(.{}, serveOnce, .{ &self.server, respond }) catch unreachable;
+    fn served(self: *Loopback, serve: Serve, comptime run: anytype, args: anytype) @typeInfo(@TypeOf(run)).@"fn".return_type.? {
+        const thread = std.Thread.spawn(.{}, serveOnce, .{ &self.server, serve }) catch unreachable;
         defer thread.join();
         errdefer if (self.server.socket.address.connect(std.testing.io, .{ .mode = .stream })) |s| s.close(std.testing.io) else |_| {};
         return @call(.auto, run, args);
@@ -751,8 +755,8 @@ const Loopback = struct {
     /// One JSON fetch with retries disabled. The timeout turns a reconnect
     /// that wrongly waits on a connection nobody accepts into an error instead
     /// of a hang.
-    fn fetch(self: *Loopback, respond: bool) FetchError!Response(Ok) {
-        return self.served(respond, fetchOk, .{self});
+    fn fetch(self: *Loopback, serve: Serve) FetchError!Response(Ok) {
+        return self.served(serve, fetchOk, .{self});
     }
 
     fn fetchOk(self: *Loopback) FetchError!Response(Ok) {
@@ -763,8 +767,8 @@ const Loopback = struct {
     }
 
     /// One NDJSON stream; returns how many events reached the callback.
-    fn stream(self: *Loopback, respond: bool) SseError!u32 {
-        return self.served(respond, streamOk, .{self});
+    fn stream(self: *Loopback, serve: Serve) SseError!u32 {
+        return self.served(serve, streamOk, .{self});
     }
 
     fn streamOk(self: *Loopback) SseError!u32 {
@@ -779,22 +783,42 @@ const Loopback = struct {
     }
 };
 
-/// Test server half for the stale-socket tests: accept one connection and,
-/// when `respond`, answer one request with keep-alive before closing it, which
-/// leaves the client holding a pooled socket the server has already closed.
-/// Without `respond` the connection closes unanswered.
-fn serveOnce(server: *std.Io.net.Server, respond: bool) void {
+/// What `serveOnce` does with the one connection it accepts.
+const Serve = enum {
+    /// Answer one request with keep-alive, then close: the client is left
+    /// holding a pooled socket the server has already closed.
+    respond,
+    /// Close without answering.
+    hang_up,
+    /// Send a head and part of the body, then close with the request still
+    /// unread, which makes the kernel reset the connection mid-body.
+    reset_mid_body,
+};
+
+/// Test server half for the loopback tests: accept one connection and handle
+/// it as `serve` says.
+fn serveOnce(server: *std.Io.net.Server, serve: Serve) void {
     const io = std.testing.io;
     const stream = server.accept(io) catch return;
     defer stream.close(io);
-    if (!respond) return;
-    var read_buf: [4096]u8 = undefined;
     var write_buf: [256]u8 = undefined;
-    var reader = stream.reader(io, &read_buf);
     var writer = stream.writer(io, &write_buf);
-    var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
-    var request = http_server.receiveHead() catch return;
-    request.respond("{\"ok\":true}\n", .{ .keep_alive = true }) catch return;
+    switch (serve) {
+        .hang_up => {},
+        .reset_mid_body => {
+            writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{") catch return;
+            writer.interface.flush() catch return;
+            // Let the client take the head before the reset discards it.
+            io.sleep(.fromMilliseconds(50), .awake) catch {};
+        },
+        .respond => {
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(io, &read_buf);
+            var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
+            var request = http_server.receiveHead() catch return;
+            request.respond("{\"ok\":true}\n", .{ .keep_alive = true }) catch return;
+        },
+    }
 }
 
 test "watchdog turns a stalled response into error.Timeout" {
@@ -821,9 +845,9 @@ test "a pooled socket the server closed while idle is reconnected despite RetryP
     // The first call pools its socket; the server then closes it. The second
     // call picks the dead socket from the pool, and must reconnect to the next
     // `serveOnce` instead of failing with HttpConnectionClosing.
-    var first = try t.fetch(true);
+    var first = try t.fetch(.respond);
     first.deinit();
-    var second = try t.fetch(true);
+    var second = try t.fetch(.respond);
     defer second.deinit();
     try std.testing.expect(second.value.ok);
 }
@@ -832,19 +856,27 @@ test "the stale-socket reconnect happens once, not again on a fresh connection" 
     var t: Loopback = try .init();
     defer t.deinit();
 
-    var first = try t.fetch(true);
+    var first = try t.fetch(.respond);
     first.deinit();
 
     // The pooled socket is dead and the reconnect's fresh connection is closed
     // unanswered too: that is the server, not a stale pool, so it surfaces.
     // A second reconnect would sit in the listen backlog until the timeout.
-    try std.testing.expectError(error.HttpConnectionClosing, t.fetch(false));
+    try std.testing.expectError(error.HttpConnectionClosing, t.fetch(.hang_up));
 }
 
 test "a stream on a pooled socket the server closed while idle is reconnected" {
     var t: Loopback = try .init();
     defer t.deinit();
 
-    try std.testing.expectEqual(1, try t.stream(true));
-    try std.testing.expectEqual(1, try t.stream(true));
+    try std.testing.expectEqual(1, try t.stream(.respond));
+    try std.testing.expectEqual(1, try t.stream(.respond));
+}
+
+test "a connection reset mid-body fails the call instead of panicking, and is not resent" {
+    var t: Loopback = try .init();
+    defer t.deinit();
+
+    // A reconnect would wait on a connection nobody accepts until the timeout.
+    try std.testing.expectError(error.ReadFailed, t.fetch(.reset_mid_body));
 }
