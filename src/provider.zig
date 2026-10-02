@@ -1294,8 +1294,9 @@ pub const llama_cpp_default_base_url = openAiPreset(.llama_cpp).?.base_url;
 pub fn defaultModel(tag: Tag) []const u8 {
     if (openAiPreset(tag)) |p| return p.default_model;
     return switch (tag) {
-        .anthropic => "claude-sonnet-5",
-        .openai, .codex => "gpt-5.5",
+        .anthropic => "claude-sonnet-5-5",
+        .openai => "gpt-6-luna",
+        .codex => "gpt-5.5",
         .gemini, .vertex => "gemini-3.8-flash",
         .openai_compatible => "",
         else => unreachable,
@@ -2238,7 +2239,7 @@ fn mapGeminiFinishReason(response: gemini_types.GenerateContentResponse) FinishR
     const reason = candidates[0].finishReason orelse return .unknown;
     return switch (reason) {
         .STOP => .stop,
-        .MAX_TOKENS => .max_tokens,
+        .MAX_TOKENS, .CONTINUATION => .max_tokens,
         .SAFETY, .RECITATION, .PROHIBITED_CONTENT, .SPII, .BLOCKLIST => .safety,
         .MALFORMED_FUNCTION_CALL => .tool_call,
         else => .unknown,

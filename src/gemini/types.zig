@@ -126,6 +126,9 @@ pub const FinishReason = union(enum) {
     MALFORMED_FUNCTION_CALL,
     /// Model called too many tools consecutively, so the system exited execution.
     TOO_MANY_TOOL_CALLS,
+    /// Hit the per-request token limit before generation completed; resume by
+    /// sending the candidate's `continuationToken` in the next request.
+    CONTINUATION,
     unknown: []const u8,
 
     pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
@@ -196,6 +199,26 @@ pub const ToolType = enum {
     GOOGLE_MAPS,
     /// File search tool.
     FILE_SEARCH,
+    /// Media processing tool.
+    MEDIA_PROCESSING,
+};
+
+/// How the model processes input media for understanding.
+pub const MediaProcessing = enum {
+    MEDIA_PROCESSING_UNSPECIFIED,
+    /// Fixed-rate frame extraction; all frames placed in context.
+    STATIC,
+    /// Model-driven dynamic navigation. Recommended for most use cases.
+    AGENTIC,
+};
+
+/// Audio transcription mode.
+pub const AudioTranscriptionMode = enum {
+    MODE_UNSPECIFIED,
+    VERBATIM,
+    /// Removes disfluencies and lightly cleans up and formats the text.
+    /// Incompatible with timestamps and diarization.
+    SMART,
 };
 
 // --- Core Types ---
@@ -337,6 +360,18 @@ pub const Part = struct {
     toolResponse: ?ToolResponse = null,
     /// The transcription of the audio part (output only).
     audioTranscription: ?Transcription = null,
+    /// How the model processes this part's media for understanding.
+    mediaProcessing: ?MediaProcessing = null,
+    /// Speech-synthesis metadata (speaker, style); only valid on text parts.
+    speechMetadata: ?SpeechMetadata = null,
+};
+
+/// Extra metadata associated with a part for speech synthesis.
+pub const SpeechMetadata = struct {
+    /// Must match a `speaker` name in the multi-speaker voice config.
+    speaker: ?[]const u8 = null,
+    /// Style instruction for the voice (e.g. "excited, fast-paced").
+    style: ?[]const u8 = null,
 };
 
 /// Contains the multi-part content of a message.
@@ -515,6 +550,8 @@ pub const AudioTranscriptionConfig = struct {
     diarization: ?bool = null,
     /// Configures word-level timestamp generation.
     wordTimestamp: ?bool = null,
+    /// Transcription mode; defaults to VERBATIM.
+    mode: ?AudioTranscriptionMode = null,
 };
 
 /// Optional model configuration parameters for content generation.
@@ -557,8 +594,6 @@ pub const GenerationConfig = struct {
     mediaResolution: ?MediaResolution = null,
     /// Whether to include audio timestamps in the response.
     audioTimestamp: ?bool = null,
-    /// Labels with user-defined metadata to break down billed charges.
-    labels: ?std.json.Value = null,
     /// Output schema of the generated response (alternative to responseSchema).
     responseJsonSchema: ?std.json.Value = null,
     /// Configuration for audio transcription (speech recognition).
@@ -585,6 +620,11 @@ pub const GenerateContentRequest = struct {
     modelArmorConfig: ?ModelArmorConfig = null,
     /// The service tier to use for the request.
     serviceTier: ?ServiceTier = null,
+    /// User-defined metadata labels for the request.
+    labels: ?std.json.Value = null,
+    /// Resumes generation from a candidate that stopped with `CONTINUATION`
+    /// (base64, as returned).
+    continuationToken: ?[]const u8 = null,
 };
 
 // --- Response Types ---
@@ -736,6 +776,9 @@ pub const Candidate = struct {
     logprobsResult: ?LogprobsResult = null,
     /// Grounding metadata (sources used when Google Search grounding is enabled).
     groundingMetadata: ?GroundingMetadata = null,
+    /// Opaque token (base64) returned with finishReason `CONTINUATION`; pass it
+    /// as the next request's `continuationToken` to keep generating.
+    continuationToken: ?[]const u8 = null,
 };
 
 /// Response modality type.
@@ -1202,4 +1245,20 @@ test "ThinkingConfig serializes correctly with thinkingLevel" {
     const json = buf.written();
     try std.testing.expect(std.mem.find(u8, json, "thinkingLevel") != null);
     try std.testing.expect(std.mem.find(u8, json, "HIGH") != null);
+}
+
+test "Candidate parses CONTINUATION and continuationToken" {
+    const json =
+        \\{"candidates":[{"content":{"role":"model","parts":[{"text":"partial"}]},"finishReason":"CONTINUATION","continuationToken":"YWJj"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(
+        GenerateContentResponse,
+        std.testing.allocator,
+        json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    const c = parsed.value.candidates.?[0];
+    try std.testing.expect(std.meta.activeTag(c.finishReason.?) == .CONTINUATION);
+    try std.testing.expectEqualStrings("YWJj", c.continuationToken.?);
 }
