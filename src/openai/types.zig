@@ -394,6 +394,33 @@ pub const ResponsesRequest = struct {
     store: ?bool = null,
     include: ?[]const []const u8 = null,
     prompt_cache_key: ?[]const u8 = null,
+    /// Prompt-cache breakpoint and diagnostics controls.
+    prompt_cache_options: ?PromptCacheOptions = null,
+};
+
+/// Prompt-caching options for a responses request.
+pub const PromptCacheOptions = struct {
+    /// A response ID to compare against; requests `prompt_cache_diagnostics`
+    /// in the response.
+    comparison_response_id: ?[]const u8 = null,
+    /// "implicit" (default) or "explicit" (no implicit breakpoint).
+    mode: ?[]const u8 = null,
+    /// Minimum lifetime of each cache breakpoint; "30m" is the only value.
+    ttl: ?[]const u8 = null,
+};
+
+/// Why the prompt cache was or wasn't reused against the response named by
+/// `prompt_cache_options.comparison_response_id`.
+pub const PromptCacheDiagnostics = struct {
+    /// "cache_miss", "cache_hit", "comparison_response_not_found", "unavailable".
+    type: ?[]const u8 = null,
+    /// Why reuse did not occur (type="cache_miss"), e.g. "model_changed",
+    /// "tools_changed", "input_changed".
+    reason: ?[]const u8 = null,
+    /// Estimated input tokens affected after the first divergence (type="cache_miss").
+    cache_missed_tokens: ?i64 = null,
+    /// Token count of the reusable prefix in the compared response (type="cache_miss").
+    comparison_reusable_tokens: ?i64 = null,
 };
 
 /// A content block within an output `message` item. `output_text` blocks carry
@@ -450,6 +477,8 @@ pub const ResponsesResponse = struct {
     output: ?[]const ResponseOutputItem = null,
     usage: ?ResponsesUsage = null,
     incomplete_details: ?IncompleteDetails = null,
+    /// Set when the request supplied `prompt_cache_options.comparison_response_id`.
+    prompt_cache_diagnostics: ?PromptCacheDiagnostics = null,
 
     /// First `output_text` across the output items, or null if the model
     /// returned only tool calls / reasoning.

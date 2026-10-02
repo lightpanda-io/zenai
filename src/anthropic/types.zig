@@ -133,7 +133,7 @@ pub const ToolChoice = struct {
 
 /// Configuration for extended thinking.
 pub const ThinkingConfig = struct {
-    /// "enabled", "disabled", "adaptive".
+    /// "enabled", "disabled", "between_tools", "adaptive".
     type: []const u8 = "disabled",
     /// Token budget for thinking (when type="enabled").
     budget_tokens: ?i32 = null,
@@ -151,7 +151,7 @@ pub const OutputConfig = struct {
 
 /// Request body for the messages endpoint.
 pub const MessageRequest = struct {
-    /// The model to use (e.g. "claude-sonnet-5").
+    /// The model to use (e.g. "claude-sonnet-5-5").
     model: []const u8,
     /// The messages in the conversation.
     messages: []const MessageParam,
@@ -182,6 +182,27 @@ pub const MessageRequest = struct {
     /// Top-level cache control — applies an ephemeral cache_control marker to
     /// the last cacheable block in the request (automatic caching).
     cache_control: ?CacheControlEphemeral = null,
+    /// Request-level diagnostics: ask the response to explain any prompt-cache
+    /// divergence from a previous request.
+    diagnostics: ?DiagnosticsParam = null,
+};
+
+/// Request-level diagnostics.
+pub const DiagnosticsParam = struct {
+    /// The `id` (`msg_...`) of this client's previous messages response. The
+    /// server compares that request's prompt against this one and returns
+    /// `diagnostics.cache_miss_reason` when the cached prefix could not be
+    /// reused. Null opts in on the first turn, with nothing to compare yet.
+    previous_message_id: ?[]const u8 = null,
+
+    /// Always emits `previous_message_id`: an explicit null is the first-turn
+    /// opt-in, so it must survive `emit_null_optional_fields = false`.
+    pub fn jsonStringify(self: DiagnosticsParam, jws: anytype) !void {
+        try jws.beginObject();
+        try jws.objectField("previous_message_id");
+        try jws.write(self.previous_message_id);
+        try jws.endObject();
+    }
 };
 
 /// Request metadata.
@@ -254,6 +275,23 @@ pub const RefusalStopDetails = struct {
     type: ?[]const u8 = null,
 };
 
+/// Why the prompt cache could not fully reuse the prefix of the request named
+/// by `diagnostics.previous_message_id`.
+pub const CacheMissReason = struct {
+    /// "model_changed", "system_changed", "tools_changed", "messages_changed",
+    /// "previous_message_not_found", "unavailable".
+    type: ?[]const u8 = null,
+    /// Input tokens that missed the cache (all but "previous_message_not_found"
+    /// and "unavailable").
+    cache_missed_input_tokens: ?i64 = null,
+};
+
+/// Response-level diagnostics.
+pub const Diagnostics = struct {
+    /// Null while the background comparison is still pending.
+    cache_miss_reason: ?CacheMissReason = null,
+};
+
 /// Response from the messages endpoint.
 pub const MessageResponse = struct {
     /// Unique message identifier.
@@ -274,6 +312,9 @@ pub const MessageResponse = struct {
     stop_sequence: ?[]const u8 = null,
     /// Token usage statistics.
     usage: ?Usage = null,
+    /// Prompt-cache diagnostics; null unless the request supplied
+    /// `diagnostics` and a divergence was detected.
+    diagnostics: ?Diagnostics = null,
 
     /// Extract text from the first text content block.
     pub fn text(self: MessageResponse) ?[]const u8 {
@@ -479,6 +520,37 @@ test "Usage parses output_tokens_details" {
     const usage = parsed.value.usage.?;
     try std.testing.expectEqual(@as(i32, 120), usage.output_tokens.?);
     try std.testing.expectEqual(@as(i64, 80), usage.output_tokens_details.?.thinking_tokens.?);
+}
+
+test "DiagnosticsParam emits a null previous_message_id" {
+    const content = [_]ContentBlockParam{.{ .text = "hi" }};
+    const messages = [_]MessageParam{.{ .role = .user, .content = &content }};
+    const req = MessageRequest{
+        .model = "claude-sonnet-5-5",
+        .messages = &messages,
+        .max_tokens = 16,
+        .diagnostics = .{},
+    };
+    var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buf.deinit();
+    try std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &buf.writer);
+    try std.testing.expect(std.mem.find(u8, buf.written(), "\"diagnostics\":{\"previous_message_id\":null}") != null);
+}
+
+test "MessageResponse parses diagnostics" {
+    const json =
+        \\{"id":"msg_2","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","diagnostics":{"cache_miss_reason":{"type":"tools_changed","cache_missed_input_tokens":4096}}}
+    ;
+    const parsed = try std.json.parseFromSlice(
+        MessageResponse,
+        std.testing.allocator,
+        json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    const reason = parsed.value.diagnostics.?.cache_miss_reason.?;
+    try std.testing.expectEqualStrings("tools_changed", reason.type.?);
+    try std.testing.expectEqual(@as(i64, 4096), reason.cache_missed_input_tokens.?);
 }
 
 test "Role serializes correctly" {
