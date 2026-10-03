@@ -154,7 +154,7 @@ fn fetchModelContextLength(client: *Client, model: []const u8) !?i32 {
 
 fn showUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
     const origin = stripV1(base_url);
-    return std.fmt.allocPrint(allocator, "{s}/api/show", .{origin});
+    return allocator.print("{s}/api/show", .{origin});
 }
 
 /// Strip the OpenAI-compatible `/v1` suffix (or a trailing slash) to recover
@@ -169,7 +169,7 @@ fn stripV1(base_url: []const u8) []const u8 {
 /// Derive the native `/api/chat` URL from the OpenAI-compatible base URL the
 /// client was built with (e.g. `http://localhost:11434/v1` → `…/api/chat`).
 fn chatUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/api/chat", .{stripV1(base_url)});
+    return allocator.print("{s}/api/chat", .{stripV1(base_url)});
 }
 
 /// Build the `/api/chat` body, sizing a null `options.num_ctx` to the serialized

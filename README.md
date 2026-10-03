@@ -18,7 +18,7 @@ const zenai = b.dependency("zenai", .{});
 exe.root_module.addImport("zenai", zenai.module("zenai"));
 ```
 
-Requires Zig >= 0.16.0. The examples below assume `allocator`, `io`, and `environ` are in scope; with Zig 0.16's main signature they come straight from `std.process.Init`:
+Requires Zig >= 0.17.0. The examples below assume `allocator`, `io`, and `environ` are in scope; with Zig's `main` signature they come straight from `std.process.Init`:
 
 ```zig
 pub fn main(init: std.process.Init) !void {

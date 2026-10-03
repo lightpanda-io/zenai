@@ -82,10 +82,10 @@ pub const Message = struct {
     /// `content` in place of the text.
     pub fn jsonStringify(self: Message, jws: anytype) !void {
         try jws.beginObject();
-        inline for (std.meta.fields(Message)) |f| {
-            if (comptime std.mem.eql(u8, f.name, "content_parts")) {
+        inline for (@typeInfo(Message).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "content_parts")) {
                 // Emitted under `content` below.
-            } else if (comptime std.mem.eql(u8, f.name, "content")) {
+            } else if (comptime std.mem.eql(u8, name, "content")) {
                 if (self.content_parts) |parts| {
                     try jws.objectField("content");
                     try jws.write(parts);
@@ -93,8 +93,8 @@ pub const Message = struct {
                     try jws.objectField("content");
                     try jws.write(v);
                 }
-            } else if (@field(self, f.name)) |v| {
-                try jws.objectField(f.name);
+            } else if (@field(self, name)) |v| {
+                try jws.objectField(name);
                 try jws.write(v);
             }
         }

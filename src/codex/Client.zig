@@ -108,7 +108,7 @@ pub fn createResponseStream(
     callback: *const fn (@TypeOf(context), ResponseStreamEvent) void,
 ) StreamError!void {
     if (self.access_token.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/responses", .{self.base_url});
+    const url = try self.allocator.print("{s}/responses", .{self.base_url});
     defer self.allocator.free(url);
 
     var req_body = request;
