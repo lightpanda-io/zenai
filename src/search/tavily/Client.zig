@@ -67,7 +67,7 @@ pub fn search(
 ) ApiError!Response(SearchResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/search", .{self.base_url});
+    const url = try self.allocator.print("{s}/search", .{self.base_url});
     defer self.allocator.free(url);
 
     var request = options;

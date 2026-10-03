@@ -493,7 +493,7 @@ pub fn embedContent(
 ) !Response(types.EmbedContentResponse) {
     try self.requireDeveloperApi();
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}/models/{s}:embedContent", .{ self.devBaseUrl(), self.api_version, model });
+    const url = try self.allocator.print("{s}/{s}/models/{s}:embedContent", .{ self.devBaseUrl(), self.api_version, model });
     defer self.allocator.free(url);
     return self.fetchPost(url, types.EmbedContentRequest{
         .content = content,
@@ -537,7 +537,7 @@ pub fn uploadFile(
     if (self.api_key.len == 0) return error.MissingApiKey;
 
     // Stage 1: Initialize resumable upload
-    const create_url = try std.fmt.allocPrint(self.allocator, "{s}/upload/{s}/files", .{ self.devBaseUrl(), self.api_version });
+    const create_url = try self.allocator.print("{s}/upload/{s}/files", .{ self.devBaseUrl(), self.api_version });
     defer self.allocator.free(create_url);
 
     var metadata_buf: std.Io.Writer.Allocating = .init(self.allocator);
@@ -578,7 +578,7 @@ pub fn uploadFile(
     var redirect_buf: [0]u8 = undefined;
     var init_response = try req.receiveHead(&redirect_buf);
 
-    const init_status: u10 = @intFromEnum(init_response.head.status);
+    const init_status: u10 = @backingInt(init_response.head.status);
     if (init_status < 200 or init_status >= 300) {
         self.setErrorDetail(init_status, "");
         return error.ApiError;
@@ -624,7 +624,7 @@ pub fn uploadFile(
     var upload_redirect_buf: [0]u8 = undefined;
     var upload_response = try upload_req.receiveHead(&upload_redirect_buf);
 
-    const upload_status: u10 = @intFromEnum(upload_response.head.status);
+    const upload_status: u10 = @backingInt(upload_response.head.status);
     if (upload_status < 200 or upload_status >= 300) {
         self.setErrorDetail(upload_status, "");
         return error.ApiError;
@@ -648,7 +648,7 @@ pub fn uploadFile(
 pub fn getFile(self: *Client, name: []const u8) !Response(types.File) {
     try self.requireDeveloperApi();
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}", .{ self.devBaseUrl(), self.api_version, name });
+    const url = try self.allocator.print("{s}/{s}/{s}", .{ self.devBaseUrl(), self.api_version, name });
     defer self.allocator.free(url);
     return self.fetchGet(url, types.File);
 }
@@ -657,7 +657,7 @@ pub fn getFile(self: *Client, name: []const u8) !Response(types.File) {
 pub fn listFiles(self: *Client, options: ListOptions) !Response(types.ListFilesResponse) {
     try self.requireDeveloperApi();
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const base = try std.fmt.allocPrint(self.allocator, "{s}/{s}/files", .{ self.devBaseUrl(), self.api_version });
+    const base = try self.allocator.print("{s}/{s}/files", .{ self.devBaseUrl(), self.api_version });
     defer self.allocator.free(base);
     const url = try http.appendListParams(self.allocator, base, options);
     defer self.allocator.free(url);
@@ -680,7 +680,7 @@ pub fn downloadFile(self: *Client, uri: []const u8) ![]u8 {
         .response_writer = &response_buf.writer,
     });
 
-    const status_code: u10 = @intFromEnum(result.status);
+    const status_code: u10 = @backingInt(result.status);
     if (status_code < 200 or status_code >= 300) {
         self.setErrorDetail(status_code, response_buf.written());
         response_buf.deinit();
@@ -694,7 +694,7 @@ pub fn downloadFile(self: *Client, uri: []const u8) ![]u8 {
 pub fn deleteFile(self: *Client, name: []const u8) !void {
     try self.requireDeveloperApi();
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}", .{ self.devBaseUrl(), self.api_version, name });
+    const url = try self.allocator.print("{s}/{s}/{s}", .{ self.devBaseUrl(), self.api_version, name });
     defer self.allocator.free(url);
 
     const result = try self.http_client.fetch(.{
@@ -705,7 +705,7 @@ pub fn deleteFile(self: *Client, name: []const u8) !void {
         },
     });
 
-    const status_code: u10 = @intFromEnum(result.status);
+    const status_code: u10 = @backingInt(result.status);
     if (status_code < 200 or status_code >= 300) {
         self.setErrorDetail(status_code, "");
         return error.ApiError;
@@ -741,10 +741,10 @@ pub fn createCachedContent(
 ) !Response(types.CachedContent) {
     try self.requireDeveloperApi();
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}/cachedContents", .{ self.devBaseUrl(), self.api_version });
+    const url = try self.allocator.print("{s}/{s}/cachedContents", .{ self.devBaseUrl(), self.api_version });
     defer self.allocator.free(url);
 
-    const full_model = try std.fmt.allocPrint(self.allocator, "models/{s}", .{model});
+    const full_model = try self.allocator.print("models/{s}", .{model});
     defer self.allocator.free(full_model);
 
     return self.fetchPost(url, types.CreateCachedContentRequest{
@@ -763,7 +763,7 @@ pub fn createCachedContent(
 pub fn getCachedContent(self: *Client, name: []const u8) !Response(types.CachedContent) {
     try self.requireDeveloperApi();
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}", .{ self.devBaseUrl(), self.api_version, name });
+    const url = try self.allocator.print("{s}/{s}/{s}", .{ self.devBaseUrl(), self.api_version, name });
     defer self.allocator.free(url);
     return self.fetchGet(url, types.CachedContent);
 }
@@ -772,7 +772,7 @@ pub fn getCachedContent(self: *Client, name: []const u8) !Response(types.CachedC
 pub fn listCachedContents(self: *Client, options: ListOptions) !Response(types.ListCachedContentsResponse) {
     try self.requireDeveloperApi();
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const base = try std.fmt.allocPrint(self.allocator, "{s}/{s}/cachedContents", .{ self.devBaseUrl(), self.api_version });
+    const base = try self.allocator.print("{s}/{s}/cachedContents", .{ self.devBaseUrl(), self.api_version });
     defer self.allocator.free(base);
     const url = try http.appendListParams(self.allocator, base, options);
     defer self.allocator.free(url);
@@ -798,7 +798,7 @@ pub fn updateCachedContent(
     else
         "";
 
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}?updateMask={s}", .{ self.devBaseUrl(), self.api_version, name, update_mask });
+    const url = try self.allocator.print("{s}/{s}/{s}?updateMask={s}", .{ self.devBaseUrl(), self.api_version, name, update_mask });
     defer self.allocator.free(url);
 
     var payload_buf: std.Io.Writer.Allocating = .init(self.allocator);
@@ -827,7 +827,7 @@ pub fn updateCachedContent(
     });
 
     const body = response_buf.written();
-    const status_code: u10 = @intFromEnum(result.status);
+    const status_code: u10 = @backingInt(result.status);
     if (status_code < 200 or status_code >= 300) {
         self.setErrorDetail(status_code, body);
         return error.ApiError;
@@ -842,7 +842,7 @@ pub fn updateCachedContent(
 pub fn deleteCachedContent(self: *Client, name: []const u8) !void {
     try self.requireDeveloperApi();
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}", .{ self.devBaseUrl(), self.api_version, name });
+    const url = try self.allocator.print("{s}/{s}/{s}", .{ self.devBaseUrl(), self.api_version, name });
     defer self.allocator.free(url);
 
     const result = try self.http_client.fetch(.{
@@ -853,7 +853,7 @@ pub fn deleteCachedContent(self: *Client, name: []const u8) !void {
         },
     });
 
-    const status_code: u10 = @intFromEnum(result.status);
+    const status_code: u10 = @backingInt(result.status);
     if (status_code < 200 or status_code >= 300) {
         self.setErrorDetail(status_code, "");
         return error.ApiError;

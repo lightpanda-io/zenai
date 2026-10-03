@@ -160,7 +160,7 @@ pub fn chatCompletion(
     config: ChatCompletionConfig,
 ) ApiError!Response(ChatCompletionResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/chat/completions", .{self.base_url});
+    const url = try self.allocator.print("{s}/chat/completions", .{self.base_url});
     defer self.allocator.free(url);
 
     return self.fetchPost(url, ChatCompletionRequest{
@@ -198,7 +198,7 @@ pub fn chatCompletionFromText(
 /// combined with reasoning on the chat completions endpoint.
 pub fn createResponse(self: *Client, request: ResponsesRequest) ApiError!Response(ResponsesResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/responses", .{self.base_url});
+    const url = try self.allocator.print("{s}/responses", .{self.base_url});
     defer self.allocator.free(url);
 
     return self.fetchPost(url, request, ResponsesResponse);
@@ -216,7 +216,7 @@ pub fn createResponseStream(
 ) StreamError!void {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/responses", .{self.base_url});
+    const url = try self.allocator.print("{s}/responses", .{self.base_url});
     defer self.allocator.free(url);
 
     var req_body = request;
@@ -247,7 +247,7 @@ pub fn chatCompletionStream(
 ) StreamError!void {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/chat/completions", .{self.base_url});
+    const url = try self.allocator.print("{s}/chat/completions", .{self.base_url});
     defer self.allocator.free(url);
 
     const req_body = ChatCompletionRequest{
@@ -484,7 +484,7 @@ pub fn createEmbedding(
     config: EmbedConfig,
 ) ApiError!Response(types.EmbeddingResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/embeddings", .{self.base_url});
+    const url = try self.allocator.print("{s}/embeddings", .{self.base_url});
     defer self.allocator.free(url);
 
     return self.fetchPost(url, types.EmbeddingRequest{
@@ -509,7 +509,7 @@ pub fn embedText(
 /// List available models.
 pub fn listModels(self: *Client) ApiError!Response(types.ListModelsResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/models", .{self.base_url});
+    const url = try self.allocator.print("{s}/models", .{self.base_url});
     defer self.allocator.free(url);
     return self.fetchGet(url, types.ListModelsResponse);
 }
@@ -517,7 +517,7 @@ pub fn listModels(self: *Client) ApiError!Response(types.ListModelsResponse) {
 /// Get metadata for a specific model.
 pub fn getModel(self: *Client, model: []const u8) ApiError!Response(types.Model) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/models/{s}", .{ self.base_url, model });
+    const url = try self.allocator.print("{s}/models/{s}", .{ self.base_url, model });
     defer self.allocator.free(url);
     return self.fetchGet(url, types.Model);
 }

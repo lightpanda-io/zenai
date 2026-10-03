@@ -79,12 +79,15 @@ pub const Question = union(enum) {
         try jw.objectField("type");
         try jw.write(@tagName(self));
         switch (self) {
-            inline else => |payload| inline for (@typeInfo(@TypeOf(payload)).@"struct".fields) |field| {
-                const v = @field(payload, field.name);
-                const skip = if (@typeInfo(field.type) == .optional) v == null and !jw.options.emit_null_optional_fields else false;
-                if (!skip) {
-                    try jw.objectField(field.name);
-                    try jw.write(v);
+            inline else => |payload| {
+                const info = @typeInfo(@TypeOf(payload)).@"struct";
+                inline for (info.field_names, info.field_types) |name, T| {
+                    const v = @field(payload, name);
+                    const skip = if (@typeInfo(T) == .optional) v == null and !jw.options.emit_null_optional_fields else false;
+                    if (!skip) {
+                        try jw.objectField(name);
+                        try jw.write(v);
+                    }
                 }
             },
         }
@@ -233,7 +236,7 @@ pub const Answer = union(enum) {
             inline else => |tag| {
                 const Payload = @FieldType(Answer, @tagName(tag));
                 var payload: Payload = .{};
-                inline for (@typeInfo(Payload).@"struct".fields) |f| @field(payload, f.name) = @field(w, f.name);
+                inline for (@typeInfo(Payload).@"struct".field_names) |name| @field(payload, name) = @field(w, name);
                 return @unionInit(Answer, @tagName(tag), payload);
             },
         }

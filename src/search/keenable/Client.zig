@@ -87,7 +87,7 @@ pub fn search(
 ) ApiError!Response(SearchResponse) {
     if (self.app_title.len == 0) return error.MissingAppTitle;
 
-    const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.base_url, searchPath(self.api_key) });
+    const url = try self.allocator.print("{s}{s}", .{ self.base_url, searchPath(self.api_key) });
     defer self.allocator.free(url);
 
     var request = options;

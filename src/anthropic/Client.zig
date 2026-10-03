@@ -133,7 +133,7 @@ pub fn createMessage(
     config: MessageConfig,
 ) ApiError!Response(MessageResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/messages", .{self.base_url});
+    const url = try self.allocator.print("{s}/messages", .{self.base_url});
     defer self.allocator.free(url);
 
     return self.fetchPost(url, MessageRequest{
@@ -193,7 +193,7 @@ pub fn createMessageStream(
 ) StreamError!void {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/messages", .{self.base_url});
+    const url = try self.allocator.print("{s}/messages", .{self.base_url});
     defer self.allocator.free(url);
 
     const req_body = MessageRequest{
@@ -343,7 +343,7 @@ pub const StreamAccumulator = struct {
 /// List available models.
 pub fn listModels(self: *Client) ApiError!Response(types.ListModelsResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/models", .{self.base_url});
+    const url = try self.allocator.print("{s}/models", .{self.base_url});
     defer self.allocator.free(url);
     return self.fetchGet(url, types.ListModelsResponse);
 }

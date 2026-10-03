@@ -1550,7 +1550,7 @@ test "cloud gateway presets: real key, default model, auto-detectable" {
         try std.testing.expect(openAiPreset(tag).?.env_var != null);
         try std.testing.expect(defaultModel(tag).len > 0);
         // Real keys, so they join env auto-detection; the keyless local servers don't.
-        try std.testing.expect(std.mem.indexOfScalar(Tag, default_candidates, tag) != null);
+        try std.testing.expect(std.mem.findScalar(Tag, default_candidates, tag) != null);
     }
     for (default_candidates) |t| try std.testing.expect(t != .ollama and t != .llama_cpp);
 }
@@ -1747,7 +1747,7 @@ fn splitToolImages(allocator: std.mem.Allocator, messages: []const Message) ![]c
             stripped[i] = res;
             stripped[i].parts = null;
             if (!hasImage(res.parts orelse &.{})) continue;
-            try images.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "Image returned by {s}", .{res.name}) });
+            try images.append(allocator, .{ .text = try allocator.print("Image returned by {s}", .{res.name}) });
             for (res.parts.?) |cp| {
                 if (cp == .image) try images.append(allocator, cp);
             }

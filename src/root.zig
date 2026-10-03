@@ -104,14 +104,14 @@ const std = @import("std");
 /// `std.testing.refAllDeclsRecursive`) so API breakage in paths no unit
 /// test exercises still fails `zig build test`.
 fn refAllDeclsRecursive(comptime T: type) void {
-    inline for (comptime std.meta.declarations(T)) |decl| {
-        if (@TypeOf(@field(T, decl.name)) == type) {
-            switch (@typeInfo(@field(T, decl.name))) {
-                .@"struct", .@"enum", .@"union", .@"opaque" => refAllDeclsRecursive(@field(T, decl.name)),
+    inline for (comptime std.meta.declarations(T)) |name| {
+        if (@TypeOf(@field(T, name)) == type) {
+            switch (@typeInfo(@field(T, name))) {
+                .@"struct", .@"enum", .@"union", .@"opaque" => refAllDeclsRecursive(@field(T, name)),
                 else => {},
             }
         }
-        _ = &@field(T, decl.name);
+        _ = &@field(T, name);
     }
 }
 

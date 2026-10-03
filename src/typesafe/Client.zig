@@ -103,7 +103,7 @@ pub fn ask(
 ) ApiError!Response(AskResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/v1/systemone", .{self.base_url});
+    const url = try self.allocator.print("{s}/v1/systemone", .{self.base_url});
     defer self.allocator.free(url);
 
     const request: AskRequest = .{ .state = state, .model = options.model, .questions = questions };
@@ -117,7 +117,7 @@ pub fn ask(
 pub fn listModels(self: *Client) ApiError!Response(ListModelsResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try std.fmt.allocPrint(self.allocator, "{s}/v1/models", .{self.base_url});
+    const url = try self.allocator.print("{s}/v1/models", .{self.base_url});
     defer self.allocator.free(url);
 
     const auth = try self.authHeader();

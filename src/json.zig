@@ -21,8 +21,9 @@ pub fn parseStringUnion(
         inline .string, .allocated_string => |s| s,
         else => return error.UnexpectedToken,
     };
-    inline for (@typeInfo(U).@"union".fields) |f| {
-        if (f.type == void and std.mem.eql(u8, f.name, slice)) return @unionInit(U, f.name, {});
+    const info = @typeInfo(U).@"union";
+    inline for (info.field_names, info.field_types) |name, T| {
+        if (T == void and std.mem.eql(u8, name, slice)) return @unionInit(U, name, {});
     }
     return .{ .unknown = try allocator.dupe(u8, slice) };
 }

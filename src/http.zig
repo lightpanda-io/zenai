@@ -55,7 +55,7 @@ pub const BearerAuth = struct {
     value: ?[]const u8 = null,
 
     pub fn header(self: *BearerAuth, allocator: std.mem.Allocator, token: []const u8) std.mem.Allocator.Error!std.http.Header {
-        if (self.value == null) self.value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+        if (self.value == null) self.value = try allocator.print("Bearer {s}", .{token});
         return .{ .name = "Authorization", .value = self.value.? };
     }
 
@@ -222,7 +222,7 @@ pub fn fetchJsonWithRetry(
         };
 
         const body = response_buf.written();
-        const status_code: u10 = @intFromEnum(status);
+        const status_code: u10 = @backingInt(status);
         if (status_code >= 200 and status_code < 300) {
             if (body.len == 0) return error.EmptyResponse;
             const parsed = try std.json.parseFromSlice(T, allocator, body, .{ .ignore_unknown_fields = true });
@@ -337,7 +337,7 @@ fn fetchOnce(
     // RedirectBehavior's integer value is the max redirect count: GET follows up
     // to 3 (matching std.http.Client.fetch), payload requests leave it unhandled.
     const redirect_behavior: std.http.Client.Request.RedirectBehavior = options.redirect_behavior orelse
-        if (options.payload == null) @enumFromInt(3) else .unhandled;
+        if (options.payload == null) @fromBackingInt(3) else .unhandled;
 
     var req = try client.request(method, uri, .{
         .redirect_behavior = redirect_behavior,
@@ -591,7 +591,7 @@ fn streamLinesOnce(
     defer allocator.free(transfer_buf);
     const reader = response.reader(transfer_buf);
 
-    const status_code: u10 = @intFromEnum(response.head.status);
+    const status_code: u10 = @backingInt(response.head.status);
     if (status_code < 200 or status_code >= 300) {
         // Read the error body so the failure carries a message, not just a status.
         var body: std.Io.Writer.Allocating = .init(allocator);
@@ -776,12 +776,12 @@ pub const ListOptions = struct {
 pub fn appendListParams(allocator: std.mem.Allocator, base_url: []const u8, options: ListOptions) ![]u8 {
     if (options.pageSize) |ps| {
         if (options.pageToken) |pt| {
-            return std.fmt.allocPrint(allocator, "{s}?pageSize={d}&pageToken={s}", .{ base_url, ps, pt });
+            return allocator.print("{s}?pageSize={d}&pageToken={s}", .{ base_url, ps, pt });
         }
-        return std.fmt.allocPrint(allocator, "{s}?pageSize={d}", .{ base_url, ps });
+        return allocator.print("{s}?pageSize={d}", .{ base_url, ps });
     }
     if (options.pageToken) |pt| {
-        return std.fmt.allocPrint(allocator, "{s}?pageToken={s}", .{ base_url, pt });
+        return allocator.print("{s}?pageToken={s}", .{ base_url, pt });
     }
     return allocator.dupe(u8, base_url);
 }
@@ -798,7 +798,7 @@ const Loopback = struct {
         errdefer server.deinit(std.testing.io);
         return .{
             .server = server,
-            .url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/", .{server.socket.address.getPort()}),
+            .url = try std.testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.getPort()}),
             .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
         };
     }
