@@ -207,6 +207,20 @@ pub const ChatCompletionRequest = struct {
     top_logprobs: ?i32 = null,
     /// Identifier for end-user monitoring.
     user: ?[]const u8 = null,
+    /// OpenRouter extension.
+    cache_control: ?CacheControl = null,
+    /// Vercel AI Gateway extension.
+    providerOptions: ?ProviderOptions = null,
+};
+
+pub const CacheControl = struct {
+    type: []const u8 = "ephemeral",
+};
+
+pub const ProviderOptions = struct {
+    gateway: struct {
+        caching: []const u8,
+    },
 };
 
 // --- Response ---
@@ -215,6 +229,8 @@ pub const ChatCompletionRequest = struct {
 /// bills the cached prefix at a discounted rate; the count shows up here.
 pub const PromptTokensDetails = struct {
     cached_tokens: ?i32 = null,
+    /// OpenRouter extension.
+    cache_write_tokens: ?i32 = null,
     /// Text input tokens present in the prompt.
     text_tokens: ?i32 = null,
     /// Image input tokens present in the prompt.
@@ -241,6 +257,8 @@ pub const Usage = struct {
     prompt_tokens_details: ?PromptTokensDetails = null,
     /// Per-completion breakdown (e.g. reasoning tokens).
     completion_tokens_details: ?CompletionTokensDetails = null,
+    /// Vercel AI Gateway extension.
+    cache_creation_input_tokens: ?i32 = null,
 };
 
 /// Log probability information for a token.
@@ -591,6 +609,22 @@ test "ChatCompletionRequest serializes to JSON" {
     try std.testing.expect(std.mem.find(u8, json, "hello") != null);
     try std.testing.expect(std.mem.find(u8, json, "gpt-4o") != null);
     try std.testing.expect(std.mem.find(u8, json, "temperature") != null);
+}
+
+test "ChatCompletionRequest serializes gateway cache hints" {
+    const messages = [_]Message{.{ .role = .user, .content = "hello" }};
+    const req: ChatCompletionRequest = .{
+        .model = "anthropic/claude-sonnet-5",
+        .messages = &messages,
+        .cache_control = .{},
+        .providerOptions = .{ .gateway = .{ .caching = "auto" } },
+    };
+    var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buf.deinit();
+    try std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &buf.writer);
+    const json = buf.written();
+    try std.testing.expect(std.mem.find(u8, json, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}") != null);
 }
 
 test "ChatCompletionResponse.text extracts text" {

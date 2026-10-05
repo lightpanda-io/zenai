@@ -627,7 +627,7 @@ pub const Client = union(enum) {
                 const oai_messages = try messagesToOpenAIMessages(req_alloc, messages);
                 const tools = if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
 
-                var response = try o.chatCompletion(model, oai_messages, mapOpenAICompletionConfig(config, tools));
+                var response = try o.chatCompletion(model, oai_messages, self.openAiCompletionConfig(model, config, tools));
                 defer response.deinit();
 
                 return openAiChatResult(o.allocator, response.value);
@@ -660,6 +660,21 @@ pub const Client = union(enum) {
                 return anthropicResult(a.allocator, response.value);
             },
         }
+    }
+
+    /// Anthropic caches only behind explicit breakpoints, which each gateway
+    /// takes in its own shape. OpenRouter's field is Anthropic-only; Vercel's
+    /// `caching: "auto"` is a no-op for implicitly-caching providers.
+    fn openAiCompletionConfig(self: Client, model: []const u8, config: GenerationConfig, tools: ?[]const openai_types.Tool) openai_mod.ChatCompletionConfig {
+        var cfg = mapOpenAICompletionConfig(config, tools);
+        switch (self) {
+            .openrouter => if (std.mem.startsWith(u8, model, "anthropic/")) {
+                cfg.cache_control = .{};
+            },
+            .vercel => cfg.providerOptions = .{ .gateway = .{ .caching = "auto" } },
+            else => {},
+        }
+        return cfg;
     }
 
     fn StreamAdapter(
@@ -733,7 +748,7 @@ pub const Client = union(enum) {
                 const tools = if (config.tools) |t| mapOpenAITools(req_alloc, t) catch return error.OutOfMemory else null;
 
                 const Adapter = StreamAdapter(@TypeOf(context), openai_types.ChatCompletionResponse, mapOpenAIFinishReason, mapOpenAIUsage);
-                try o.chatCompletionStream(model, oai_messages, mapOpenAICompletionConfig(config, tools), Adapter{ .user_ctx = context, .user_cb = callback, .alloc = o.allocator }, &Adapter.wrap);
+                try o.chatCompletionStream(model, oai_messages, self.openAiCompletionConfig(model, config, tools), Adapter{ .user_ctx = context, .user_cb = callback, .alloc = o.allocator }, &Adapter.wrap);
             },
             // Handled by the early return above, before the arena is created.
             .ollama, .codex => unreachable,
@@ -834,7 +849,7 @@ pub const Client = union(enum) {
                 const tools = if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
 
                 var acc = openai_mod.StreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
-                o.chatCompletionStream(model, oai_messages, mapOpenAICompletionConfig(config, tools), &acc, openai_mod.StreamAccumulator.onEvent) catch |err| switch (err) {
+                o.chatCompletionStream(model, oai_messages, self.openAiCompletionConfig(model, config, tools), &acc, openai_mod.StreamAccumulator.onEvent) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.ApiError,
                 };
@@ -1604,6 +1619,40 @@ test "reasoning_effort: omitted for none/null effort, sent otherwise" {
     try std.testing.expectEqual(@as(?openai_types.ReasoningEffort, .low), mapOpenAICompletionConfig(.{ .effort = .low }, tools).reasoning_effort);
 }
 
+test "openAiCompletionConfig: Anthropic cache hints per gateway" {
+    const or_client: Client = .{ .openrouter = undefined };
+    try std.testing.expect(or_client.openAiCompletionConfig("anthropic/claude-sonnet-5", .{}, null).cache_control != null);
+    try std.testing.expect(or_client.openAiCompletionConfig("openai/gpt-5.5", .{}, null).cache_control == null);
+
+    const vercel: Client = .{ .vercel = undefined };
+    const cfg = vercel.openAiCompletionConfig("anthropic/claude-sonnet-5", .{}, null);
+    try std.testing.expectEqualStrings("auto", cfg.providerOptions.?.gateway.caching);
+    try std.testing.expect(cfg.cache_control == null);
+
+    const compat: Client = .{ .openai_compatible = undefined };
+    const plain = compat.openAiCompletionConfig("anthropic/claude-sonnet-5", .{}, null);
+    try std.testing.expect(plain.cache_control == null and plain.providerOptions == null);
+}
+
+test "mapOpenAIUsage: cache writes come out of the fresh prompt count" {
+    const openrouter = mapOpenAIUsage(.{ .usage = .{
+        .prompt_tokens = 1000,
+        .prompt_tokens_details = .{ .cached_tokens = 600, .cache_write_tokens = 300 },
+    } });
+    try std.testing.expectEqual(@as(?i32, 100), openrouter.prompt_tokens);
+    try std.testing.expectEqual(@as(?i32, 600), openrouter.cached_tokens);
+    try std.testing.expectEqual(@as(?i32, 300), openrouter.cache_creation_tokens);
+
+    const vercel = mapOpenAIUsage(.{ .usage = .{
+        .prompt_tokens = 8409,
+        .prompt_tokens_details = .{ .cached_tokens = 0 },
+        .cache_creation_input_tokens = 8406,
+    } });
+    try std.testing.expectEqual(@as(?i32, 3), vercel.prompt_tokens);
+    try std.testing.expectEqual(@as(?i32, 8406), vercel.cache_creation_tokens);
+    try std.testing.expectEqual(@as(i32, 8409), vercel.inputTokens());
+}
+
 // --- Conversion helpers ---
 
 /// Extract and concatenate all system messages into a single text string.
@@ -2272,11 +2321,14 @@ fn mapGeminiUsage(response: gemini_types.GenerateContentResponse) Usage {
 fn mapOpenAIUsage(response: openai_types.ChatCompletionResponse) Usage {
     const usage = response.usage orelse return .{};
     const cached = if (usage.prompt_tokens_details) |d| d.cached_tokens else null;
+    // Both gateways count cache writes in `prompt_tokens`.
+    const written = (if (usage.prompt_tokens_details) |d| d.cache_write_tokens else null) orelse usage.cache_creation_input_tokens;
     return .{
-        .prompt_tokens = freshPrompt(usage.prompt_tokens, cached),
+        .prompt_tokens = freshPrompt(usage.prompt_tokens, addOpt(cached, written)),
         .completion_tokens = usage.completion_tokens,
         .total_tokens = usage.total_tokens,
         .cached_tokens = cached,
+        .cache_creation_tokens = written,
     };
 }
 
