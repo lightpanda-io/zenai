@@ -150,6 +150,8 @@ pub const ChatCompletionConfig = struct {
     response_format: ?types.ResponseFormat = null,
     /// The effort level for model reasoning.
     reasoning_effort: ?types.ReasoningEffort = null,
+    cache_control: ?types.CacheControl = null,
+    providerOptions: ?types.ProviderOptions = null,
 };
 
 /// Create a chat completion.
@@ -177,6 +179,8 @@ pub fn chatCompletion(
         .seed = config.seed,
         .response_format = config.response_format,
         .reasoning_effort = config.reasoning_effort,
+        .cache_control = config.cache_control,
+        .providerOptions = config.providerOptions,
     }, ChatCompletionResponse);
 }
 
@@ -267,6 +271,8 @@ pub fn chatCompletionStream(
         .seed = config.seed,
         .response_format = config.response_format,
         .reasoning_effort = config.reasoning_effort,
+        .cache_control = config.cache_control,
+        .providerOptions = config.providerOptions,
     };
 
     var hdr_buf: [4]std.http.Header = undefined;
