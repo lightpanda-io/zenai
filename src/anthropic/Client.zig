@@ -32,7 +32,7 @@ interrupt: ?*http.Interrupt = null,
 
 /// Options for customizing the API endpoint.
 pub const InitOptions = struct {
-    /// Base URL for the Anthropic API.
+    /// Base URL for the Anthropic API, with or without the trailing `/v1`.
     base_url: []const u8 = "https://api.anthropic.com/v1",
     /// API version header value.
     api_version: []const u8 = "2023-06-01",
@@ -74,6 +74,14 @@ pub const ApiError = error{
 } || std.http.Client.FetchError || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error || std.Uri.ParseError;
 
 // --- Internal helpers ---
+
+/// The Anthropic SDKs, and the gateways that document them, take the base URL
+/// without `/v1` and append it; earlier zenai callers pass it with `/v1`.
+fn endpoint(self: *const Client, path: []const u8) std.mem.Allocator.Error![]u8 {
+    const base = std.mem.trimEnd(u8, self.base_url, "/");
+    const version = if (std.mem.endsWith(u8, base, "/v1")) "" else "/v1";
+    return self.allocator.print("{s}{s}{s}", .{ base, version, path });
+}
 
 fn authHeaders(self: *const Client) [2]std.http.Header {
     return .{
@@ -133,7 +141,7 @@ pub fn createMessage(
     config: MessageConfig,
 ) ApiError!Response(MessageResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/messages", .{self.base_url});
+    const url = try self.endpoint("/messages");
     defer self.allocator.free(url);
 
     return self.fetchPost(url, MessageRequest{
@@ -193,7 +201,7 @@ pub fn createMessageStream(
 ) StreamError!void {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try self.allocator.print("{s}/messages", .{self.base_url});
+    const url = try self.endpoint("/messages");
     defer self.allocator.free(url);
 
     const req_body = MessageRequest{
@@ -343,7 +351,7 @@ pub const StreamAccumulator = struct {
 /// List available models.
 pub fn listModels(self: *Client) ApiError!Response(types.ListModelsResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/models", .{self.base_url});
+    const url = try self.endpoint("/models");
     defer self.allocator.free(url);
     return self.fetchGet(url, types.ListModelsResponse);
 }
@@ -361,6 +369,22 @@ test "Client init and deinit" {
     try std.testing.expectEqualStrings("test-key", client.api_key);
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1", client.base_url);
     try std.testing.expectEqualStrings("2023-06-01", client.api_version);
+}
+
+test "endpoint: /v1 is appended when the base URL lacks it" {
+    const cases = [_]struct { base: []const u8, url: []const u8 }{
+        .{ .base = "https://api.anthropic.com/v1", .url = "https://api.anthropic.com/v1/messages" },
+        .{ .base = "https://api.anthropic.com", .url = "https://api.anthropic.com/v1/messages" },
+        .{ .base = "https://openrouter.ai/api/", .url = "https://openrouter.ai/api/v1/messages" },
+        .{ .base = "https://ai-gateway.vercel.sh/v1/", .url = "https://ai-gateway.vercel.sh/v1/messages" },
+    };
+    for (cases) |c| {
+        var client = Client.init(std.testing.io, std.testing.allocator, "k", .{ .base_url = c.base });
+        defer client.deinit();
+        const url = try client.endpoint("/messages");
+        defer std.testing.allocator.free(url);
+        try std.testing.expectEqualStrings(c.url, url);
+    }
 }
 
 test "listModels: missing api key" {
