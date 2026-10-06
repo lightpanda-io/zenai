@@ -1013,6 +1013,8 @@ pub const Client = union(enum) {
         stream: ?TextDeltaHook = null,
         /// Called before each model request; may rewrite earlier messages.
         before_request: ?BeforeRequestHook = null,
+        /// Called with each model response, before its tool calls run.
+        after_response: ?AfterResponseHook = null,
 
         pub fn cancelRequested(self: RunToolsConfig) bool {
             return if (self.cancel) |c| c.check() else false;
@@ -1034,6 +1036,15 @@ pub const Client = union(enum) {
 
         pub fn call(self: BeforeRequestHook) void {
             self.callFn(self.context);
+        }
+    };
+
+    pub const AfterResponseHook = struct {
+        context: *anyopaque,
+        callFn: *const fn (context: *anyopaque, result: *const GenerateResult) void,
+
+        pub fn call(self: AfterResponseHook, result: *const GenerateResult) void {
+            self.callFn(self.context, result);
         }
     };
 
@@ -1120,6 +1131,7 @@ pub const Client = union(enum) {
                 try self.generateContent(model, messages.items, gen_config);
             defer gen_result.deinit();
             total_usage.add(gen_result.usage);
+            if (config.after_response) |hook| hook.call(&gen_result);
 
             // A streamed turn returns partial data on mid-stream cancel rather
             // than erroring; catch it here so the loop stops instead of treating
