@@ -1011,6 +1011,8 @@ pub const Client = union(enum) {
         /// deltas to this hook as they arrive while still accumulating tool
         /// calls into the buffered per-turn result. Null runs the buffered path.
         stream: ?TextDeltaHook = null,
+        /// Called before each model request; may rewrite earlier messages.
+        before_request: ?BeforeRequestHook = null,
 
         pub fn cancelRequested(self: RunToolsConfig) bool {
             return if (self.cancel) |c| c.check() else false;
@@ -1023,6 +1025,15 @@ pub const Client = union(enum) {
 
         pub fn check(self: CancelHook) bool {
             return self.checkFn(self.context);
+        }
+    };
+
+    pub const BeforeRequestHook = struct {
+        context: *anyopaque,
+        callFn: *const fn (context: *anyopaque) void,
+
+        pub fn call(self: BeforeRequestHook) void {
+            self.callFn(self.context);
         }
     };
 
@@ -1095,6 +1106,7 @@ pub const Client = union(enum) {
                 cancelled = true;
                 break;
             }
+            if (config.before_request) |hook| hook.call();
             const gen_config: GenerationConfig = .{
                 .tools = config.tools,
                 .max_tokens = config.max_tokens,
