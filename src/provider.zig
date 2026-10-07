@@ -11,6 +11,39 @@ const openai_types = @import("openai/types.zig");
 const anthropic_types = @import("anthropic/types.zig");
 const ollama_native = @import("openai/ollama.zig");
 
+/// getPosix for Windows: std's getWindows takes a WTF-16
+/// key and returns a WTF-16 value, so the key is built on
+/// the stack and the value is transcoded to a null-
+/// terminated UTF-8 string. The copy is intentionally kept:
+/// it backs a string that lives as long as the process
+/// environment it was read from, matching getPosix, which
+/// returns pointers into the global environ on POSIX.
+pub fn envGet(environ: std.process.Environ, key: []const u8) ?[:0]const u8 {
+    if (comptime @import("builtin").os.tag == .windows) {
+        if (key.len == 0 or key.len >= 2048) return null;
+        var wkey: [2048]u16 = undefined;
+        for (key, 0..) |c, i| wkey[i] = c;
+        wkey[key.len] = 0;
+        const wkey_z: [:0]u16 = wkey[0..key.len :0];
+        const wvalue = environ.getWindows(wkey_z.ptr) orelse return null;
+        return std.unicode.utf16LeToUtf8AllocZ(std.heap.page_allocator, wvalue) catch return null;
+    }
+    return environ.getPosix(key);
+}
+
+test "envGet: windows branch reads the live process environment" {
+    // A Windows environ cannot be built synthetically: its block
+    // is a GlobalBlock and getWindows reads the live PEB
+    // environment. PATH is set in every process, so a non-null
+    // result exercises the WTF-16 key build, the lookup and the
+    // UTF-16 to UTF-8 transcode.
+    if (comptime @import("builtin").os.tag == .windows) {
+        const value = envGet(.{ .block = .global }, "PATH") orelse return error.SkipZigTest;
+        defer std.heap.page_allocator.free(value);
+        try std.testing.expect(value.len > 0);
+    }
+}
+
 // --- Types ---
 
 pub const Tool = struct {
@@ -495,7 +528,7 @@ pub const Client = union(enum) {
                 errdefer allocator.destroy(client);
                 const base_url: ?[:0]const u8 = options.base_url orelse switch (tag) {
                     // Never fall through to api.openai.com.
-                    .openai_compatible => options.environ.getPosix("OPENAI_BASE_URL") orelse return error.MissingBaseUrl,
+                    .openai_compatible => envGet(options.environ, "OPENAI_BASE_URL") orelse return error.MissingBaseUrl,
                     else => if (openAiPreset(tag)) |p| p.base_url else null,
                 };
                 var impl_opts: Impl.InitOptions = .{ .retry_policy = options.retry_policy, .request_timeout_ms = options.request_timeout_ms };
@@ -1268,41 +1301,41 @@ fn openAiPreset(tag: Tag) ?OpenAiPreset {
 /// matching go-genai's backend selection. Gates env detection so exactly one
 /// of `.gemini`/`.vertex` can ever detect from GOOGLE_API_KEY.
 pub fn useVertex(environ: std.process.Environ) bool {
-    const v = environ.getPosix("GOOGLE_GENAI_USE_VERTEXAI") orelse return false;
+    const v = envGet(environ, "GOOGLE_GENAI_USE_VERTEXAI") orelse return false;
     return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
 }
 
 pub fn envApiKey(environ: std.process.Environ, tag: Tag) ?[:0]const u8 {
     if (openAiPreset(tag)) |p| {
-        if (p.env_var) |v| return environ.getPosix(v);
+        if (p.env_var) |v| return envGet(environ, v);
         return p.placeholder_key;
     }
     return switch (tag) {
-        .anthropic => environ.getPosix("ANTHROPIC_API_KEY"),
+        .anthropic => envGet(environ, "ANTHROPIC_API_KEY"),
         // OPENAI_BASE_URL gates OPENAI_API_KEY between `.openai` and
         // `.openai_compatible` so exactly one of them can ever detect it,
         // mirroring the `.gemini`/`.vertex` split on GOOGLE_API_KEY.
-        .openai => if (environ.getPosix("OPENAI_BASE_URL") == null)
-            environ.getPosix("OPENAI_API_KEY")
+        .openai => if (envGet(environ, "OPENAI_BASE_URL") == null)
+            envGet(environ, "OPENAI_API_KEY")
         else
             null,
-        .openai_compatible => if (environ.getPosix("OPENAI_BASE_URL") != null)
-            environ.getPosix("OPENAI_API_KEY")
+        .openai_compatible => if (envGet(environ, "OPENAI_BASE_URL") != null)
+            envGet(environ, "OPENAI_API_KEY")
         else
             null,
         .gemini => if (useVertex(environ))
             null
         else
-            environ.getPosix("GOOGLE_API_KEY") orelse environ.getPosix("GEMINI_API_KEY"),
+            envGet(environ, "GOOGLE_API_KEY") orelse envGet(environ, "GEMINI_API_KEY"),
         // Express mode only: with GOOGLE_CLOUD_PROJECT set, the credential
         // must be an OAuth access token the caller supplies explicitly —
         // not detectable from env. VERTEX_API_KEY is unambiguous vertex
         // intent, so it skips the GOOGLE_GENAI_USE_VERTEXAI opt-in.
-        .vertex => if (environ.getPosix("GOOGLE_CLOUD_PROJECT") != null)
+        .vertex => if (envGet(environ, "GOOGLE_CLOUD_PROJECT") != null)
             null
         else
-            environ.getPosix("VERTEX_API_KEY") orelse
-                (if (useVertex(environ)) environ.getPosix("GOOGLE_API_KEY") else null),
+            envGet(environ, "VERTEX_API_KEY") orelse
+                (if (useVertex(environ)) envGet(environ, "GOOGLE_API_KEY") else null),
         // Codex authenticates with an OAuth subscription token supplied by the
         // caller, not an env var — never env-detected.
         .codex => null,
@@ -1392,9 +1425,9 @@ pub fn detectKeys(environ: std.process.Environ, buf: []Candidate, candidates: []
 /// GOOGLE_CLOUD_* env vars, then the "global" location.
 fn vertexConfigFromEnv(environ: std.process.Environ, project: ?[]const u8, location: ?[]const u8) gemini_mod.VertexConfig {
     return .{
-        .project = project orelse environ.getPosix("GOOGLE_CLOUD_PROJECT"),
-        .location = location orelse environ.getPosix("GOOGLE_CLOUD_LOCATION") orelse
-            environ.getPosix("GOOGLE_CLOUD_REGION") orelse "global",
+        .project = project orelse envGet(environ, "GOOGLE_CLOUD_PROJECT"),
+        .location = location orelse envGet(environ, "GOOGLE_CLOUD_LOCATION") orelse
+            envGet(environ, "GOOGLE_CLOUD_REGION") orelse "global",
     };
 }
 
@@ -1469,7 +1502,7 @@ pub fn listChatModelIds(
     } else switch (tag) {
         .openai_compatible => {
             const url = options.base_url orelse
-                options.environ.getPosix("OPENAI_BASE_URL") orelse return error.MissingBaseUrl;
+                envGet(options.environ, "OPENAI_BASE_URL") orelse return error.MissingBaseUrl;
             try listOpenAICompatibleModelIds(io, allocator, arena, &ids, api_key, url, .{});
         },
         .anthropic => {
@@ -1601,20 +1634,24 @@ test "openai_compatible: no static preset, env-gated key detection" {
 }
 
 test "openai/openai_compatible: OPENAI_BASE_URL splits key detection" {
-    // Environ.PosixBlock is not the block representation on Windows.
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const with_url: std.process.Environ = .{ .block = .{ .slice = &[_:null]?[*:0]const u8{
-        "OPENAI_BASE_URL=http://localhost:8000/v1",
-        "OPENAI_API_KEY=sk-test",
-    } } };
-    try std.testing.expect(envApiKey(with_url, .openai) == null);
-    try std.testing.expectEqualStrings("sk-test", envApiKey(with_url, .openai_compatible).?);
+    // A synthetic environ can only be built from a PosixBlock
+    // slice, which does not exist on Windows; there getWindows
+    // reads the live PEB environment (see the envGet test above),
+    // so these POSIX-only assertions are comptime-skipped.
+    if (comptime @import("builtin").os.tag != .windows) {
+        const with_url: std.process.Environ = .{ .block = .{ .slice = &[_:null]?[*:0]const u8{
+            "OPENAI_BASE_URL=http://localhost:8000/v1",
+            "OPENAI_API_KEY=sk-test",
+        } } };
+        try std.testing.expect(envApiKey(with_url, .openai) == null);
+        try std.testing.expectEqualStrings("sk-test", envApiKey(with_url, .openai_compatible).?);
 
-    const without_url: std.process.Environ = .{ .block = .{ .slice = &[_:null]?[*:0]const u8{
-        "OPENAI_API_KEY=sk-test",
-    } } };
-    try std.testing.expectEqualStrings("sk-test", envApiKey(without_url, .openai).?);
-    try std.testing.expect(envApiKey(without_url, .openai_compatible) == null);
+        const without_url: std.process.Environ = .{ .block = .{ .slice = &[_:null]?[*:0]const u8{
+            "OPENAI_API_KEY=sk-test",
+        } } };
+        try std.testing.expectEqualStrings("sk-test", envApiKey(without_url, .openai).?);
+        try std.testing.expect(envApiKey(without_url, .openai_compatible) == null);
+    }
 }
 
 test "openai_compatible: envVarName and defaultModel" {
