@@ -1677,6 +1677,17 @@ test "mapOpenAIUsage: cache writes come out of the fresh prompt count" {
     try std.testing.expectEqual(@as(i32, 8409), vercel.inputTokens());
 }
 
+test "mapOpenAIResponsesUsage: cache writes come out of the fresh input count" {
+    const usage = mapOpenAIResponsesUsage(.{ .usage = .{
+        .input_tokens = 1000,
+        .input_tokens_details = .{ .cached_tokens = 600, .cache_write_tokens = 300 },
+    } });
+    try std.testing.expectEqual(@as(?i32, 100), usage.prompt_tokens);
+    try std.testing.expectEqual(@as(?i32, 600), usage.cached_tokens);
+    try std.testing.expectEqual(@as(?i32, 300), usage.cache_creation_tokens);
+    try std.testing.expectEqual(@as(i32, 1000), usage.inputTokens());
+}
+
 // --- Conversion helpers ---
 
 /// Extract and concatenate all system messages into a single text string.
@@ -2166,11 +2177,13 @@ fn mapOpenAIResponsesFinishReason(response: openai_types.ResponsesResponse) Fini
 fn mapOpenAIResponsesUsage(response: openai_types.ResponsesResponse) Usage {
     const usage = response.usage orelse return .{};
     const cached = if (usage.input_tokens_details) |d| d.cached_tokens else null;
+    const written = if (usage.input_tokens_details) |d| d.cache_write_tokens else null;
     return .{
-        .prompt_tokens = freshPrompt(usage.input_tokens, cached),
+        .prompt_tokens = freshPrompt(usage.input_tokens, addOpt(cached, written)),
         .completion_tokens = usage.output_tokens,
         .total_tokens = usage.total_tokens,
         .cached_tokens = cached,
+        .cache_creation_tokens = written,
     };
 }
 
