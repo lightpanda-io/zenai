@@ -400,6 +400,14 @@ pub const Model = struct {
     display_name: ?[]const u8 = null,
     /// ISO 8601 creation timestamp.
     created_at: ?[]const u8 = null,
+    /// Model family: "haiku", "sonnet", "opus", "fable", "mythos".
+    line: ?[]const u8 = null,
+    /// "active", "deprecated", "retired".
+    lifecycle: ?[]const u8 = null,
+    /// ISO 8601 timestamp the model was deprecated, null while active.
+    deprecated_at: ?[]const u8 = null,
+    /// ISO 8601 timestamp the model retires (or retired), null if unscheduled.
+    retires_at: ?[]const u8 = null,
 };
 
 /// Response from the list models endpoint.
@@ -551,6 +559,23 @@ test "MessageResponse parses diagnostics" {
     const reason = parsed.value.diagnostics.?.cache_miss_reason.?;
     try std.testing.expectEqualStrings("tools_changed", reason.type.?);
     try std.testing.expectEqual(@as(i64, 4096), reason.cache_missed_input_tokens.?);
+}
+
+test "Model parses line and lifecycle" {
+    const json =
+        \\{"data":[{"type":"model","id":"claude-haiku-5-5","display_name":"Claude Haiku 5.5","created_at":"2026-10-01T00:00:00Z","line":"haiku","lifecycle":"active","deprecated_at":null,"retires_at":null}],"has_more":false}
+    ;
+    const parsed = try std.json.parseFromSlice(
+        ListModelsResponse,
+        std.testing.allocator,
+        json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    const m = parsed.value.data.?[0];
+    try std.testing.expectEqualStrings("haiku", m.line.?);
+    try std.testing.expectEqualStrings("active", m.lifecycle.?);
+    try std.testing.expect(m.retires_at == null);
 }
 
 test "Role serializes correctly" {

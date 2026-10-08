@@ -464,6 +464,8 @@ pub const ResponseOutputItem = struct {
 
 pub const ResponseInputTokensDetails = struct {
     cached_tokens: ?i32 = null,
+    /// Input tokens written to the cache.
+    cache_write_tokens: ?i32 = null,
 };
 
 pub const ResponseOutputTokensDetails = struct {
