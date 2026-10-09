@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const json = @import("json.zig");
 const retry = @import("retry.zig");
 
@@ -482,6 +483,11 @@ fn readError(connection: *std.http.Client.Connection) SendReceiveHeadError {
         // apart from a head cut short; plain TCP reports the former as
         // HttpConnectionClosing, the shape of an idle keep-alive close.
         error.TlsConnectionTruncated => error.HttpConnectionClosing,
+        // Windows reports a pooled socket the server closed while idle as
+        // STATUS_LOCAL_DISCONNECT (Winsock's WSAECONNABORTED), which std's
+        // netReadWindows does not map, so it arrives as Unexpected with the
+        // status discarded. Treat it as the reset it is.
+        error.Unexpected => if (builtin.os.tag == .windows) error.ConnectionResetByPeer else error.ReadFailed,
         else => error.ReadFailed,
     };
 }
@@ -934,7 +940,18 @@ test "the stale-socket reconnect happens once, not again on a fresh connection" 
     // The pooled socket is dead and the reconnect's fresh connection is closed
     // unanswered too: that is the server, not a stale pool, so it surfaces.
     // A second reconnect would sit in the listen backlog until the timeout.
-    try std.testing.expectError(error.HttpConnectionClosing, t.fetch(.hang_up));
+    // Windows can report the hang-up as an abort rather than a clean close;
+    // either way it must surface instead of reconnecting again.
+    if (builtin.os.tag == .windows) {
+        const err = if (t.fetch(.hang_up)) |r| {
+            var response = r;
+            response.deinit();
+            return error.TestUnexpectedResult;
+        } else |err| err;
+        try std.testing.expect(isStaleConnection(err));
+    } else {
+        try std.testing.expectError(error.HttpConnectionClosing, t.fetch(.hang_up));
+    }
 }
 
 test "a stream on a pooled socket the server closed while idle is reconnected" {
