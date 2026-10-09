@@ -6,6 +6,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const http = @import("../http.zig");
 const retry = @import("../retry.zig");
+const provider = @import("../provider.zig");
 
 pub const RetryPolicy = retry.RetryPolicy;
 
@@ -37,14 +38,14 @@ pub const default_base_url = "https://api.typesafe.ai";
 pub const env_var_name = "TYPESAFE_API_KEY";
 
 pub fn envApiKey(environ: std.process.Environ) ?[:0]const u8 {
-    return environ.getPosix(env_var_name);
+    return provider.envGet(environ, env_var_name);
 }
 
 /// The environment variable `envBaseUrl` reads.
 pub const base_url_env_var_name = "TYPESAFE_BASE_URL";
 
 pub fn envBaseUrl(environ: std.process.Environ) []const u8 {
-    return environ.getPosix(base_url_env_var_name) orelse default_base_url;
+    return provider.envGet(environ, base_url_env_var_name) orelse default_base_url;
 }
 
 pub const InitOptions = struct {

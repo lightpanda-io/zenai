@@ -45,10 +45,15 @@ jobs:
         run: zig fmt --check ./
 
   zig-test:
-    name: zig test
+    name: zig test (${{ matrix.os }})
     needs: zig-fmt
 
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
 
     if: github.event.pull_request.draft == false
