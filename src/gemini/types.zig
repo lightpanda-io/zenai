@@ -379,7 +379,8 @@ pub const Content = struct {
     /// The producer of the content. Must be either "user" or "model".
     role: ?[]const u8 = null,
     /// List of parts that constitute a single message.
-    parts: []const Part,
+    /// Gemini omits it on an empty model turn.
+    parts: []const Part = &.{},
 };
 
 // --- Schema ---
@@ -1191,6 +1192,21 @@ test "GenerateContentResponse parses function call" {
     defer parsed.deinit();
     const fc = parsed.value.candidates.?[0].content.?.parts[0].functionCall.?;
     try std.testing.expectEqualStrings("get_weather", fc.name.?);
+}
+
+test "GenerateContentResponse parses content without parts" {
+    const json =
+        \\{"candidates":[{"content":{"role":"model"},"finishReason":"STOP"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(
+        GenerateContentResponse,
+        std.testing.allocator,
+        json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(0, parsed.value.candidates.?[0].content.?.parts.len);
+    try std.testing.expect(parsed.value.text() == null);
 }
 
 test "FinishReason parses from JSON" {
