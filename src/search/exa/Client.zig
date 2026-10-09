@@ -38,7 +38,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
         .allocator = allocator,
         .api_key = api_key,
         .base_url = options.base_url,
-        .http_client = .{ .allocator = allocator, .io = io },
+        .http_client = .{ .allocator = allocator, .io = http.addrConfigIo(io) },
         .retry_policy = options.retry_policy,
         .request_timeout_ms = options.request_timeout_ms,
     };

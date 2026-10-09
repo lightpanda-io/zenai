@@ -86,7 +86,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
         .api_version = options.api_version orelse
             (if (options.vertex != null) "v1beta1" else "v1beta"),
         .vertex = options.vertex,
-        .http_client = .{ .allocator = allocator, .io = io },
+        .http_client = .{ .allocator = allocator, .io = http.addrConfigIo(io) },
         .retry_policy = options.retry_policy,
         .request_timeout_ms = options.request_timeout_ms,
     };

@@ -68,7 +68,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
         .organization = options.organization,
         .project = options.project,
         .bill_to = options.bill_to,
-        .http_client = .{ .allocator = allocator, .io = io },
+        .http_client = .{ .allocator = allocator, .io = http.addrConfigIo(io) },
         .retry_policy = options.retry_policy,
         .request_timeout_ms = options.request_timeout_ms,
     };
