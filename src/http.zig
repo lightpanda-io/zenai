@@ -68,6 +68,74 @@ pub const BearerAuth = struct {
     }
 };
 
+/// `io` with DNS lookups that skip IPv6 when this host can't reach the IPv6
+/// internet, as glibc's `AI_ADDRCONFIG` does. Hand it to `std.http.Client`.
+///
+/// Zig 0.17's `HostName.connect` starts a connect per resolved address with
+/// `io.async`. On `Io.Threaded.init_single_threaded` (what lightpanda uses)
+/// that runs each one to completion in turn, so a blackholed IPv6 address
+/// blocks until its SYN times out (~2 min on Linux) before the request goes
+/// out. That is the case on a network that advertises an IPv6 default route
+/// without giving the host a global address.
+///
+/// Only the first `Io` implementation seen is wrapped (the vtable lives in a
+/// global, since clients are returned by value); any other passes through.
+pub fn addrConfigIo(io: std.Io) std.Io {
+    if (AddrConfig.state.cmpxchgStrong(.unset, .building, .acquire, .acquire) == null) {
+        AddrConfig.inner = io.vtable;
+        AddrConfig.vtable = io.vtable.*;
+        AddrConfig.vtable.netLookup = addrConfigNetLookup;
+        AddrConfig.state.store(.ready, .release);
+    }
+    while (AddrConfig.state.load(.acquire) != .ready) std.atomic.spinLoopHint();
+    if (AddrConfig.inner != io.vtable) return io;
+    return .{ .userdata = io.userdata, .vtable = &AddrConfig.vtable };
+}
+
+const AddrConfig = struct {
+    var state: std.atomic.Value(enum(u8) { unset, building, ready }) = .init(.unset);
+    var inner: *const std.Io.VTable = undefined;
+    var vtable: std.Io.VTable = undefined;
+};
+
+fn addrConfigNetLookup(
+    userdata: ?*anyopaque,
+    host_name: std.Io.net.HostName,
+    results: *std.Io.Queue(std.Io.net.HostName.LookupResult),
+    options: std.Io.net.HostName.LookupOptions,
+) std.Io.net.HostName.LookupError!void {
+    var opts = options;
+    if (opts.family == null and !hasUsableIp6(.{ .userdata = userdata, .vtable = AddrConfig.inner })) {
+        opts.family = .ip4;
+    }
+    return AddrConfig.inner.netLookup(userdata, host_name, results, opts);
+}
+
+/// Probed per lookup, so a network change is picked up. A UDP connect sends
+/// nothing, but makes the kernel pick a route and source address for a global
+/// IPv6 destination (Google Public DNS).
+fn hasUsableIp6(io: std.Io) bool {
+    const probe = std.Io.net.IpAddress.parse("2001:4860:4860::8888", 53) catch unreachable;
+    const stream = probe.connect(io, .{ .mode = .dgram }) catch |err| return switch (err) {
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.AddressUnavailable,
+        error.AddressFamilyUnsupported,
+        => false,
+        // Unsure: keep IPv6 rather than break an IPv6-only host.
+        else => true,
+    };
+    defer stream.close(io);
+    return isUsableIp6Source(stream.socket.address);
+}
+
+fn isUsableIp6Source(address: std.Io.net.IpAddress) bool {
+    return switch (address) {
+        .ip6 => |a| !a.isLinkLocal() and !a.isLoopBack(),
+        .ip4 => false,
+    };
+}
+
 /// Cross-thread trigger for aborting an in-flight HTTP request. A request path
 /// arms it with the active connection's stream around the blocking read (see
 /// `armInterrupt`); another thread (the SIGINT handler) calls `fire` to
@@ -744,6 +812,23 @@ test "extractErrorMessage reads each provider's error shape" {
             try std.testing.expect(got == null);
         }
     }
+}
+
+test "isUsableIp6Source rejects link-local and loopback sources" {
+    const parse = std.Io.net.IpAddress.parse;
+    try std.testing.expect(!isUsableIp6Source(try parse("fe80::601e:cc94:a6d0:94e9", 0)));
+    try std.testing.expect(!isUsableIp6Source(try parse("::1", 0)));
+    try std.testing.expect(!isUsableIp6Source(try parse("192.168.1.36", 0)));
+    try std.testing.expect(isUsableIp6Source(try parse("2a01:e0a:1ef:9a90::1", 0)));
+}
+
+test "addrConfigIo wraps only the lookup and is stable" {
+    const io = std.testing.io;
+    const wrapped = addrConfigIo(io);
+    try std.testing.expectEqual(io.userdata, wrapped.userdata);
+    try std.testing.expectEqual(addrConfigIo(io).vtable, wrapped.vtable);
+    try std.testing.expectEqual(io.vtable.netConnectIp, wrapped.vtable.netConnectIp);
+    try std.testing.expect(wrapped.vtable.netLookup == addrConfigNetLookup);
 }
 
 test "ErrorDetail.dupe outlives the original" {

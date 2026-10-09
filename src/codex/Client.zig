@@ -53,7 +53,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, access_token: []const u8, 
         .session_id = options.session_id,
         .originator = options.originator,
         .user_agent = options.user_agent,
-        .http_client = .{ .allocator = allocator, .io = io },
+        .http_client = .{ .allocator = allocator, .io = http.addrConfigIo(io) },
     };
 }
 
