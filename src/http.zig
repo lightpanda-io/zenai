@@ -408,9 +408,17 @@ fn fetchOnce(
     const redirect_behavior: std.http.Client.Request.RedirectBehavior = options.redirect_behavior orelse
         if (options.payload == null) @fromBackingInt(3) else .unhandled;
 
+    // Ask for an uncompressed body unless the caller chose an encoding. std's
+    // Request.deinit pools a connection only once its reader is `.ready`, and
+    // reading a gzip body through the decompressor stops short of that, so
+    // every call would open a new connection and pay its TLS handshake again.
+    // API replies are small JSON, so compression saves next to nothing.
+    var headers = options.headers;
+    if (headers.accept_encoding == .default) headers.accept_encoding = .{ .override = "identity" };
+
     var req = try client.request(method, uri, .{
         .redirect_behavior = redirect_behavior,
-        .headers = options.headers,
+        .headers = headers,
         .extra_headers = options.extra_headers,
         .privileged_headers = options.privileged_headers,
         .keep_alive = options.keep_alive,
@@ -944,6 +952,16 @@ const Loopback = struct {
     fn countEvent(events: *u32, _: Ok) void {
         events.* += 1;
     }
+
+    /// One JSON POST, like every provider call.
+    fn postOk(self: *Loopback) FetchError!Response(Ok) {
+        var detail: NoDetail = .{};
+        return fetchJsonWithRetry(std.testing.allocator, &self.client, .disabled, 2000, .{
+            .location = .{ .url = self.url },
+            .method = .POST,
+            .payload = "{}",
+        }, Ok, &detail);
+    }
 };
 
 /// What `serveOnce` does with the one connection it accepts.
@@ -956,7 +974,13 @@ const Serve = enum {
     /// Send a head and part of the body, then close with the request still
     /// unread, which makes the kernel reset the connection mid-body.
     reset_mid_body,
+    /// Answer as a CDN fronting an API does: gzip and chunked when the request
+    /// accepts gzip, plain otherwise.
+    respond_negotiated,
 };
+
+/// `{"ok":true}\n`, gzipped.
+const ok_gzip = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xab\x56\xca\xcf\x56\xb2\x2a\x29\x2a\x4d\xad\xe5\x02\x00\x88\x41\x7f\xc2\x0c\x00\x00\x00";
 
 /// Test server half for the loopback tests: accept one connection and handle
 /// it as `serve` says.
@@ -981,7 +1005,36 @@ fn serveOnce(server: *std.Io.net.Server, serve: Serve) void {
             var request = http_server.receiveHead() catch return;
             request.respond("{\"ok\":true}\n", .{ .keep_alive = true }) catch return;
         },
+        .respond_negotiated => {
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(io, &read_buf);
+            var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
+            var request = http_server.receiveHead() catch return;
+            var gzip = false;
+            var headers = request.iterateHeaders();
+            while (headers.next()) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "accept-encoding") and std.mem.indexOf(u8, h.value, "gzip") != null) gzip = true;
+            }
+            const response = if (gzip)
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n20\r\n" ++ ok_gzip ++ "\r\n0\r\n\r\n"
+            else
+                "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n{\"ok\":true}\n";
+            writer.interface.writeAll(response) catch return;
+            writer.interface.flush() catch return;
+            // Hold the socket open until the client has read the response.
+            io.sleep(.fromMilliseconds(50), .awake) catch {};
+        },
     }
+}
+
+test "a JSON call leaves its connection in the pool" {
+    var t: Loopback = try .init();
+    defer t.deinit();
+
+    var response = try t.served(.respond_negotiated, Loopback.postOk, .{&t});
+    defer response.deinit();
+    try std.testing.expect(response.value.ok);
+    try std.testing.expectEqual(1, t.client.connection_pool.free_len);
 }
 
 test "watchdog turns a stalled response into error.Timeout" {
