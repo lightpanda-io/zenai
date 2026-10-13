@@ -3,6 +3,7 @@ const types = @import("types.zig");
 const http = @import("../http.zig");
 const retry = @import("../retry.zig");
 const json = @import("../json.zig");
+const continuation = @import("continuation.zig");
 
 pub const RetryPolicy = retry.RetryPolicy;
 
@@ -113,7 +114,30 @@ pub const RequestOptions = struct {
     modelArmorConfig: ?types.ModelArmorConfig = null,
     /// The service tier to use for the request.
     serviceTier: ?types.ServiceTier = null,
+    /// Resume from a candidate that stopped with `CONTINUATION` (its
+    /// `continuationToken`, as returned).
+    continuationToken: ?[]const u8 = null,
+    /// When a response stops with `CONTINUATION` before the model finishes,
+    /// send the same request again with its continuation token until it does.
+    /// `generateContent` returns the responses merged into one, and streaming
+    /// emits the chunks of every request in order, with usage summed over
+    /// them. Timeouts and retries apply to each request, and each is billed.
+    automatic_continuation: bool = true,
 };
+
+fn generateRequest(contents: []const Content, config: ?GenerationConfig, options: RequestOptions) GenerateContentRequest {
+    return .{
+        .contents = contents,
+        .generationConfig = config,
+        .systemInstruction = options.systemInstruction,
+        .safetySettings = options.safetySettings,
+        .tools = options.tools,
+        .toolConfig = options.toolConfig,
+        .modelArmorConfig = options.modelArmorConfig,
+        .serviceTier = options.serviceTier,
+        .continuationToken = options.continuationToken,
+    };
+}
 
 /// Owns the parsed response and its backing memory.
 /// Call `deinit()` when done to free all resources.
@@ -230,6 +254,8 @@ pub const ListOptions = http.ListOptions;
 // --- Generate Content ---
 
 /// Generate content from the model given a conversation history and configuration.
+/// See `RequestOptions.automatic_continuation` for responses the model has
+/// not finished.
 pub fn generateContent(
     self: *Client,
     model: []const u8,
@@ -241,16 +267,24 @@ pub fn generateContent(
     const url = try self.modelUrl(model, .{ .action = "generateContent" });
     defer self.allocator.free(url);
 
-    return self.fetchPost(url, GenerateContentRequest{
-        .contents = contents,
-        .generationConfig = config,
-        .systemInstruction = options.systemInstruction,
-        .safetySettings = options.safetySettings,
-        .tools = options.tools,
-        .toolConfig = options.toolConfig,
-        .modelArmorConfig = options.modelArmorConfig,
-        .serviceTier = options.serviceTier,
-    }, GenerateContentResponse);
+    var response = try self.fetchPost(url, generateRequest(contents, config, options), GenerateContentResponse);
+    if (!options.automatic_continuation) return response;
+    errdefer response.deinit();
+
+    // Merged into the first response's arena, so the result owns every hop.
+    const arena = response.parsed.arena.allocator();
+    var request = generateRequest(contents, config, options);
+    while (continuation.resumeToken(response.value)) |token| {
+        request.continuationToken = token;
+        var hop = try self.fetchPost(url, request, GenerateContentResponse);
+        defer hop.deinit();
+        const curr = try std.json.parseFromSliceLeaky(GenerateContentResponse, arena, hop.json_buf.written(), .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        });
+        response.value = try continuation.merge(arena, response.value, curr);
+    }
+    return response;
 }
 
 /// Convenience: generate content from a single text prompt.
@@ -277,6 +311,8 @@ pub const StreamError = error{
 /// Generate content with streaming via Server-Sent Events.
 /// The `callback` is invoked for each chunk as it arrives.
 /// Pass a `context` value to carry state into the callback.
+/// See `RequestOptions.automatic_continuation` for responses the model has
+/// not finished; a stream cut off after a checkpoint also resumes from it.
 pub fn generateContentStream(
     self: *Client,
     model: []const u8,
@@ -291,18 +327,23 @@ pub fn generateContentStream(
     const url = try self.modelUrl(model, .{ .action = "streamGenerateContent?alt=sse" });
     defer self.allocator.free(url);
 
-    const req_body = GenerateContentRequest{
-        .contents = contents,
-        .generationConfig = config,
-        .systemInstruction = options.systemInstruction,
-        .safetySettings = options.safetySettings,
-        .tools = options.tools,
-        .toolConfig = options.toolConfig,
-        .modelArmorConfig = options.modelArmorConfig,
-        .serviceTier = options.serviceTier,
-    };
     const auth = [1]std.http.Header{try self.authHeader()};
-    return http.streamSseValue(self.allocator, &self.http_client, url, &auth, req_body, GenerateContentResponse, self, context, callback);
+    var request = generateRequest(contents, config, options);
+    if (!options.automatic_continuation) {
+        return http.streamSseValue(self.allocator, &self.http_client, url, &auth, request, GenerateContentResponse, self, context, callback);
+    }
+
+    const Hops = continuation.Stream(@TypeOf(context));
+    var hops: Hops = .init(self.allocator, context, callback);
+    defer hops.deinit();
+    while (true) {
+        http.streamSseValue(self.allocator, &self.http_client, url, &auth, request, GenerateContentResponse, self, &hops, Hops.onChunk) catch |err| {
+            const cancelled = if (self.interrupt) |it| it.isFired() else false;
+            if (err == error.OutOfMemory or cancelled or !hops.canResume()) return err;
+        };
+        if (hops.err) |e| return e;
+        request.continuationToken = try hops.next() orelse return;
+    }
 }
 
 /// Convenience: stream content generation from a single text prompt.
@@ -860,6 +901,10 @@ pub fn deleteCachedContent(self: *Client, name: []const u8) !void {
     }
 }
 
+test {
+    _ = continuation;
+}
+
 test "Client init and deinit" {
     var client = Client.init(std.testing.io, std.testing.allocator, "test-key", .{});
     defer client.deinit();
@@ -1086,4 +1131,148 @@ test "StreamAccumulator reassembles text and a function call into a GenerateCont
     const call = resp.firstFunctionCall().?;
     try std.testing.expectEqualStrings("search", call.name.?);
     try std.testing.expectEqualStrings("birds", call.args.?.object.get("q").?.string);
+}
+
+/// Test server for the continuation tests: answers one request per entry of
+/// `bodies` in order, recording each request body, with keep-alive so the
+/// client may reuse the connection.
+const ContinuationServer = struct {
+    server: std.Io.net.Server,
+    bodies: []const []const u8,
+    content_type: []const u8,
+    requests: [4][]u8 = undefined,
+    served: usize = 0,
+
+    fn run(self: *ContinuationServer) void {
+        const io = std.testing.io;
+        while (self.served < self.bodies.len) {
+            const stream = self.server.accept(io) catch return;
+            defer stream.close(io);
+            var read_buf: [8192]u8 = undefined;
+            var write_buf: [1024]u8 = undefined;
+            var reader = stream.reader(io, &read_buf);
+            var writer = stream.writer(io, &write_buf);
+            var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
+            while (self.served < self.bodies.len) {
+                var request = http_server.receiveHead() catch break;
+                var body_buf: [8192]u8 = undefined;
+                const body_reader = request.readerExpectNone(&body_buf);
+                const body = body_reader.allocRemaining(std.testing.allocator, .unlimited) catch return;
+                self.requests[self.served] = body;
+                const out = self.bodies[self.served];
+                self.served += 1;
+                request.respond(out, .{
+                    .keep_alive = true,
+                    .extra_headers = &.{.{ .name = "content-type", .value = self.content_type }},
+                }) catch return;
+            }
+        }
+    }
+
+    fn deinit(self: *ContinuationServer) void {
+        for (self.requests[0..self.served]) |r| std.testing.allocator.free(r);
+        self.server.deinit(std.testing.io);
+    }
+};
+
+fn continuationClient(server: *ContinuationServer) !Client {
+    var buf: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}", .{server.server.socket.address.getPort()});
+    var client = Client.init(std.testing.io, std.testing.allocator, "key", .{ .retry_policy = .disabled, .request_timeout_ms = 2000 });
+    client.base_url = try std.testing.allocator.dupe(u8, base);
+    return client;
+}
+
+test "generateContent continues a CONTINUATION response and merges the hops" {
+    const loopback: std.Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var server: ContinuationServer = .{
+        .server = try loopback.listen(std.testing.io, .{}),
+        .content_type = "application/json",
+        .bodies = &.{
+            \\{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello, "}]},"finishReason":"CONTINUATION","continuationToken":"Y2sx"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"totalTokenCount":12}}
+            ,
+            \\{"candidates":[{"content":{"role":"model","parts":[{"text":"world."}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":2,"totalTokenCount":14},"responseId":"r2"}
+            ,
+        },
+    };
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, ContinuationServer.run, .{&server});
+    defer thread.join();
+
+    var client = try continuationClient(&server);
+    defer std.testing.allocator.free(client.base_url.?);
+    defer client.deinit();
+
+    var response = try client.generateContentFromText("m", "hi", null, .{});
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), server.served);
+    try std.testing.expect(std.mem.find(u8, server.requests[0], "continuationToken") == null);
+    try std.testing.expect(std.mem.find(u8, server.requests[1], "\"continuationToken\":\"Y2sx\"") != null);
+
+    const parts = response.value.parts().?;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("Hello, ", parts[0].text.?);
+    try std.testing.expectEqualStrings("world.", parts[1].text.?);
+    try std.testing.expect(response.value.candidates.?[0].finishReason.? == .STOP);
+    try std.testing.expectEqual(@as(?i32, 26), response.value.usageMetadata.?.totalTokenCount);
+    try std.testing.expectEqualStrings("r2", response.value.responseId.?);
+}
+
+test "generateContent with automatic_continuation off returns the first response" {
+    const loopback: std.Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var server: ContinuationServer = .{
+        .server = try loopback.listen(std.testing.io, .{}),
+        .content_type = "application/json",
+        .bodies = &.{
+            \\{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello, "}]},"finishReason":"CONTINUATION","continuationToken":"Y2sx"}]}
+            ,
+        },
+    };
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, ContinuationServer.run, .{&server});
+    defer thread.join();
+
+    var client = try continuationClient(&server);
+    defer std.testing.allocator.free(client.base_url.?);
+    defer client.deinit();
+
+    var response = try client.generateContentFromText("m", "hi", null, .{ .automatic_continuation = false });
+    defer response.deinit();
+    try std.testing.expect(response.value.candidates.?[0].finishReason.? == .CONTINUATION);
+    try std.testing.expectEqualStrings("Y2sx", response.value.candidates.?[0].continuationToken.?);
+}
+
+test "generateContentStream continues across requests into one accumulated response" {
+    const loopback: std.Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var server: ContinuationServer = .{
+        .server = try loopback.listen(std.testing.io, .{}),
+        .content_type = "text/event-stream",
+        .bodies = &.{
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello, \"}]},\"finishReason\":\"CONTINUATION\",\"continuationToken\":\"Y2sx\"}],\"usageMetadata\":{\"totalTokenCount\":12}}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"world.\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"totalTokenCount\":14}}\n\n",
+        },
+    };
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, ContinuationServer.run, .{&server});
+    defer thread.join();
+
+    var client = try continuationClient(&server);
+    defer std.testing.allocator.free(client.base_url.?);
+    defer client.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var probe = TextProbe{};
+    defer probe.text.deinit(std.testing.allocator);
+    var acc = StreamAccumulator.init(arena.allocator(), &probe, TextProbe.cb);
+    try client.generateContentStreamFromText("m", "hi", null, .{}, &acc, StreamAccumulator.onEvent);
+    try std.testing.expect(acc.err == null);
+
+    try std.testing.expectEqual(@as(usize, 2), server.served);
+    try std.testing.expect(std.mem.find(u8, server.requests[1], "\"continuationToken\":\"Y2sx\"") != null);
+    const resp = try acc.response();
+    try std.testing.expectEqualStrings("Hello, world.", resp.text().?);
+    try std.testing.expect(resp.candidates.?[0].finishReason.? == .STOP);
+    try std.testing.expectEqual(@as(?i32, 26), resp.usageMetadata.?.totalTokenCount);
 }
