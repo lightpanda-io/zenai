@@ -77,14 +77,12 @@ pub const Message = struct {
     tool_call_id: ?[]const u8 = null,
     /// Refusal message from the model.
     refusal: ?[]const u8 = null,
-    /// Reasoning text from `thinking` content blocks (response only; Mistral
-    /// reasoning models). Not sent back.
+    /// Reasoning from `thinking` content blocks (response only).
     thinking: ?[]const u8 = null,
 
-    /// Default field parsing, except that `content` may also be an array of
-    /// blocks, as Mistral reasoning models return it: `text` blocks join into
-    /// `content`, `thinking` blocks into `thinking`. Streaming deltas use the
-    /// same shape during the thinking phase.
+    /// Default field parsing, except that `content` may be an array of blocks
+    /// (Mistral reasoning models): `text` blocks join into `content`,
+    /// `thinking` blocks into `thinking`.
     pub fn jsonParse(
         allocator: std.mem.Allocator,
         source: anytype,
@@ -110,7 +108,7 @@ pub const Message = struct {
                 continue;
             }
             inline for (@typeInfo(Message).@"struct".field_names, @typeInfo(Message).@"struct".field_types) |name, T| {
-                // Request-only or derived from `content`, never on the wire.
+                // Not wire fields.
                 if (comptime std.mem.eql(u8, name, "content") or
                     std.mem.eql(u8, name, "content_parts") or
                     std.mem.eql(u8, name, "thinking")) continue;
@@ -125,7 +123,6 @@ pub const Message = struct {
         return msg;
     }
 
-    /// Wire `content`: a string, or an array of typed blocks.
     const Content = union(enum) {
         text: []const u8,
         blocks: []const ContentBlock,
@@ -142,8 +139,7 @@ pub const Message = struct {
         }
     };
 
-    /// A `text` block carries `text`; a `thinking` block nests its reasoning
-    /// as `text` blocks under `thinking`. Other types are ignored.
+    /// `thinking` blocks nest their reasoning as `text` blocks.
     const ContentBlock = struct {
         type: []const u8,
         text: ?[]const u8 = null,
@@ -151,7 +147,6 @@ pub const Message = struct {
         closed: ?bool = null,
     };
 
-    /// Concatenated text of the `kind` blocks, or null if there is none.
     fn joinBlocks(
         allocator: std.mem.Allocator,
         blocks: []const ContentBlock,
@@ -172,7 +167,7 @@ pub const Message = struct {
     }
 
     /// Default field emission, except that `content_parts` goes out as
-    /// `content` in place of the text, and `thinking` is response-only.
+    /// `content` in place of the text, and `thinking` is omitted.
     pub fn jsonStringify(self: Message, jws: anytype) !void {
         try jws.beginObject();
         inline for (@typeInfo(Message).@"struct".field_names) |name| {

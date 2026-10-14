@@ -311,8 +311,7 @@ pub fn fetchJsonWithRetry(
     }
 }
 
-/// Record a 2xx body that failed to parse, so the caller sees what came back:
-/// a bare `UnexpectedToken` reads like a key problem, not a schema mismatch.
+/// Record the head of a 2xx body that failed to parse.
 fn setUnparsedDetail(error_handler: anytype, status: u10, err: anyerror, body: []const u8) void {
     var buf: [320]u8 = undefined;
     const head = body[0..@min(body.len, 256)];
@@ -805,7 +804,7 @@ pub fn extractErrorMessage(allocator: std.mem.Allocator, body: []const u8) ?[]u8
         .array => |list| if (list.items.len > 0) stringField(list.items[0], "msg") else null,
         else => null,
     } else if (stringField(parsed.value, "object")) |object|
-        // Mistral: `{"object":"error","message":...}` at the top level.
+        // Mistral
         if (std.mem.eql(u8, object, "error")) stringField(parsed.value, "message") else null
     else
         null;

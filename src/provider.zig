@@ -388,12 +388,10 @@ test "dupeToolResults: preserves is_error flag" {
 
 /// Categorical effort level for model reasoning.
 pub const Effort = enum {
-    /// Send no effort field: the model's own default applies, which may or
-    /// may not reason. Same as a null `GenerationConfig.effort`, but storable
-    /// as a value; the only setting models without reasoning accept.
+    /// Send no effort field; the model default applies. Same as a null
+    /// `GenerationConfig.effort`.
     null,
-    /// Reasoning off, sent explicitly. Reasoning models that run by default
-    /// (e.g. mistral-large-4, Claude Sonnet 5) keep reasoning without it.
+    /// Reasoning off, sent explicitly.
     none,
     minimal,
     low,
@@ -1448,8 +1446,7 @@ pub fn defaultModel(tag: Tag) []const u8 {
 }
 
 /// Default effort for `tag`, or null to defer to the caller's own default.
-/// `.null` for Mistral: models without reasoning (codestral, ministral) reject
-/// any `reasoning_effort`, even "none".
+/// `.null` for Mistral: codestral and ministral reject any `reasoning_effort`.
 pub fn defaultEffort(tag: Tag) ?Effort {
     return switch (tag) {
         .mistral => .null,
@@ -2779,7 +2776,7 @@ fn mapEffortToGeminiConfig(model: []const u8, level: Effort) gemini_types.Thinki
 /// `MINIMAL` with HTTP 400 where `.low` works.
 fn mapEffortToGemini(level: Effort) ?gemini_types.ThinkingLevel {
     return switch (level) {
-        .null => unreachable, // folded into a null effort by `flooredConfig`
+        .null => unreachable, // see `flooredConfig`
         .none => null,
         .minimal => .MINIMAL,
         .low => .LOW,
@@ -2794,7 +2791,7 @@ fn mapEffortToGemini(level: Effort) ?gemini_types.ThinkingLevel {
 /// so `.none` will fail on that model — accepted tradeoff.
 fn mapEffortToGeminiBudget(level: Effort) i32 {
     return switch (level) {
-        .null => unreachable, // folded into a null effort by `flooredConfig`
+        .null => unreachable, // see `flooredConfig`
         .none => 0,
         .minimal => 512,
         .low => 2048,
@@ -2816,18 +2813,14 @@ fn mapOpenAICompletionConfig(config: GenerationConfig, tools: ?[]const openai_ty
         .tools = tools,
         .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
         .response_format = mapResponseFormatToOpenAI(config.response_format),
-        // A null effort omits the field, the one setting models without
-        // reasoning accept; `.none` is sent to switch reasoning off.
         .reasoning_effort = if (config.effort) |tl| mapEffortToOpenAI(tl) else null,
     };
 }
 
-/// Mistral accepts only "none" and "high" (anything else is HTTP 400 on
-/// mistral-medium-3.5, mistral-large-4 and Magistral), so every level that
-/// asks for reasoning becomes "high".
+/// Mistral accepts only "none" and "high".
 fn mapEffortToMistral(level: Effort) openai_types.ReasoningEffort {
     return switch (level) {
-        .null => unreachable, // folded into a null effort by `flooredConfig`
+        .null => unreachable, // see `flooredConfig`
         .none => .none,
         .minimal, .low, .medium, .high, .xhigh => .high,
     };
@@ -2854,9 +2847,8 @@ fn floorMaxTokens(effort: ?Effort, max_tokens: i32) i32 {
 }
 
 /// Null `max_tokens` means "provider default", which is generous, so it is
-/// left alone rather than pinned to the floor. Every entry point runs its
-/// config through here, which also folds `.null` into a null effort so the
-/// per-provider mappers only ever see a level to send.
+/// left alone rather than pinned to the floor. Also folds `.null` into a null
+/// effort, so the mappers never see it.
 fn flooredConfig(config: GenerationConfig) GenerationConfig {
     var floored = config;
     if (config.effort == .null) floored.effort = null;
@@ -2891,7 +2883,7 @@ fn mapEffortToAnthropic(effort: ?Effort, max_tokens: i32) AnthropicReasoning {
 
 fn mapEffortToOpenAI(level: Effort) openai_types.ReasoningEffort {
     return switch (level) {
-        .null => unreachable, // folded into a null effort by `flooredConfig`
+        .null => unreachable, // see `flooredConfig`
         .none => .none,
         .minimal => .minimal,
         .low => .low,
