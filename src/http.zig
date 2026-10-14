@@ -294,7 +294,10 @@ pub fn fetchJsonWithRetry(
         const status_code: u10 = @backingInt(status);
         if (status_code >= 200 and status_code < 300) {
             if (body.len == 0) return error.EmptyResponse;
-            const parsed = try std.json.parseFromSlice(T, allocator, body, .{ .ignore_unknown_fields = true });
+            const parsed = std.json.parseFromSlice(T, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| {
+                setUnparsedDetail(error_handler, status_code, err, body);
+                return err;
+            };
             keep_buf = true;
             return .{ .value = parsed.value, .json_buf = response_buf, .parsed = parsed };
         }
@@ -306,6 +309,14 @@ pub fn fetchJsonWithRetry(
         error_handler.setErrorDetail(status_code, body);
         return error.ApiError;
     }
+}
+
+/// Record the head of a 2xx body that failed to parse.
+fn setUnparsedDetail(error_handler: anytype, status: u10, err: anyerror, body: []const u8) void {
+    var buf: [320]u8 = undefined;
+    const head = body[0..@min(body.len, 256)];
+    const message = std.mem.print(&buf, "unexpected response ({s}): {s}", .{ @errorName(err), head }) catch head;
+    error_handler.setErrorDetail(status, message);
 }
 
 /// A single HTTP round-trip into `response_writer`, mirroring
@@ -700,6 +711,7 @@ fn streamLinesOnce(
 
         const parsed = std.json.parseFromSlice(EventT, allocator, json_data, .{ .ignore_unknown_fields = true }) catch |err| {
             std.log.err("stream: failed to parse chunk: {}", .{err});
+            setUnparsedDetail(error_handler, status_code, err, json_data);
             return error.InvalidSseData;
         };
         defer parsed.deinit();
@@ -791,7 +803,11 @@ pub fn extractErrorMessage(allocator: std.mem.Allocator, body: []const u8) ?[]u8
         .object => stringField(detail, "message"),
         .array => |list| if (list.items.len > 0) stringField(list.items[0], "msg") else null,
         else => null,
-    } else null;
+    } else if (stringField(parsed.value, "object")) |object|
+        // Mistral
+        if (std.mem.eql(u8, object, "error")) stringField(parsed.value, "message") else null
+    else
+        null;
     return allocator.dupe(u8, msg orelse return null) catch null;
 }
 
@@ -807,6 +823,8 @@ test "extractErrorMessage reads each provider's error shape" {
         .{ .body = "{\"detail\":{\"error_type\":\"authentication_error\",\"message\":\"Cannot authenticate\"}}", .want = "Cannot authenticate" },
         .{ .body = "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"body\",\"model\"],\"msg\":\"Field required\"}]}", .want = "Field required" },
         .{ .body = "{\"detail\":\"Not Found\"}", .want = "Not Found" },
+        .{ .body = "{\"object\":\"error\",\"message\":\"reasoning_effort is not enabled for this model\",\"code\":\"3051\"}", .want = "reasoning_effort is not enabled for this model" },
+        .{ .body = "{\"object\":\"chat.completion\",\"message\":\"hi\"}", .want = null },
         .{ .body = "{\"detail\":[]}", .want = null },
         .{ .body = "{\"error\":\"plain\"}", .want = null },
         .{ .body = "<html>502</html>", .want = null },
@@ -847,6 +865,23 @@ test "ErrorDetail.dupe outlives the original" {
     detail.deinit(std.testing.allocator);
     try std.testing.expectEqual(401, copy.status);
     try std.testing.expectEqualStrings("nope", copy.message.?);
+}
+
+test "setUnparsedDetail records the error and the head of the body" {
+    const Recorder = struct {
+        detail: ErrorDetail = .{},
+        fn setErrorDetail(self: *@This(), status: u10, body: []const u8) void {
+            self.detail.set(std.testing.allocator, status, body);
+        }
+    };
+    var rec: Recorder = .{};
+    defer rec.detail.deinit(std.testing.allocator);
+    const body: [400]u8 = @splat('x');
+    setUnparsedDetail(&rec, 200, error.UnexpectedToken, &body);
+    try std.testing.expectEqual(200, rec.detail.status);
+    const message = rec.detail.message.?;
+    try std.testing.expect(std.mem.startsWith(u8, message, "unexpected response (UnexpectedToken): xxx"));
+    try std.testing.expectEqual("unexpected response (UnexpectedToken): ".len + 256, message.len);
 }
 
 /// Owns the parsed response and its backing memory.
