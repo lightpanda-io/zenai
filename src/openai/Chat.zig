@@ -181,6 +181,7 @@ fn dupeMessage(self: *Chat, msg: Message) std.mem.Allocator.Error!Message {
     if (msg.name) |n| duped.name = try a.dupe(u8, n);
     if (msg.tool_call_id) |id| duped.tool_call_id = try a.dupe(u8, id);
     if (msg.refusal) |r| duped.refusal = try a.dupe(u8, r);
+    if (msg.thinking) |t| duped.thinking = try a.dupe(u8, t);
     if (msg.tool_calls) |tcs| {
         const duped_tcs = try a.alloc(types.ToolCall, tcs.len);
         for (tcs, 0..) |tc, i| {

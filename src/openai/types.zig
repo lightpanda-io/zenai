@@ -77,14 +77,107 @@ pub const Message = struct {
     tool_call_id: ?[]const u8 = null,
     /// Refusal message from the model.
     refusal: ?[]const u8 = null,
+    /// Reasoning text from `thinking` content blocks (response only; Mistral
+    /// reasoning models). Not sent back.
+    thinking: ?[]const u8 = null,
+
+    /// Default field parsing, except that `content` may also be an array of
+    /// blocks, as Mistral reasoning models return it: `text` blocks join into
+    /// `content`, `thinking` blocks into `thinking`. Streaming deltas use the
+    /// same shape during the thinking phase.
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) std.json.ParseError(@TypeOf(source.*))!Message {
+        if (.object_begin != try source.next()) return error.UnexpectedToken;
+        var msg: Message = .{};
+        fields: while (true) {
+            const name_token = try source.nextAllocMax(allocator, options.allocate.?, options.max_value_len.?);
+            const key = switch (name_token) {
+                inline .string, .allocated_string => |slice| slice,
+                .object_end => break,
+                else => return error.UnexpectedToken,
+            };
+            if (std.mem.eql(u8, key, "content")) {
+                switch (try std.json.innerParse(?Content, allocator, source, options) orelse continue) {
+                    .text => |t| msg.content = t,
+                    .blocks => |blocks| {
+                        msg.content = try joinBlocks(allocator, blocks, .text);
+                        msg.thinking = try joinBlocks(allocator, blocks, .thinking);
+                    },
+                }
+                continue;
+            }
+            inline for (@typeInfo(Message).@"struct".field_names, @typeInfo(Message).@"struct".field_types) |name, T| {
+                // Request-only or derived from `content`, never on the wire.
+                if (comptime std.mem.eql(u8, name, "content") or
+                    std.mem.eql(u8, name, "content_parts") or
+                    std.mem.eql(u8, name, "thinking")) continue;
+                if (std.mem.eql(u8, key, name)) {
+                    @field(msg, name) = try std.json.innerParse(T, allocator, source, options);
+                    continue :fields;
+                }
+            }
+            if (!options.ignore_unknown_fields) return error.UnknownField;
+            try source.skipValue();
+        }
+        return msg;
+    }
+
+    /// Wire `content`: a string, or an array of typed blocks.
+    const Content = union(enum) {
+        text: []const u8,
+        blocks: []const ContentBlock,
+
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) std.json.ParseError(@TypeOf(source.*))!Content {
+            return switch (try source.peekNextTokenType()) {
+                .array_begin => .{ .blocks = try std.json.innerParse([]const ContentBlock, allocator, source, options) },
+                else => .{ .text = try std.json.innerParse([]const u8, allocator, source, options) },
+            };
+        }
+    };
+
+    /// A `text` block carries `text`; a `thinking` block nests its reasoning
+    /// as `text` blocks under `thinking`. Other types are ignored.
+    const ContentBlock = struct {
+        type: []const u8,
+        text: ?[]const u8 = null,
+        thinking: ?[]const ContentBlock = null,
+        closed: ?bool = null,
+    };
+
+    /// Concatenated text of the `kind` blocks, or null if there is none.
+    fn joinBlocks(
+        allocator: std.mem.Allocator,
+        blocks: []const ContentBlock,
+        comptime kind: enum { text, thinking },
+    ) std.mem.Allocator.Error!?[]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        for (blocks) |b| {
+            if (!std.mem.eql(u8, b.type, @tagName(kind))) continue;
+            switch (kind) {
+                .text => if (b.text) |t| try out.appendSlice(allocator, t),
+                .thinking => for (b.thinking orelse continue) |inner| {
+                    if (inner.text) |t| try out.appendSlice(allocator, t);
+                },
+            }
+        }
+        if (out.items.len == 0) return null;
+        return try out.toOwnedSlice(allocator);
+    }
 
     /// Default field emission, except that `content_parts` goes out as
-    /// `content` in place of the text.
+    /// `content` in place of the text, and `thinking` is response-only.
     pub fn jsonStringify(self: Message, jws: anytype) !void {
         try jws.beginObject();
         inline for (@typeInfo(Message).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "content_parts")) {
-                // Emitted under `content` below.
+            if (comptime std.mem.eql(u8, name, "content_parts") or std.mem.eql(u8, name, "thinking")) {
+                // `content_parts` is emitted under `content` below.
             } else if (comptime std.mem.eql(u8, name, "content")) {
                 if (self.content_parts) |parts| {
                     try jws.objectField("content");
@@ -657,6 +750,50 @@ test "ChatCompletionResponse parses tool calls" {
     const tc = parsed.value.firstToolCall().?;
     try std.testing.expectEqualStrings("get_weather", tc.function.?.name.?);
     try std.testing.expectEqualStrings("call_123", tc.id.?);
+}
+
+test "Message parses array content: text answers, thinking set aside" {
+    const json =
+        \\{"choices":[{"index":0,"message":{"role":"assistant","tool_calls":null,"content":[{"type":"thinking","thinking":[{"type":"text","text":"The user "},{"type":"text","text":"said hi."}],"closed":true},{"type":"text","text":"Hello!"}]},"finish_reason":"stop"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(ChatCompletionResponse, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const msg = parsed.value.choices.?[0].message.?;
+    try std.testing.expectEqual(Role.assistant, msg.role.?);
+    try std.testing.expectEqualStrings("Hello!", parsed.value.text().?);
+    try std.testing.expectEqualStrings("The user said hi.", msg.thinking.?);
+    try std.testing.expect(msg.tool_calls == null);
+}
+
+test "Message parses streamed thinking deltas without content" {
+    const json =
+        \\{"choices":[{"index":0,"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"Hmm"}],"closed":true}]},"finish_reason":null}]}
+    ;
+    const parsed = try std.json.parseFromSlice(ChatCompletionResponse, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const delta = parsed.value.choices.?[0].delta.?;
+    try std.testing.expect(delta.content == null);
+    try std.testing.expectEqualStrings("Hmm", delta.thinking.?);
+}
+
+test "Message parses string and null content, rejects unknown fields when asked" {
+    const parsed = try std.json.parseFromSlice(Message, std.testing.allocator,
+        \\{"role":"assistant","content":null,"refusal":"no"}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.content == null);
+    try std.testing.expectEqualStrings("no", parsed.value.refusal.?);
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Message, std.testing.allocator,
+        \\{"content":"hi","extra":1}
+    , .{}));
+}
+
+test "Message does not serialize thinking" {
+    const msg: Message = .{ .role = .assistant, .content = "Hello!", .thinking = "reasoning" };
+    var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buf.deinit();
+    try std.json.Stringify.value(msg, .{ .emit_null_optional_fields = false }, &buf.writer);
+    try std.testing.expectEqualStrings("{\"role\":\"assistant\",\"content\":\"Hello!\"}", buf.written());
 }
 
 test "FinishReason parses from JSON" {
