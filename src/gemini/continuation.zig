@@ -9,6 +9,8 @@ const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 const Candidate = types.Candidate;
 const FinishReason = types.FinishReason;
+const GroundingMetadata = types.GroundingMetadata;
+const GroundingSupport = types.GroundingSupport;
 const GenerateContentResponse = types.GenerateContentResponse;
 const ModalityTokenCount = types.ModalityTokenCount;
 const SafetyRating = types.SafetyRating;
@@ -75,16 +77,29 @@ fn addOpt(a: ?i32, b: ?i32) ?i32 {
 
 fn mergeCandidates(arena: Allocator, prev: ?[]const Candidate, curr: ?[]const Candidate) Allocator.Error!?[]const Candidate {
     const p = prev orelse return curr;
-    const c = curr orelse return p;
+    const c = curr orelse &.{};
+    if (p.len == 0) return curr;
     const out = try arena.alloc(Candidate, @max(p.len, c.len));
     for (out, 0..) |*slot, i| {
         slot.* = if (i >= p.len)
             c[i]
         else if (i >= c.len)
-            p[i]
+            // The latest request said nothing about this candidate, so it no
+            // longer has a request to continue from.
+            clearStaleContinuation(p[i])
         else
             try mergeCandidate(arena, p[i], c[i]);
     }
+    return out;
+}
+
+fn clearStaleContinuation(cand: Candidate) Candidate {
+    var out = cand;
+    out.continuationToken = null;
+    if (out.finishReason) |reason| if (reason == .CONTINUATION) {
+        out.finishReason = null;
+        out.finishMessage = null;
+    };
     return out;
 }
 
@@ -96,6 +111,7 @@ fn mergeCandidate(arena: Allocator, prev: Candidate, curr: Candidate) Allocator.
     out.continuationToken = curr.continuationToken;
     out.tokenCount = addOpt(prev.tokenCount, curr.tokenCount);
     out.safetyRatings = try mergeSafetyRatings(arena, prev.safetyRatings, curr.safetyRatings);
+    out.groundingMetadata = try mergeGrounding(arena, prev, curr);
     if (prev.content != null and curr.content != null) {
         out.content = .{
             .role = curr.content.?.role orelse prev.content.?.role,
@@ -109,6 +125,43 @@ fn mergeCandidate(arena: Allocator, prev: Candidate, curr: Candidate) Allocator.
         out.logprobsResult = .{
             .topCandidates = try concat(types.TopCandidates, arena, prev.logprobsResult.?.topCandidates, curr.logprobsResult.?.topCandidates),
             .chosenCandidates = try concat(types.TokenLogprob, arena, prev.logprobsResult.?.chosenCandidates, curr.logprobsResult.?.chosenCandidates),
+        };
+    }
+    return out;
+}
+
+/// Chunks, supports and queries concatenated. The latest request's supports
+/// index its own chunks and parts, so they are shifted past the ones before.
+fn mergeGrounding(arena: Allocator, prev: Candidate, curr: Candidate) Allocator.Error!?GroundingMetadata {
+    var c = curr.groundingMetadata orelse return prev.groundingMetadata;
+    const p = prev.groundingMetadata orelse GroundingMetadata{};
+    const chunk_offset: i32 = @intCast(if (p.groundingChunks) |chunks| chunks.len else 0);
+    const part_offset: i32 = @intCast(if (prev.content) |content| content.parts.len else 0);
+    c.groundingSupports = try shiftSupports(arena, c.groundingSupports, chunk_offset, part_offset);
+    if (prev.groundingMetadata == null) return c;
+    return .{
+        .groundingChunks = try concat(types.GroundingChunk, arena, p.groundingChunks, c.groundingChunks),
+        .groundingSupports = try concat(GroundingSupport, arena, p.groundingSupports, c.groundingSupports),
+        .searchEntryPoint = if (p.searchEntryPoint != null and c.searchEntryPoint != null)
+            latest(types.SearchEntryPoint, p.searchEntryPoint.?, c.searchEntryPoint.?)
+        else
+            c.searchEntryPoint orelse p.searchEntryPoint,
+        .webSearchQueries = try concat([]const u8, arena, p.webSearchQueries, c.webSearchQueries),
+    };
+}
+
+fn shiftSupports(arena: Allocator, supports: ?[]const GroundingSupport, chunk_offset: i32, part_offset: i32) Allocator.Error!?[]const GroundingSupport {
+    const s = supports orelse return null;
+    if (chunk_offset == 0 and part_offset == 0) return s;
+    const out = try arena.dupe(GroundingSupport, s);
+    for (out) |*support| {
+        if (chunk_offset > 0) if (support.groundingChunkIndices) |indices| {
+            const shifted = try arena.alloc(i32, indices.len);
+            for (shifted, indices) |*dst, i| dst.* = i + chunk_offset;
+            support.groundingChunkIndices = shifted;
+        };
+        if (part_offset > 0) if (support.segment) |*segment| {
+            segment.partIndex = (segment.partIndex orelse 0) + part_offset;
         };
     }
     return out;
@@ -210,11 +263,16 @@ fn dupeUsage(arena: Allocator, usage: UsageMetadata) Allocator.Error!UsageMetada
     return out;
 }
 
-/// Wraps a stream callback across the requests of a continued generation:
-/// chunks of every request reach `user_cb` in order, a `CONTINUATION` finish
-/// reason the next request supersedes is cleared, and usage is summed over the
-/// requests so far.
-pub fn Stream(comptime Context: type) type {
+/// A stream that ends without progress (no content, no new checkpoint) is
+/// retried from the same token at most this many times in a row.
+const max_reconnects_without_progress = 3;
+
+/// Wraps a stream callback across the requests ("hops") of a continued
+/// generation: chunks of every request reach `user_cb` in order, a
+/// `CONTINUATION` finish reason the next request supersedes is cleared, and
+/// usage is summed over the requests so far. `Error` is the error set of a
+/// failed request.
+pub fn Stream(comptime Context: type, comptime Error: type) type {
     return struct {
         const Self = @This();
 
@@ -229,13 +287,19 @@ pub fn Stream(comptime Context: type) type {
         hop_arena: std.heap.ArenaAllocator,
         /// Copies of the chunk handed to `user_cb`, freed after it returns.
         chunk_arena: std.heap.ArenaAllocator,
+        /// The token this request was sent with (empty for the first).
+        sent: std.ArrayList(u8) = .empty,
         /// This request's latest checkpoint token.
         token: std.ArrayList(u8) = .empty,
         has_token: bool = false,
-        /// Whether this request's finish reason, if any, is resumable.
-        resumable: bool = true,
-        /// The token the next request is sent with.
-        sent: std.ArrayList(u8) = .empty,
+        /// This request's latest finish reason, if any.
+        finish: ?FinishReason = null,
+        prompt_feedback: bool = false,
+        has_content: bool = false,
+        received_chunk: bool = false,
+        reconnects: u8 = 0,
+        /// The latest failure since the stream last made progress.
+        last_err: ?Error = null,
         err: ?Allocator.Error = null,
 
         pub fn init(allocator: Allocator, user_ctx: Context, user_cb: *const fn (Context, GenerateContentResponse) void) Self {
@@ -257,26 +321,74 @@ pub fn Stream(comptime Context: type) type {
             self.sent.deinit(self.allocator);
         }
 
-        /// Whether the request that just ended, normally or cut off, can be
-        /// resumed from a checkpoint.
-        pub fn canResume(self: *const Self) bool {
-            return self.has_token and self.resumable;
+        /// Whether the current request has delivered any chunk.
+        pub fn receivedChunk(self: *const Self) bool {
+            return self.received_chunk;
         }
 
-        /// Call when a request ends. Returns the token to send the next request
-        /// with, valid until the following `next` call, or null when the model
-        /// has finished.
-        pub fn next(self: *Self) Allocator.Error!?[]const u8 {
-            if (!self.canResume()) return null;
+        fn newToken(self: *const Self) bool {
+            return self.has_token and !std.mem.eql(u8, self.token.items, self.sent.items);
+        }
+
+        const Next = enum { new, retry, none };
+
+        fn nextHop(self: *Self) Next {
+            if (self.prompt_feedback) {
+                self.reconnects = 0;
+                return .none;
+            }
+            if (isSet(self.finish)) {
+                if (self.finish.? != .CONTINUATION or !self.newToken()) return .none;
+                self.reconnects = 0;
+                return .new;
+            }
+            if (self.newToken()) {
+                self.reconnects = 0;
+                return .new;
+            }
+            if (self.has_content or self.reconnects >= max_reconnects_without_progress) return .none;
+            if (self.sent.items.len == 0) return .none;
+            self.reconnects += 1;
+            return .retry;
+        }
+
+        /// Call when a request ends, with its failure if it did not end
+        /// cleanly. Returns the token to send the next request with, valid
+        /// until the following `endHop` call; null when the stream is over; or
+        /// the error that ended it. A request cut off after a checkpoint is
+        /// resumed from it, and one that made no progress is retried from the
+        /// same token a few times; a request that ends with a finish reason or
+        /// prompt feedback is not resumed unless it asks to continue.
+        pub fn endHop(self: *Self, hop_err: ?Error) (Error || Allocator.Error)!?[]const u8 {
             if (self.hop_usage) |u| {
                 // `hop_usage` already includes `prior_usage`, so this is a
                 // replace; `prior_arena` grows by one copy per request.
                 self.prior_usage = try dupeUsage(self.prior_arena.allocator(), u);
             }
-            std.mem.swap(std.ArrayList(u8), &self.token, &self.sent);
+            if (hop_err) |e| {
+                self.last_err = e;
+            } else if (self.has_content or self.newToken()) {
+                self.last_err = null;
+            }
+
+            switch (self.nextHop()) {
+                .new => std.mem.swap(std.ArrayList(u8), &self.token, &self.sent),
+                .retry => {},
+                .none => {
+                    if (hop_err) |e| return e;
+                    // Cut off without an error of its own: surface the failure
+                    // that started the run of unproductive requests.
+                    const gave_up = !isSet(self.finish) and !self.prompt_feedback;
+                    if (gave_up) if (self.last_err) |e| return e;
+                    return null;
+                },
+            }
             self.token.clearRetainingCapacity();
             self.has_token = false;
-            self.resumable = true;
+            self.finish = null;
+            self.prompt_feedback = false;
+            self.has_content = false;
+            self.received_chunk = false;
             self.hop_usage = null;
             _ = self.hop_arena.reset(.retain_capacity);
             return self.sent.items;
@@ -294,21 +406,26 @@ pub fn Stream(comptime Context: type) type {
         fn handle(self: *Self, chunk: GenerateContentResponse) Allocator.Error!GenerateContentResponse {
             var out = chunk;
             const scratch = self.chunk_arena.allocator();
+            self.received_chunk = true;
+            if (chunk.promptFeedback != null) self.prompt_feedback = true;
             const candidates = chunk.candidates orelse &.{};
             if (candidates.len > 0) {
                 const cand = candidates[0];
-                if (isSet(cand.finishReason)) self.resumable = isResumable(cand.finishReason);
+                if (cand.content) |content| {
+                    if (content.parts.len > 0) self.has_content = true;
+                }
+                if (isSet(cand.finishReason)) self.finish = cand.finishReason;
                 const token = cand.continuationToken orelse "";
                 if (token.len > 0) {
                     self.token.clearRetainingCapacity();
                     try self.token.appendSlice(self.allocator, token);
                     self.has_token = true;
-                } else if (isSet(cand.finishReason) and !self.resumable) {
+                } else if (isSet(cand.finishReason) and !isResumable(cand.finishReason)) {
                     self.has_token = false;
                 }
                 // The next request carries on from here, so this one has not
                 // finished the candidate.
-                if (isSet(cand.finishReason) and self.canResume()) {
+                if (isSet(cand.finishReason) and self.has_token and isResumable(cand.finishReason) and chunk.promptFeedback == null) {
                     const copy = try scratch.dupe(Candidate, candidates);
                     copy[0].finishReason = null;
                     out.candidates = copy;
@@ -414,20 +531,23 @@ const Collect = struct {
     }
 };
 
+const TestError = error{ ApiError, InvalidSseData };
+const TestStream = Stream(*Collect, TestError);
+
 test "Stream clears a superseded CONTINUATION and sums usage across requests" {
     var collect: Collect = .{ .arena = .init(std.testing.allocator) };
     defer collect.arena.deinit();
-    var s = Stream(*Collect).init(std.testing.allocator, &collect, Collect.cb);
+    var s = TestStream.init(std.testing.allocator, &collect, Collect.cb);
     defer s.deinit();
 
     // Request 1: a checkpoint mid-stream, then CONTINUATION at the end.
     s.onChunk(.{ .candidates = &.{.{ .continuationToken = "ck1" }}, .usageMetadata = .{ .totalTokenCount = 5 } });
     s.onChunk(.{ .candidates = &.{.{ .finishReason = .CONTINUATION, .continuationToken = "ck2" }}, .usageMetadata = .{ .totalTokenCount = 10 } });
-    try std.testing.expectEqualStrings("ck2", (try s.next()).?);
+    try std.testing.expectEqualStrings("ck2", (try s.endHop(null)).?);
 
     // Request 2 finishes.
     s.onChunk(.{ .candidates = &.{.{ .finishReason = .STOP }}, .usageMetadata = .{ .totalTokenCount = 7 } });
-    try std.testing.expect((try s.next()) == null);
+    try std.testing.expect((try s.endHop(null)) == null);
     try std.testing.expect(s.err == null);
 
     try std.testing.expectEqual(@as(usize, 3), collect.finishes.items.len);
@@ -440,26 +560,131 @@ test "Stream clears a superseded CONTINUATION and sums usage across requests" {
 test "Stream resumes a cut-off request from its last checkpoint" {
     var collect: Collect = .{ .arena = .init(std.testing.allocator) };
     defer collect.arena.deinit();
-    var s = Stream(*Collect).init(std.testing.allocator, &collect, Collect.cb);
+    var s = TestStream.init(std.testing.allocator, &collect, Collect.cb);
     defer s.deinit();
 
-    try std.testing.expect(!s.canResume());
     s.onChunk(.{ .candidates = &.{.{ .continuationToken = "ck1" }} });
     // The stream errors out here, before a finish reason.
-    try std.testing.expect(s.canResume());
-    try std.testing.expectEqualStrings("ck1", (try s.next()).?);
-    // A request that fails before its first checkpoint is not resumed.
-    try std.testing.expect(!s.canResume());
+    try std.testing.expectEqualStrings("ck1", (try s.endHop(error.InvalidSseData)).?);
+}
+
+test "Stream: a first request that fails before a checkpoint is not resumed" {
+    var collect: Collect = .{ .arena = .init(std.testing.allocator) };
+    defer collect.arena.deinit();
+    var s = TestStream.init(std.testing.allocator, &collect, Collect.cb);
+    defer s.deinit();
+
+    try std.testing.expectError(error.InvalidSseData, s.endHop(error.InvalidSseData));
 }
 
 test "Stream: a final finish reason drops the checkpoint" {
     var collect: Collect = .{ .arena = .init(std.testing.allocator) };
     defer collect.arena.deinit();
-    var s = Stream(*Collect).init(std.testing.allocator, &collect, Collect.cb);
+    var s = TestStream.init(std.testing.allocator, &collect, Collect.cb);
     defer s.deinit();
 
     s.onChunk(.{ .candidates = &.{.{ .continuationToken = "ck1" }} });
     s.onChunk(.{ .candidates = &.{.{ .finishReason = .MAX_TOKENS }} });
-    try std.testing.expect((try s.next()) == null);
+    try std.testing.expect((try s.endHop(null)) == null);
     try std.testing.expect(collect.finishes.items[1].? == .MAX_TOKENS);
+}
+
+test "Stream: prompt feedback stops the stream" {
+    var collect: Collect = .{ .arena = .init(std.testing.allocator) };
+    defer collect.arena.deinit();
+    var s = TestStream.init(std.testing.allocator, &collect, Collect.cb);
+    defer s.deinit();
+
+    s.onChunk(.{
+        .candidates = &.{.{ .finishReason = .CONTINUATION, .continuationToken = "ck1" }},
+        .promptFeedback = .{ .blockReason = "SAFETY" },
+    });
+    // The finish reason is kept: there is no next request to supersede it.
+    try std.testing.expect(collect.finishes.items[0].? == .CONTINUATION);
+    try std.testing.expect((try s.endHop(null)) == null);
+}
+
+test "Stream retries a request that made no progress, then gives up with its error" {
+    var collect: Collect = .{ .arena = .init(std.testing.allocator) };
+    defer collect.arena.deinit();
+    var s = TestStream.init(std.testing.allocator, &collect, Collect.cb);
+    defer s.deinit();
+
+    s.onChunk(.{ .candidates = &.{.{ .finishReason = .CONTINUATION, .continuationToken = "ck1" }} });
+    try std.testing.expectEqualStrings("ck1", (try s.endHop(null)).?);
+
+    // Request 2 drops, then closes empty: both resend ck1.
+    try std.testing.expectEqualStrings("ck1", (try s.endHop(error.InvalidSseData)).?);
+    for (0..max_reconnects_without_progress - 1) |_| {
+        try std.testing.expectEqualStrings("ck1", (try s.endHop(null)).?);
+    }
+    // Out of retries: the drop is not lost behind the clean closes.
+    try std.testing.expectError(error.InvalidSseData, s.endHop(null));
+}
+
+test "Stream: a request that repeats its own token is not continued" {
+    var collect: Collect = .{ .arena = .init(std.testing.allocator) };
+    defer collect.arena.deinit();
+    var s = TestStream.init(std.testing.allocator, &collect, Collect.cb);
+    defer s.deinit();
+
+    s.onChunk(.{ .candidates = &.{.{ .finishReason = .CONTINUATION, .continuationToken = "ck1" }} });
+    try std.testing.expectEqualStrings("ck1", (try s.endHop(null)).?);
+    s.onChunk(.{ .candidates = &.{.{ .finishReason = .CONTINUATION, .continuationToken = "ck1" }} });
+    try std.testing.expect((try s.endHop(null)) == null);
+}
+
+test "merge: a request without candidates clears the continuation" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const parts = [_]types.Part{.{ .text = "Hello" }};
+    const first: GenerateContentResponse = .{ .candidates = &.{.{
+        .content = .{ .role = "model", .parts = &parts },
+        .finishReason = .CONTINUATION,
+        .finishMessage = "more",
+        .continuationToken = "abc",
+    }} };
+    const second: GenerateContentResponse = .{ .promptFeedback = .{ .blockReason = "SAFETY" } };
+
+    const merged = try merge(arena, first, second);
+    const cand = merged.candidates.?[0];
+    try std.testing.expectEqualStrings("Hello", cand.content.?.parts[0].text.?);
+    try std.testing.expect(cand.finishReason == null);
+    try std.testing.expect(cand.finishMessage == null);
+    try std.testing.expect(cand.continuationToken == null);
+    try std.testing.expectEqualStrings("SAFETY", merged.promptFeedback.?.blockReason.?);
+}
+
+test "merge shifts the latest request's grounding supports past the earlier ones" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const a_parts = [_]types.Part{ .{ .text = "a" }, .{ .text = "b" } };
+    const b_parts = [_]types.Part{.{ .text = "c" }};
+    const a_chunks = [_]types.GroundingChunk{ .{}, .{} };
+    const b_chunks = [_]types.GroundingChunk{.{}};
+    const a_supports = [_]GroundingSupport{.{ .groundingChunkIndices = &.{1}, .segment = .{ .partIndex = 1 } }};
+    const b_supports = [_]GroundingSupport{.{ .groundingChunkIndices = &.{0}, .segment = .{} }};
+
+    const merged = try merge(arena, .{ .candidates = &.{.{
+        .content = .{ .parts = &a_parts },
+        .groundingMetadata = .{ .groundingChunks = &a_chunks, .groundingSupports = &a_supports, .webSearchQueries = &.{"q1"} },
+    }} }, .{ .candidates = &.{.{
+        .content = .{ .parts = &b_parts },
+        .groundingMetadata = .{ .groundingChunks = &b_chunks, .groundingSupports = &b_supports, .webSearchQueries = &.{"q2"} },
+    }} });
+
+    const gm = merged.candidates.?[0].groundingMetadata.?;
+    try std.testing.expectEqual(@as(usize, 3), gm.groundingChunks.?.len);
+    try std.testing.expectEqual(@as(usize, 2), gm.groundingSupports.?.len);
+    try std.testing.expectEqualSlices(i32, &.{1}, gm.groundingSupports.?[0].groundingChunkIndices.?);
+    try std.testing.expectEqual(@as(?i32, 1), gm.groundingSupports.?[0].segment.?.partIndex);
+    try std.testing.expectEqualSlices(i32, &.{2}, gm.groundingSupports.?[1].groundingChunkIndices.?);
+    try std.testing.expectEqual(@as(?i32, 2), gm.groundingSupports.?[1].segment.?.partIndex);
+    try std.testing.expectEqual(@as(usize, 2), gm.webSearchQueries.?.len);
+    // The inputs are untouched.
+    try std.testing.expectEqual(@as(i32, 0), b_supports[0].groundingChunkIndices.?[0]);
 }
