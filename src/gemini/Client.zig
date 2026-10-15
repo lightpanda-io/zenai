@@ -274,8 +274,11 @@ pub fn generateContent(
     // Merged into the first response's arena, so the result owns every hop.
     const arena = response.parsed.arena.allocator();
     var request = generateRequest(contents, config, options);
-    while (continuation.resumeToken(response.value)) |token| {
-        request.continuationToken = token;
+    // The latest response decides whether to go on, not the merge: a request
+    // without candidates ends the generation.
+    var token = continuation.resumeToken(response.value);
+    while (token) |t| {
+        request.continuationToken = t;
         var hop = try self.fetchPost(url, request, GenerateContentResponse);
         defer hop.deinit();
         const curr = try std.json.parseFromSliceLeaky(GenerateContentResponse, arena, hop.json_buf.written(), .{
@@ -283,6 +286,7 @@ pub fn generateContent(
             .allocate = .alloc_always,
         });
         response.value = try continuation.merge(arena, response.value, curr);
+        token = continuation.resumeToken(curr);
     }
     return response;
 }
@@ -333,16 +337,21 @@ pub fn generateContentStream(
         return http.streamSseValue(self.allocator, &self.http_client, url, &auth, request, GenerateContentResponse, self, context, callback);
     }
 
-    const Hops = continuation.Stream(@TypeOf(context));
+    const Hops = continuation.Stream(@TypeOf(context), StreamError);
     var hops: Hops = .init(self.allocator, context, callback);
     defer hops.deinit();
     while (true) {
+        var hop_err: ?StreamError = null;
         http.streamSseValue(self.allocator, &self.http_client, url, &auth, request, GenerateContentResponse, self, &hops, Hops.onChunk) catch |err| {
-            const cancelled = if (self.interrupt) |it| it.isFired() else false;
-            if (err == error.OutOfMemory or cancelled or !hops.canResume()) return err;
+            if (err == error.OutOfMemory) return err;
+            // A rejected request is not retried here.
+            if (err == error.ApiError and !hops.receivedChunk()) return err;
+            hop_err = err;
         };
         if (hops.err) |e| return e;
-        request.continuationToken = try hops.next() orelse return;
+        // An interrupted read ends the body like a clean close; never resume it.
+        if (self.interrupt) |it| if (it.isFired()) return hop_err orelse {};
+        request.continuationToken = try hops.endHop(hop_err) orelse return;
     }
 }
 
@@ -1217,6 +1226,37 @@ test "generateContent continues a CONTINUATION response and merges the hops" {
     try std.testing.expect(response.value.candidates.?[0].finishReason.? == .STOP);
     try std.testing.expectEqual(@as(?i32, 26), response.value.usageMetadata.?.totalTokenCount);
     try std.testing.expectEqualStrings("r2", response.value.responseId.?);
+}
+
+test "generateContent stops when a continuation returns no candidates" {
+    const loopback: std.Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var server: ContinuationServer = .{
+        .server = try loopback.listen(std.testing.io, .{}),
+        .content_type = "application/json",
+        .bodies = &.{
+            \\{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello, "}]},"finishReason":"CONTINUATION","continuationToken":"Y2sx"}]}
+            ,
+            \\{"promptFeedback":{"blockReason":"SAFETY"}}
+            ,
+        },
+    };
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, ContinuationServer.run, .{&server});
+    defer thread.join();
+
+    var client = try continuationClient(&server);
+    defer std.testing.allocator.free(client.base_url.?);
+    defer client.deinit();
+
+    var response = try client.generateContentFromText("m", "hi", null, .{});
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), server.served);
+    const cand = response.value.candidates.?[0];
+    try std.testing.expectEqualStrings("Hello, ", cand.content.?.parts[0].text.?);
+    try std.testing.expect(cand.finishReason == null);
+    try std.testing.expect(cand.continuationToken == null);
+    try std.testing.expectEqualStrings("SAFETY", response.value.promptFeedback.?.blockReason.?);
 }
 
 test "generateContent with automatic_continuation off returns the first response" {
