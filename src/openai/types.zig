@@ -632,12 +632,42 @@ pub const EmbeddingRequest = struct {
 
 /// A single embedding result.
 pub const Embedding = struct {
-    /// The embedding vector.
+    /// The embedding vector, decoded from base64 when the request asked for
+    /// `encoding_format = "base64"`.
     embedding: ?[]const f32 = null,
     /// The index of this embedding in the input list.
     index: ?i32 = null,
     /// Object type (always "embedding").
     object: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Embedding {
+        const raw = try std.json.innerParse(struct {
+            embedding: ?Vector = null,
+            index: ?i32 = null,
+            object: ?[]const u8 = null,
+        }, allocator, source, options);
+        return .{ .embedding = if (raw.embedding) |v| v.values else null, .index = raw.index, .object = raw.object };
+    }
+
+    /// A JSON array of floats, or a base64 string of little-endian float32s.
+    const Vector = struct {
+        values: []const f32,
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Vector {
+            if (try source.peekNextTokenType() != .string) {
+                return .{ .values = try std.json.innerParse([]const f32, allocator, source, options) };
+            }
+            const encoded = try std.json.innerParse([]const u8, allocator, source, options);
+            const decoder = std.base64.standard.Decoder;
+            const len = decoder.calcSizeForSlice(encoded) catch return error.UnexpectedToken;
+            if (len % 4 != 0) return error.UnexpectedToken;
+            const bytes = try allocator.alloc(u8, len);
+            decoder.decode(bytes, encoded) catch return error.UnexpectedToken;
+            const values = try allocator.alloc(f32, len / 4);
+            for (values, 0..) |*v, i| v.* = @bitCast(std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little));
+            return .{ .values = values };
+        }
+    };
 };
 
 /// Token usage for embeddings.
@@ -851,4 +881,16 @@ test "Role serializes correctly" {
     try std.json.Stringify.value(msg, .{ .emit_null_optional_fields = false }, &buf.writer);
     const json = buf.written();
     try std.testing.expect(std.mem.find(u8, json, "\"user\"") != null);
+}
+
+test "EmbeddingResponse parses float and base64 vectors" {
+    const json =
+        \\{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.5,0.25]},{"object":"embedding","index":1,"embedding":"AACAPwAAIMA="}],"model":"text-embedding-3-small"}
+    ;
+    const parsed = try std.json.parseFromSlice(EmbeddingResponse, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const data = parsed.value.data.?;
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25 }, data[0].embedding.?);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, -2.5 }, data[1].embedding.?);
+    try std.testing.expectEqual(@as(i32, 1), data[1].index.?);
 }

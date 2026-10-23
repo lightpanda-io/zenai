@@ -402,8 +402,10 @@ pub const Effort = enum {
 
 /// Minimal generation config — the intersection of what both providers support.
 pub const GenerationConfig = struct {
+    /// Ignored by Anthropic, whose API (2026-10-21) rejects sampling parameters.
     temperature: ?f32 = null,
     max_tokens: ?i32 = null,
+    /// Ignored by Anthropic, like `temperature`.
     top_p: ?f32 = null,
     stop: ?[]const []const u8 = null,
     frequency_penalty: ?f32 = null,
@@ -746,8 +748,6 @@ pub const Client = union(enum) {
 
                 var response = try a.createMessage(model, ant_messages, reasoning.max_tokens, .{
                     .system = system_blocks,
-                    .temperature = config.temperature,
-                    .top_p = config.top_p,
                     .stop_sequences = config.stop,
                     .tools = tools,
                     .tool_choice = mapToolChoiceToAnthropic(config.tool_choice),
@@ -889,8 +889,6 @@ pub const Client = union(enum) {
 
                 try a.createMessageStream(model, ant_messages, reasoning.max_tokens, .{
                     .system = system_blocks,
-                    .temperature = config.temperature,
-                    .top_p = config.top_p,
                     .stop_sequences = config.stop,
                     .tools = tools,
                     .tool_choice = mapToolChoiceToAnthropic(config.tool_choice),
@@ -933,8 +931,6 @@ pub const Client = union(enum) {
                 var acc = anthropic_mod.StreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
                 a.createMessageStream(model, ant_messages, reasoning.max_tokens, .{
                     .system = system_blocks,
-                    .temperature = config.temperature,
-                    .top_p = config.top_p,
                     .stop_sequences = config.stop,
                     .tools = tools,
                     .tool_choice = mapToolChoiceToAnthropic(config.tool_choice),

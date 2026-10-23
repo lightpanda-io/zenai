@@ -35,7 +35,7 @@ pub const InitOptions = struct {
     /// Base URL for the Anthropic API, with or without the trailing `/v1`.
     base_url: []const u8 = "https://api.anthropic.com/v1",
     /// API version header value.
-    api_version: []const u8 = "2023-06-01",
+    api_version: []const u8 = "2026-10-21",
     /// Retry policy for transient HTTP failures (5xx including 529
     /// `overloaded_error`, 429, and known flaky network errors). Pass
     /// `RetryPolicy.disabled` to opt out.
@@ -114,12 +114,6 @@ fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) Ap
 pub const MessageConfig = struct {
     /// System prompt (separate from messages).
     system: ?[]const types.TextBlock = null,
-    /// Sampling temperature (0.0-1.0).
-    temperature: ?f32 = null,
-    /// Top-p (nucleus) sampling.
-    top_p: ?f32 = null,
-    /// Top-k sampling.
-    top_k: ?i32 = null,
     /// Custom stop sequences.
     stop_sequences: ?[]const []const u8 = null,
     /// Tools the model may use.
@@ -130,6 +124,8 @@ pub const MessageConfig = struct {
     thinking: ?types.ThinkingConfig = null,
     /// Output-level controls.
     output_config: ?types.OutputConfig = null,
+    /// Inference speed mode: "standard" or "fast".
+    speed: ?[]const u8 = null,
 };
 
 /// Create a message.
@@ -149,14 +145,12 @@ pub fn createMessage(
         .messages = messages,
         .max_tokens = max_tokens,
         .system = config.system,
-        .temperature = config.temperature,
-        .top_p = config.top_p,
-        .top_k = config.top_k,
         .stop_sequences = config.stop_sequences,
         .tools = config.tools,
         .tool_choice = config.tool_choice,
         .thinking = config.thinking,
         .output_config = config.output_config,
+        .speed = config.speed,
         // Apply an ephemeral cache_control marker to the last cacheable block
         // (default 5-minute TTL). For agent loops this caches the system
         // prompt + tool definitions across turns, dropping repeated-prefix
@@ -210,14 +204,12 @@ pub fn createMessageStream(
         .max_tokens = max_tokens,
         .stream = true,
         .system = config.system,
-        .temperature = config.temperature,
-        .top_p = config.top_p,
-        .top_k = config.top_k,
         .stop_sequences = config.stop_sequences,
         .tools = config.tools,
         .tool_choice = config.tool_choice,
         .thinking = config.thinking,
         .output_config = config.output_config,
+        .speed = config.speed,
         // See createMessage above for cache_control rationale.
         .cache_control = .{},
     };
@@ -368,7 +360,7 @@ test "Client init and deinit" {
     defer client.deinit();
     try std.testing.expectEqualStrings("test-key", client.api_key);
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1", client.base_url);
-    try std.testing.expectEqualStrings("2023-06-01", client.api_version);
+    try std.testing.expectEqualStrings("2026-10-21", client.api_version);
 }
 
 test "endpoint: /v1 is appended when the base URL lacks it" {

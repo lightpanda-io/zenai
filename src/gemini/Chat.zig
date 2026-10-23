@@ -110,7 +110,11 @@ pub fn sendStream(
 
         fn handle(s: *const @This(), response: GenerateContentResponse) void {
             if (response.parts()) |pts| {
-                s.parts.appendSlice(s.alloc, pts) catch {};
+                // The API ends some streamed turns with a chunk whose parts
+                // carry no data; sent back, each would be an empty part.
+                for (pts) |part| {
+                    if (partHasData(part) or part.thoughtSignature != null) s.parts.append(s.alloc, part) catch {};
+                }
             }
             s.user_cb(s.user_ctx, response);
         }
@@ -166,15 +170,20 @@ fn validateResponse(response: GenerateContentResponse) bool {
     const content = candidates[0].content orelse return false;
     if (content.parts.len == 0) return false;
     for (content.parts) |part| {
-        if (part.text != null or
-            part.inlineData != null or
-            part.fileData != null or
-            part.functionCall != null or
-            part.functionResponse != null or
-            part.executableCode != null or
-            part.codeExecutionResult != null) return true;
+        if (part.text != null or partHasData(part)) return true;
     }
     return false;
+}
+
+/// Whether `part` carries non-empty text or another data field.
+fn partHasData(part: Part) bool {
+    return (part.text != null and part.text.?.len > 0) or
+        part.inlineData != null or
+        part.fileData != null or
+        part.functionCall != null or
+        part.functionResponse != null or
+        part.executableCode != null or
+        part.codeExecutionResult != null;
 }
 
 fn dupeParts(self: *Chat, parts: []const Part) std.mem.Allocator.Error![]Part {
@@ -220,4 +229,12 @@ test "Chat init and deinit" {
     defer chat.deinit();
     try std.testing.expectEqualStrings("gemini-2.5-flash", chat.model);
     try std.testing.expectEqual(@as(usize, 0), chat.getHistory().len);
+}
+
+test "partHasData ignores empty text" {
+    try std.testing.expect(!partHasData(.{}));
+    try std.testing.expect(!partHasData(.{ .text = "" }));
+    try std.testing.expect(!partHasData(.{ .text = "", .thoughtSignature = "sig" }));
+    try std.testing.expect(partHasData(.{ .text = "hi" }));
+    try std.testing.expect(partHasData(.{ .functionCall = .{ .name = "f" } }));
 }
