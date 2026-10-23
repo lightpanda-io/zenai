@@ -602,6 +602,7 @@ fn frameSse(line: []const u8) LineFrame {
     if (std.mem.startsWith(u8, line, "event: ")) return .skip;
     if (!std.mem.startsWith(u8, line, "data: ")) return .skip;
     const json_data = line["data: ".len..];
+    if (json_data.len == 0) return .skip;
     // OpenAI terminates with a `[DONE]` sentinel; others just EOF.
     if (std.mem.eql(u8, json_data, "[DONE]")) return .stop;
     return .{ .parse = json_data };
@@ -709,6 +710,11 @@ fn streamLinesOnce(
             .parse => |d| d,
         };
 
+        if (isStreamError(allocator, json_data)) {
+            error_handler.setErrorDetail(status_code, json_data);
+            return error.ApiError;
+        }
+
         const parsed = std.json.parseFromSlice(EventT, allocator, json_data, .{ .ignore_unknown_fields = true }) catch |err| {
             std.log.err("stream: failed to parse chunk: {}", .{err});
             setUnparsedDetail(error_handler, status_code, err, json_data);
@@ -717,6 +723,18 @@ fn streamLinesOnce(
         defer parsed.deinit();
         callback(context, parsed.value);
     }
+}
+
+/// Whether a stream event reports a failure in-band after a 2xx head:
+/// `{"error":{...}}` (Gemini, OpenAI and compatible gateways), Anthropic's
+/// `{"type":"error","error":{...}}`, or Ollama's `{"error":"..."}`.
+fn isStreamError(allocator: std.mem.Allocator, data: []const u8) bool {
+    if (std.mem.find(u8, data, "\"error\"") == null) return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const err = parsed.value.object.get("error") orelse return false;
+    return err == .object or err == .string;
 }
 
 /// POST `payload` and stream the Server-Sent Events response, invoking
@@ -882,6 +900,23 @@ test "setUnparsedDetail records the error and the head of the body" {
     const message = rec.detail.message.?;
     try std.testing.expect(std.mem.startsWith(u8, message, "unexpected response (UnexpectedToken): xxx"));
     try std.testing.expectEqual("unexpected response (UnexpectedToken): ".len + 256, message.len);
+}
+
+test "frameSse skips an event with no data" {
+    try std.testing.expect(frameSse("data: ") == .skip);
+    try std.testing.expect(frameSse("event: ping") == .skip);
+    try std.testing.expect(frameSse("data: [DONE]") == .stop);
+    try std.testing.expectEqualStrings("{}", frameSse("data: {}").parse);
+}
+
+test "isStreamError recognizes each provider's in-band error" {
+    const a = std.testing.allocator;
+    try std.testing.expect(isStreamError(a, "{\"error\":{\"code\":500,\"message\":\"Internal error\",\"status\":\"INTERNAL\"}}"));
+    try std.testing.expect(isStreamError(a, "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}"));
+    try std.testing.expect(isStreamError(a, "{\"error\":\"model not found\"}"));
+    try std.testing.expect(!isStreamError(a, "{\"choices\":[],\"error\":null}"));
+    try std.testing.expect(!isStreamError(a, "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\\\"error\\\"\"}]}}]}"));
+    try std.testing.expect(!isStreamError(a, "{\"type\":\"content_block_delta\"}"));
 }
 
 /// Owns the parsed response and its backing memory.

@@ -159,12 +159,6 @@ pub const MessageRequest = struct {
     max_tokens: i32,
     /// System prompt (separate from messages).
     system: ?[]const TextBlock = null,
-    /// Sampling temperature (0.0-1.0).
-    temperature: ?f32 = null,
-    /// Top-p (nucleus) sampling (0.0-1.0).
-    top_p: ?f32 = null,
-    /// Top-k sampling.
-    top_k: ?i32 = null,
     /// Custom stop sequences.
     stop_sequences: ?[]const []const u8 = null,
     /// Tools the model may use.
@@ -177,6 +171,9 @@ pub const MessageRequest = struct {
     thinking: ?ThinkingConfig = null,
     /// Output-level controls.
     output_config: ?OutputConfig = null,
+    /// Inference speed mode: "standard" or "fast" (high output tokens per
+    /// second). Some models require the `fast-mode-2026-02-01` beta header.
+    speed: ?[]const u8 = null,
     /// Request metadata.
     metadata: ?Metadata = null,
     /// Top-level cache control — applies an ephemeral cache_control marker to
@@ -247,6 +244,8 @@ pub const Usage = struct {
     cache_creation_input_tokens: ?i32 = null,
     /// Tokens read from the cache.
     cache_read_input_tokens: ?i32 = null,
+    /// Inference speed mode used for the request: "standard" or "fast".
+    speed: ?[]const u8 = null,
 };
 
 /// Policy category that triggered a refusal. Known values are void tags; any
@@ -427,7 +426,6 @@ test "MessageRequest serializes to JSON" {
         .model = "claude-sonnet-4-6",
         .messages = &messages,
         .max_tokens = 1024,
-        .temperature = 0.5,
     };
     var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer buf.deinit();
