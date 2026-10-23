@@ -78,6 +78,10 @@ pub const search = struct {
 pub const typesafe = struct {
     pub const Client = @import("typesafe/Client.zig");
     pub const types = @import("typesafe/types.zig");
+    /// Questions from JSON and answers back as JSON, for a caller driven by
+    /// configuration rather than comptime.
+    pub const json = @import("typesafe/json.zig");
+    pub const Pool = @import("typesafe/Pool.zig");
 
     /// Shorthands for building questions.
     pub const Question = types.Question;
