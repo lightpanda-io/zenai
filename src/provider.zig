@@ -141,6 +141,18 @@ pub const ToolResult = struct {
     thought_signature: ?[]const u8 = null,
 };
 
+/// Encrypted reasoning from a Responses-API turn (OpenAI, Codex, xAI), echoed
+/// back on the assistant message so the model keeps its chain of thought
+/// across tool calls. The ciphertext is only valid for the provider and model
+/// that produced it; other turns drop it.
+pub const ReasoningItem = struct {
+    id: []const u8,
+    encrypted_content: []const u8,
+    summary: []const []const u8 = &.{},
+    provider: Tag,
+    model: []const u8,
+};
+
 /// Controls how the model uses tools.
 pub const ToolChoice = enum {
     /// Model decides whether to call tools.
@@ -244,6 +256,8 @@ pub const Message = struct {
     /// Rich content parts (text + images). When set, takes precedence over
     /// `content` for building provider content blocks.
     parts: ?[]const ContentPart = null,
+    /// Assistant turns only: reasoning to echo back. See `ReasoningItem`.
+    reasoning: ?[]const ReasoningItem = null,
 };
 
 /// Smallest index `i` with `i >= min` such that truncating the head of
@@ -297,7 +311,24 @@ pub fn dupeMessage(alloc: std.mem.Allocator, msg: Message) !Message {
         .tool_calls = if (msg.tool_calls) |tcs| try dupeToolCalls(alloc, tcs) else null,
         .tool_results = if (msg.tool_results) |trs| try dupeToolResults(alloc, trs) else null,
         .parts = if (msg.parts) |ps| try dupeParts(alloc, ps) else null,
+        .reasoning = if (msg.reasoning) |rs| try dupeReasoning(alloc, rs) else null,
     };
+}
+
+pub fn dupeReasoning(alloc: std.mem.Allocator, items: []const ReasoningItem) ![]const ReasoningItem {
+    const out = try alloc.alloc(ReasoningItem, items.len);
+    for (items, out) |r, *d| {
+        const summary = try alloc.alloc([]const u8, r.summary.len);
+        for (r.summary, summary) |t, *ds| ds.* = try alloc.dupe(u8, t);
+        d.* = .{
+            .id = try alloc.dupe(u8, r.id),
+            .encrypted_content = try alloc.dupe(u8, r.encrypted_content),
+            .summary = summary,
+            .provider = r.provider,
+            .model = try alloc.dupe(u8, r.model),
+        };
+    }
+    return out;
 }
 
 pub fn dupeToolCalls(alloc: std.mem.Allocator, calls: []const ToolCall) ![]const ToolCall {
@@ -493,6 +524,8 @@ fn addOpt(a: ?i32, b: ?i32) ?i32 {
 pub const GenerateResult = struct {
     text: ?[]const u8 = null,
     tool_calls: ?[]const ToolCall = null,
+    /// Store on the assistant `Message` for this turn; see `ReasoningItem`.
+    reasoning: ?[]const ReasoningItem = null,
     finish_reason: FinishReason = .unknown,
     usage: Usage = .{},
     /// ArenaAllocator owns all dynamic strings and tool_call slices.
@@ -543,6 +576,7 @@ pub const Client = union(enum) {
     vercel: *openai_mod,
     mistral: *openai_mod,
     openrouter: *openai_mod,
+    xai: *openai_mod,
     codex: *codex_mod,
 
     pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError || codex_mod.ApiError;
@@ -692,25 +726,15 @@ pub const Client = union(enum) {
 
                 return geminiResult(g.allocator, response.value);
             },
-            .openai => |o| {
-                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, "system");
+            // xAI treats Chat Completions as legacy; Responses is its primary API.
+            .openai, .xai => |o| {
+                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, "system", self, model);
                 const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
 
-                var response = try o.createResponse(.{
-                    .model = model,
-                    .input = input,
-                    .tools = tools,
-                    .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
-                    .reasoning = if (config.effort) |tl|
-                        .{ .effort = mapEffortToOpenAI(tl) }
-                    else
-                        null,
-                    .max_output_tokens = config.max_tokens,
-                    .temperature = config.temperature,
-                });
+                var response = try o.createResponse(self.responsesRequest(model, input, tools, config));
                 defer response.deinit();
 
-                return openAiResponsesResult(o.allocator, response.value);
+                return openAiResponsesResult(o.allocator, response.value, self, model);
             },
             // Handled by the early return above, before the arena is created.
             .codex => unreachable,
@@ -775,9 +799,32 @@ pub const Client = union(enum) {
             .mistral => if (config.effort) |tl| {
                 cfg.reasoning_effort = mapEffortToMistral(tl);
             },
+            .xai => if (config.effort) |tl| {
+                cfg.reasoning_effort = mapEffortToXai(tl);
+            },
             else => {},
         }
         return cfg;
+    }
+
+    /// Responses request for the `.openai` and `.xai` arms, which differ only
+    /// in which effort levels the model accepts. Both round-trip encrypted
+    /// reasoning like `codexRequest`.
+    fn responsesRequest(self: Client, model: []const u8, input: []const openai_types.ResponseInputItem, tools: ?[]const openai_types.ResponseTool, config: GenerationConfig) openai_types.ResponsesRequest {
+        return .{
+            .model = model,
+            .input = input,
+            .tools = tools,
+            .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
+            .reasoning = if (config.effort) |tl| .{
+                .effort = if (self == .xai) mapEffortToXai(tl) else mapEffortToOpenAI(tl),
+            } else null,
+            .max_output_tokens = config.max_tokens,
+            .temperature = config.temperature,
+            // Stateless: the encrypted reasoning travels in `input` instead.
+            .store = false,
+            .include = &.{"reasoning.encrypted_content"},
+        };
     }
 
     fn StreamAdapter(
@@ -846,7 +893,7 @@ pub const Client = union(enum) {
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
                 }, Adapter{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Adapter.wrap);
             },
-            .openai, .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral, .openrouter => |o| {
+            .openai, .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral, .openrouter, .xai => |o| {
                 const oai_messages = messagesToOpenAIMessages(req_alloc, messages) catch return error.OutOfMemory;
                 const tools = if (config.tools) |t| mapOpenAITools(req_alloc, t) catch return error.OutOfMemory else null;
 
@@ -979,28 +1026,20 @@ pub const Client = union(enum) {
             // Native OpenAI streams via the Responses API: Chat Completions 400s
             // on function tools + reasoning for the gpt-5 family, and the buffered
             // path already uses Responses, so streaming stays consistent with it.
-            .openai => |o| {
-                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, "system");
+            .openai, .xai => |o| {
+                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, "system", self, model);
                 const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
 
                 var acc = openai_mod.ResponsesStreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
-                o.createResponseStream(.{
-                    .model = model,
-                    .input = input,
-                    .tools = tools,
-                    .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
-                    .reasoning = if (config.effort) |tl| .{ .effort = mapEffortToOpenAI(tl) } else null,
-                    .max_output_tokens = config.max_tokens,
-                    .temperature = config.temperature,
-                }, &acc, openai_mod.ResponsesStreamAccumulator.onEvent) catch |err| switch (err) {
+                o.createResponseStream(self.responsesRequest(model, input, tools, config), &acc, openai_mod.ResponsesStreamAccumulator.onEvent) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.ApiError,
                 };
                 if (acc.err) |e| return e;
-                return openAiResponsesResult(o.allocator, try acc.response());
+                return openAiResponsesResult(o.allocator, try acc.response(), self, model);
             },
             .codex => |c| {
-                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, codex_system_role);
+                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, codex_system_role, self, model);
                 const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
 
                 var acc = openai_mod.ResponsesStreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
@@ -1009,7 +1048,7 @@ pub const Client = union(enum) {
                     else => return error.ApiError,
                 };
                 if (acc.err) |e| return e;
-                return openAiResponsesResult(c.allocator, try acc.response());
+                return openAiResponsesResult(c.allocator, try acc.response(), self, model);
             },
             // Native `/api/chat` streaming (NDJSON) keeps the `num_ctx` sizing
             // that the OpenAI-compatible `/v1` shim (used by the other local
@@ -1046,7 +1085,7 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
-            .openai, .ollama, .huggingface, .openai_compatible, .llama_cpp, .vercel, .mistral, .openrouter => |o| {
+            .openai, .ollama, .huggingface, .openai_compatible, .llama_cpp, .vercel, .mistral, .openrouter, .xai => |o| {
                 var response = try o.embedText(model, text);
                 defer response.deinit();
                 var result = EmbedResult.init(o.allocator);
@@ -1246,6 +1285,7 @@ pub const Client = union(enum) {
                     .role = .assistant,
                     .content = if (gen_result.text) |t| try data_alloc.dupe(u8, t) else null,
                     .tool_calls = duped_calls,
+                    .reasoning = if (gen_result.reasoning) |r| try dupeReasoning(data_alloc, r) else null,
                 });
 
                 if (config.cancelRequested()) {
@@ -1307,6 +1347,7 @@ pub const Client = union(enum) {
                 try messages.append(list_alloc, .{
                     .role = .assistant,
                     .content = text,
+                    .reasoning = if (gen_result.reasoning) |r| try dupeReasoning(data_alloc, r) else null,
                 });
             }
 
@@ -1357,6 +1398,7 @@ fn openAiPreset(tag: Tag) ?OpenAiPreset {
         .vercel => .{ .base_url = "https://ai-gateway.vercel.sh/v1", .env_var = "AI_GATEWAY_API_KEY", .default_model = "openai/gpt-5.5" },
         .mistral => .{ .base_url = "https://api.mistral.ai/v1", .env_var = "MISTRAL_API_KEY", .default_model = "mistral-medium-3.5" },
         .openrouter => .{ .base_url = "https://openrouter.ai/api/v1", .env_var = "OPENROUTER_API_KEY", .default_model = "openai/gpt-5.5" },
+        .xai => .{ .base_url = "https://api.x.ai/v1", .env_var = "XAI_API_KEY", .default_model = "grok-4.7" },
         .anthropic, .gemini, .vertex, .openai, .codex => null,
     };
 }
@@ -1683,7 +1725,7 @@ test "llama_cpp: placeholder key, loopback default, excluded from auto-detect" {
 }
 
 test "cloud gateway presets: real key, default model, auto-detectable" {
-    for ([_]Tag{ .vercel, .mistral, .openrouter }) |tag| {
+    for ([_]Tag{ .vercel, .mistral, .openrouter, .xai }) |tag| {
         try std.testing.expect(openAiPreset(tag).?.env_var != null);
         try std.testing.expect(defaultModel(tag).len > 0);
         // Real keys, so they join env auto-detection; the keyless local servers don't.
@@ -1744,6 +1786,85 @@ test "reasoning_effort: omitted for a null effort, sent otherwise" {
     try std.testing.expectEqual(@as(?openai_types.ReasoningEffort, null), mapOpenAICompletionConfig(.{ .effort = null }, tools).reasoning_effort);
     try std.testing.expectEqual(@as(?openai_types.ReasoningEffort, .none), mapOpenAICompletionConfig(.{ .effort = .none }, tools).reasoning_effort);
     try std.testing.expectEqual(@as(?openai_types.ReasoningEffort, .low), mapOpenAICompletionConfig(.{ .effort = .low }, tools).reasoning_effort);
+}
+
+test "responsesRequest: xAI never sends none, OpenAI does" {
+    const xai: Client = .{ .xai = undefined };
+    try std.testing.expect(xai.responsesRequest("grok-4.7", &.{}, null, .{}).reasoning == null);
+    try std.testing.expectEqual(openai_types.ReasoningEffort.low, xai.responsesRequest("grok-4.7", &.{}, null, .{ .effort = .none }).reasoning.?.effort);
+    try std.testing.expectEqual(openai_types.ReasoningEffort.xhigh, xai.responsesRequest("grok-4.7", &.{}, null, .{ .effort = .xhigh }).reasoning.?.effort);
+    // Per-chunk streaming still goes through Chat Completions, with the same mapping.
+    try std.testing.expectEqual(@as(?openai_types.ReasoningEffort, .low), xai.openAiCompletionConfig("grok-4.7", .{ .effort = .none }, null).reasoning_effort);
+
+    const oai: Client = .{ .openai = undefined };
+    const req = oai.responsesRequest("gpt-5.5", &.{}, null, .{ .effort = .none });
+    try std.testing.expectEqual(openai_types.ReasoningEffort.none, req.reasoning.?.effort);
+    // Stateless: encrypted reasoning is requested and carried in `input`.
+    try std.testing.expectEqual(@as(?bool, false), req.store);
+    try std.testing.expectEqualStrings("reasoning.encrypted_content", req.include.?[0]);
+}
+
+test "openAiResponsesResult: keeps reasoning with its origin, skips ciphertext-less items" {
+    const output = [_]openai_types.ResponseOutputItem{
+        .{ .type = "reasoning", .id = "rs_1", .summary = &.{.{ .text = "plan" }}, .encrypted_content = "enc1" },
+        .{ .type = "reasoning", .id = "rs_2" },
+        .{ .type = "function_call", .call_id = "call_1", .name = "search", .arguments = "{}" },
+    };
+    var result = try openAiResponsesResult(std.testing.allocator, .{ .output = &output }, .{ .xai = undefined }, "grok-4.7");
+    defer result.deinit();
+
+    const r = result.reasoning.?;
+    try std.testing.expectEqual(@as(usize, 1), r.len);
+    try std.testing.expectEqualStrings("rs_1", r[0].id);
+    try std.testing.expectEqualStrings("enc1", r[0].encrypted_content);
+    try std.testing.expectEqualStrings("plan", r[0].summary[0]);
+    try std.testing.expectEqual(Tag.xai, r[0].provider);
+    try std.testing.expectEqualStrings("grok-4.7", r[0].model);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.?.len);
+}
+
+test "messagesToOpenAIResponsesInput: echoes reasoning only to its own provider and model" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const reasoning = [_]ReasoningItem{.{ .id = "rs_1", .encrypted_content = "enc1", .provider = .xai, .model = "grok-4.7" }};
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "search" }};
+    const results = [_]ToolResult{.{ .id = "call_1", .name = "search", .content = "ok" }};
+    const msgs = [_]Message{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .tool_calls = &calls, .reasoning = &reasoning },
+        .{ .role = .tool, .tool_results = &results },
+    };
+
+    const same = try messagesToOpenAIResponsesInput(a, &msgs, "system", .{ .xai = undefined }, "grok-4.7");
+    try std.testing.expectEqual(@as(usize, 4), same.len);
+    // Reasoning precedes the function call it produced.
+    try std.testing.expectEqualStrings("reasoning", same[1].type);
+    try std.testing.expectEqualStrings("function_call", same[2].type);
+    try std.testing.expectEqualStrings("{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"enc1\"}", try stringifyForTest(a, same[1]));
+
+    for ([_]struct { Client, []const u8 }{
+        .{ .{ .openai = undefined }, "grok-4.7" },
+        .{ .{ .xai = undefined }, "grok-4.6" },
+    }) |other| {
+        const items = try messagesToOpenAIResponsesInput(a, &msgs, "system", other[0], other[1]);
+        try std.testing.expectEqual(@as(usize, 3), items.len);
+        for (items) |it| try std.testing.expect(!std.mem.eql(u8, it.type, "reasoning"));
+    }
+}
+
+test "dupeMessage: deep-copies reasoning" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const summary = [_][]const u8{"plan"};
+    const reasoning = [_]ReasoningItem{.{ .id = "rs_1", .encrypted_content = "enc1", .summary = &summary, .provider = .openai, .model = "gpt-5.5" }};
+    const out = try dupeMessage(arena.allocator(), .{ .role = .assistant, .reasoning = &reasoning });
+    const r = out.reasoning.?[0];
+    try std.testing.expectEqualStrings("enc1", r.encrypted_content);
+    try std.testing.expectEqualStrings("plan", r.summary[0]);
+    try std.testing.expectEqual(Tag.openai, r.provider);
+    try std.testing.expect(r.encrypted_content.ptr != reasoning[0].encrypted_content.ptr);
 }
 
 test "openAiCompletionConfig: Mistral sends only none or high" {
@@ -2198,8 +2319,9 @@ fn codexRequest(model: []const u8, input: []const openai_types.ResponseInputItem
 /// Flatten the normalized conversation into Responses-API `input` items: each
 /// assistant tool call becomes a `function_call` item and each tool result a
 /// `function_call_output` item, rather than the role-tagged messages chat
-/// completions uses.
-fn messagesToOpenAIResponsesInput(allocator: std.mem.Allocator, input: []const Message, system_role: []const u8) ![]openai_types.ResponseInputItem {
+/// completions uses. Reasoning from `client`/`model` is echoed ahead of the
+/// output it produced; reasoning from any other origin is dropped.
+fn messagesToOpenAIResponsesInput(allocator: std.mem.Allocator, input: []const Message, system_role: []const u8, client: Client, model: []const u8) ![]openai_types.ResponseInputItem {
     const messages = try splitToolImages(allocator, input);
     var out: std.ArrayList(openai_types.ResponseInputItem) = .empty;
 
@@ -2216,6 +2338,18 @@ fn messagesToOpenAIResponsesInput(allocator: std.mem.Allocator, input: []const M
             }
             continue;
         }
+
+        if (msg.reasoning) |items| for (items) |r| {
+            if (r.provider != client or !std.mem.eql(u8, r.model, model)) continue;
+            const summary = try allocator.alloc(openai_types.ResponseSummaryText, r.summary.len);
+            for (r.summary, summary) |t, *d| d.* = .{ .text = t };
+            try out.append(allocator, .{
+                .type = "reasoning",
+                .id = r.id,
+                .summary = summary,
+                .encrypted_content = r.encrypted_content,
+            });
+        };
 
         const content: ?openai_types.ResponseContent = if (msg.parts) |parts|
             .{ .parts = try responsesContentParts(allocator, parts) }
@@ -2671,7 +2805,7 @@ fn openAiChatResult(alloc: std.mem.Allocator, response: openai_types.ChatComplet
 
 /// Map an OpenAI `ResponsesResponse` (buffered or stream-reassembled) into the
 /// unified `GenerateResult`. Shared by the buffered and streaming `.openai` arms.
-fn openAiResponsesResult(alloc: std.mem.Allocator, response: openai_types.ResponsesResponse) Client.Error!GenerateResult {
+fn openAiResponsesResult(alloc: std.mem.Allocator, response: openai_types.ResponsesResponse, client: Client, model: []const u8) Client.Error!GenerateResult {
     var result = GenerateResult.init(alloc);
     errdefer result.deinit();
     const ga = result.arena.allocator();
@@ -2683,8 +2817,25 @@ fn openAiResponsesResult(alloc: std.mem.Allocator, response: openai_types.Respon
 
     if (response.output) |items| {
         var tool_calls: std.ArrayList(ToolCall) = .empty;
+        var reasoning: std.ArrayList(ReasoningItem) = .empty;
         for (items) |item| {
             const item_type = item.type orelse continue;
+            if (std.mem.eql(u8, item_type, "reasoning")) {
+                // Without ciphertext (or an id to pair it with) there is nothing to echo.
+                const id = item.id orelse continue;
+                const enc = item.encrypted_content orelse continue;
+                const src = item.summary orelse &.{};
+                const summary = try ga.alloc([]const u8, src.len);
+                for (src, summary) |st, *d| d.* = try ga.dupe(u8, st.text);
+                try reasoning.append(ga, .{
+                    .id = try ga.dupe(u8, id),
+                    .encrypted_content = try ga.dupe(u8, enc),
+                    .summary = summary,
+                    .provider = client,
+                    .model = try ga.dupe(u8, model),
+                });
+                continue;
+            }
             if (!std.mem.eql(u8, item_type, "function_call")) continue;
             const args_val: ?std.json.Value = if (item.arguments) |a|
                 (std.json.parseFromSliceLeaky(std.json.Value, ga, a, .{}) catch null)
@@ -2697,6 +2848,7 @@ fn openAiResponsesResult(alloc: std.mem.Allocator, response: openai_types.Respon
             });
         }
         if (tool_calls.items.len > 0) result.tool_calls = try tool_calls.toOwnedSlice(ga);
+        if (reasoning.items.len > 0) result.reasoning = try reasoning.toOwnedSlice(ga);
     }
     return result;
 }
@@ -2819,6 +2971,17 @@ fn mapEffortToMistral(level: Effort) openai_types.ReasoningEffort {
         .null => unreachable, // see `flooredConfig`
         .none => .none,
         .minimal, .low, .medium, .high, .xhigh => .high,
+    };
+}
+
+/// Grok reasoning can't be disabled: it takes low, medium, high and xhigh.
+fn mapEffortToXai(level: Effort) openai_types.ReasoningEffort {
+    return switch (level) {
+        .null => unreachable, // see `flooredConfig`
+        .none, .minimal, .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
     };
 }
 
@@ -3008,7 +3171,7 @@ test "tool result parts land where each API accepts an image" {
     const chat_json = try stringifyForTest(a, chat[3]);
     try std.testing.expect(std.mem.find(u8, chat_json, "\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Image returned by screenshot\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgo=\"}}]") != null);
 
-    const responses = try messagesToOpenAIResponsesInput(a, &msgs, "developer");
+    const responses = try messagesToOpenAIResponsesInput(a, &msgs, "developer", .{ .codex = undefined }, "gpt-5.5");
     try std.testing.expectEqual(4, responses.len);
     const responses_json = try stringifyForTest(a, responses[3]);
     try std.testing.expect(std.mem.find(u8, responses_json, "\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Image returned by screenshot\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]") != null);
@@ -3034,7 +3197,7 @@ test "user image parts reach every backend" {
     try std.testing.expect(std.mem.find(u8, chat, "\"content\":[{\"type\":\"text\",\"text\":\"what is this?\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,AAAA\"}}]") != null);
     try std.testing.expect(std.mem.find(u8, chat, "content_parts") == null);
 
-    const responses = try stringifyForTest(a, try messagesToOpenAIResponsesInput(a, &msgs, "developer"));
+    const responses = try stringifyForTest(a, try messagesToOpenAIResponsesInput(a, &msgs, "developer", .{ .codex = undefined }, "gpt-5.5"));
     try std.testing.expect(std.mem.find(u8, responses, "{\"type\":\"input_image\",\"image_url\":\"data:image/jpeg;base64,AAAA\"}") != null);
 
     const ollama = try stringifyForTest(a, try messagesToOllamaMessages(a, &msgs));
