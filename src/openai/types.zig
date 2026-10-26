@@ -457,15 +457,26 @@ pub const ResponseReasoning = struct {
 /// One item in the request `input` list. The `type` selects which fields are
 /// meaningful: a `message` carries `role`/`content`; a `function_call` carries
 /// `call_id`/`name`/`arguments`; a `function_call_output` carries
-/// `call_id`/`output`.
+/// `call_id`/`output`; a `reasoning` item echoes `id`/`summary`/
+/// `encrypted_content` from an earlier response.
 pub const ResponseInputItem = struct {
     type: []const u8,
+    id: ?[]const u8 = null,
     role: ?[]const u8 = null,
     content: ?ResponseContent = null,
     call_id: ?[]const u8 = null,
     name: ?[]const u8 = null,
     arguments: ?[]const u8 = null,
     output: ?[]const u8 = null,
+    /// Required (possibly empty) on `reasoning` items.
+    summary: ?[]const ResponseSummaryText = null,
+    encrypted_content: ?[]const u8 = null,
+};
+
+/// A `summary_text` entry of a `reasoning` item.
+pub const ResponseSummaryText = struct {
+    type: []const u8 = "summary_text",
+    text: []const u8,
 };
 
 /// `message` item content: plain text, or parts when it carries images.
@@ -536,9 +547,10 @@ pub const ResponseOutputContent = struct {
     text: ?[]const u8 = null,
 };
 
-/// One item in the response `output` list. `reasoning` items are summaries we
-/// ignore; `message` items carry `content`; `function_call` items carry a tool
-/// call to dispatch.
+/// One item in the response `output` list. `reasoning` items carry the
+/// model's encrypted chain of thought (with `include:
+/// ["reasoning.encrypted_content"]`) to echo back next turn; `message` items
+/// carry `content`; `function_call` items carry a tool call to dispatch.
 pub const ResponseOutputItem = struct {
     type: ?[]const u8 = null,
     id: ?[]const u8 = null,
@@ -548,6 +560,8 @@ pub const ResponseOutputItem = struct {
     name: ?[]const u8 = null,
     arguments: ?[]const u8 = null,
     status: ?[]const u8 = null,
+    summary: ?[]const ResponseSummaryText = null,
+    encrypted_content: ?[]const u8 = null,
 };
 
 pub const ResponseInputTokensDetails = struct {

@@ -396,7 +396,8 @@ pub const StreamAccumulator = struct {
 /// Reassembles a streamed Responses-API response into the same `ResponsesResponse`
 /// the non-streaming `createResponse` returns. Text arrives as `output_text.delta`
 /// events (forwarded to `on_text_fn`); each `output_item.done` carries a complete
-/// `function_call` item; the terminal `response.completed`/`incomplete` event
+/// `function_call` or `reasoning` item (`output_item.added` may hold a truncated
+/// `encrypted_content`, so only `done` is used); the terminal `response.completed`/`incomplete` event
 /// carries usage and status. All storage lives in `arena`.
 pub const ResponsesStreamAccumulator = struct {
     arena: std.mem.Allocator,
@@ -404,6 +405,7 @@ pub const ResponsesStreamAccumulator = struct {
     on_text_fn: *const fn (*anyopaque, []const u8) void,
     text: std.ArrayListUnmanaged(u8) = .empty,
     calls: std.ArrayListUnmanaged(types.ResponseOutputItem) = .empty,
+    reasoning: std.ArrayListUnmanaged(types.ResponseOutputItem) = .empty,
     usage: ?types.ResponsesUsage = null,
     incomplete_reason: ?[]const u8 = null,
     err: ?error{OutOfMemory} = null,
@@ -442,6 +444,18 @@ pub const ResponsesStreamAccumulator = struct {
                     .name = if (item.name) |n| try self.arena.dupe(u8, n) else null,
                     .arguments = if (item.arguments) |a| try self.arena.dupe(u8, a) else null,
                 });
+            } else if (std.mem.eql(u8, it, "reasoning")) {
+                const summary: ?[]types.ResponseSummaryText = if (item.summary) |src| blk: {
+                    const out = try self.arena.alloc(types.ResponseSummaryText, src.len);
+                    for (src, out) |s, *d| d.* = .{ .text = try self.arena.dupe(u8, s.text) };
+                    break :blk out;
+                } else null;
+                try self.reasoning.append(self.arena, .{
+                    .type = "reasoning",
+                    .id = if (item.id) |i| try self.arena.dupe(u8, i) else null,
+                    .summary = summary,
+                    .encrypted_content = if (item.encrypted_content) |e| try self.arena.dupe(u8, e) else null,
+                });
             }
         } else if (std.mem.eql(u8, t, "response.completed") or std.mem.eql(u8, t, "response.incomplete")) {
             if (event.response) |r| {
@@ -459,6 +473,9 @@ pub const ResponsesStreamAccumulator = struct {
     /// after the stream completes and `err` is clear.
     pub fn response(self: *ResponsesStreamAccumulator) error{OutOfMemory}!ResponsesResponse {
         var output: std.ArrayListUnmanaged(types.ResponseOutputItem) = .empty;
+        // Reasoning precedes the message and calls it produced, as in a
+        // buffered response.
+        try output.appendSlice(self.arena, self.reasoning.items);
         if (self.text.items.len > 0) {
             const content = try self.arena.dupe(types.ResponseOutputContent, &.{.{ .type = "output_text", .text = self.text.items }});
             try output.append(self.arena, .{ .type = "message", .role = "assistant", .content = content });
@@ -690,4 +707,29 @@ test "ResponsesStreamAccumulator reassembles text and a completed function-call 
     try std.testing.expectEqualStrings("call_9", fc.?.call_id.?);
     try std.testing.expectEqualStrings("search", fc.?.name.?);
     try std.testing.expectEqualStrings("{\"q\":\"birds\"}", fc.?.arguments.?);
+}
+
+test "ResponsesStreamAccumulator keeps the done reasoning item, ahead of calls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var probe = TextProbe{};
+    defer probe.text.deinit(std.testing.allocator);
+
+    var acc = ResponsesStreamAccumulator.init(arena.allocator(), &probe, TextProbe.cb);
+    const events = [_]ResponseStreamEvent{
+        // `added` may carry a truncated ciphertext; it must not be kept.
+        .{ .type = "response.output_item.added", .item = .{ .type = "reasoning", .id = "rs_1", .encrypted_content = "par" } },
+        .{ .type = "response.output_item.done", .item = .{ .type = "reasoning", .id = "rs_1", .summary = &.{.{ .text = "think" }}, .encrypted_content = "partial+rest" } },
+        .{ .type = "response.output_item.done", .item = .{ .type = "function_call", .call_id = "call_1", .name = "search", .arguments = "{}" } },
+    };
+    for (events) |ev| acc.onEvent(ev);
+    try std.testing.expect(acc.err == null);
+
+    const items = (try acc.response()).output.?;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqualStrings("reasoning", items[0].type.?);
+    try std.testing.expectEqualStrings("rs_1", items[0].id.?);
+    try std.testing.expectEqualStrings("partial+rest", items[0].encrypted_content.?);
+    try std.testing.expectEqualStrings("think", items[0].summary.?[0].text);
+    try std.testing.expectEqualStrings("function_call", items[1].type.?);
 }
