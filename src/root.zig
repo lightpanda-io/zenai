@@ -41,6 +41,10 @@ pub const huggingface = openai;
 /// with a different default base URL (`http://localhost:8080/v1`).
 pub const llama_cpp = openai;
 
+/// ZML's LLMD inference server uses the OpenAI-compatible Chat Completions API
+/// with a different default base URL (`http://localhost:8000/v1`).
+pub const llmd = openai;
+
 /// Generic OpenAI-compatible Chat Completions API. Auto-detected when
 /// `OPENAI_BASE_URL` is set — use it for any server that speaks the OpenAI
 /// chat completions wire format (vLLM, LiteLLM, Together, Groq, etc.).
