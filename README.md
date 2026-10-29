@@ -1,9 +1,29 @@
 # zenai
 
-Zig client for AI APIs, supporting [Google Gemini](https://ai.google.dev/gemini-api/docs) (Developer API and [Vertex AI](https://cloud.google.com/vertex-ai/generative-ai/docs)), [OpenAI](https://platform.openai.com/docs/api-reference), and [Anthropic](https://docs.anthropic.com/en/docs/about-claude/models). OpenAI-compatible endpoints — [Ollama](https://github.com/ollama/ollama/blob/main/docs/openai.md), [Hugging Face Inference](https://huggingface.co/docs/inference-providers/index), [llama.cpp](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) (`llama-server`), [LLMD](https://zml.ai/llmd/), [Vercel AI Gateway](https://vercel.com/docs/ai-gateway), [Mistral](https://docs.mistral.ai/), [OpenRouter](https://openrouter.ai/docs), and [xAI](https://docs.x.ai/) — are supported through the OpenAI client. Ported from the official [Go Gen AI SDK](https://github.com/googleapis/go-genai), [openai-go](https://github.com/openai/openai-go), and [anthropic-sdk-go](https://github.com/anthropics/anthropic-sdk-go). Also ships an `agent infrastructure` namespace under `zenai.search` — currently [Tavily](https://docs.tavily.com/), [Brave Search](https://brave.com/search/api/), [Exa](https://exa.ai/docs/reference/search) and [Keenable](https://docs.keenable.ai/), with room for sibling providers. Also ships `zenai.typesafe` for [TypeSafe System One](https://docs.typesafe.ai) — the Jev judgement model, which answers typed questions about a piece of state (a probability, a labelled choice, or a score) instead of generating text.
+Zig client for AI APIs, ported from the official Go SDKs ([go-genai](https://github.com/googleapis/go-genai), [openai-go](https://github.com/openai/openai-go), [anthropic-sdk-go](https://github.com/anthropics/anthropic-sdk-go)). It covers:
+
+- **LLMs**
+  - [Google Gemini](https://ai.google.dev/gemini-api/docs), on the Developer API or [Vertex AI](https://cloud.google.com/vertex-ai/generative-ai/docs)
+  - [OpenAI](https://platform.openai.com/docs/api-reference), plus any OpenAI-compatible endpoint through the same client:
+    - Local: [Ollama](https://github.com/ollama/ollama/blob/main/docs/openai.md), [llama.cpp](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) (`llama-server`), [LLMD](https://zml.ai/llmd/)
+    - Hosted: [Hugging Face Inference](https://huggingface.co/docs/inference-providers/index), [Mistral](https://docs.mistral.ai/), [xAI](https://docs.x.ai/)
+    - Gateways: [OpenRouter](https://openrouter.ai/docs), [Vercel AI Gateway](https://vercel.com/docs/ai-gateway)
+    - Anything else, via `OPENAI_BASE_URL`
+  - [Codex](#chatgpt-subscription-codex): OpenAI models billed to your ChatGPT plan instead of API credits
+  - [Anthropic](https://docs.anthropic.com/en/docs/about-claude/models)
+- **Search** (`zenai.search`): [Tavily](https://docs.tavily.com/), [Brave Search](https://brave.com/search/api/), [Exa](https://exa.ai/docs/reference/search), [Keenable](https://docs.keenable.ai/)
+- **Judgement** (`zenai.typesafe`): [TypeSafe System One](https://docs.typesafe.ai), whose Jev model answers typed questions about a piece of state (a probability, a labelled choice or a score) instead of generating text
 
 <img width="1024" height="1024" alt="Meditating panda with incense smoke" src="https://github.com/user-attachments/assets/b9c82960-05ec-4aa1-b171-092ee2126551" />
 
+## Contents
+
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Gemini](#gemini) · [OpenAI](#openai) · [Codex](#chatgpt-subscription-codex) · [Anthropic](#anthropic)
+- [Search](#search)
+- [TypeSafe](#typesafe-system-one)
+- [Features](#features)
 
 ## Installation
 
@@ -29,6 +49,61 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
+## Quick start
+
+`zenai.provider.Client` wraps every LLM backend behind one interface, so switching providers means changing the line that builds it:
+
+```zig
+const zenai = @import("zenai");
+
+var gemini_client = zenai.gemini.Client.init(io, allocator, gemini_key, .{});
+defer gemini_client.deinit();
+const ai: zenai.provider.Client = .{ .gemini = &gemini_client };
+
+var result = try ai.generateContent("gemini-2.5-flash", &.{
+    .{ .role = .user, .content = "What is Zig?" },
+}, .{});
+defer result.deinit();
+
+std.debug.print("{s}\n", .{result.text orelse ""});
+```
+
+The OpenAI-compatible backends all use the OpenAI client with a different `base_url` and tag:
+
+| Tag | Default `base_url` | Key |
+| --- | --- | --- |
+| `.openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `.ollama` | `http://localhost:11434/v1` | none |
+| `.llama_cpp` | `http://localhost:8080/v1` | none |
+| `.llmd` | `http://localhost:8000/v1` | none |
+| `.huggingface` | `https://router.huggingface.co/v1` | `HF_TOKEN` |
+| `.mistral` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
+| `.xai` | `https://api.x.ai/v1` | `XAI_API_KEY` |
+| `.openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `.vercel` | `https://ai-gateway.vercel.sh/v1` | `AI_GATEWAY_API_KEY` |
+| `.openai_compatible` | `OPENAI_BASE_URL` | `OPENAI_API_KEY` |
+
+```zig
+var llama_client = zenai.llama_cpp.Client.init(io, allocator, "llama.cpp", .{
+    .base_url = "http://localhost:8080/v1",
+});
+const ai: zenai.provider.Client = .{ .llama_cpp = &llama_client };
+```
+
+Gateway model ids are provider-prefixed (`"anthropic/claude-sonnet-5"`). For Hugging Face, pass `.base_url` to target a dedicated Inference Endpoint instead of the serverless router. `provider.Client.init` picks `.openai_compatible` on its own when `OPENAI_BASE_URL` is set, which covers vLLM, LiteLLM, Together, Groq and the like.
+
+When you need something the abstraction doesn't expose, switch on the tag and use the provider client directly:
+
+```zig
+switch (ai) {
+    .gemini => |g| {
+        // Use Gemini-specific features like cached content, file uploads, etc.
+        var cached = try g.createCachedContent("gemini-2.5-flash", .{ ... });
+    },
+    else => {},
+}
+```
+
 ## Gemini
 
 Set your API key ([get one here](https://ai.google.dev/gemini-api/docs/api-key)):
@@ -50,7 +125,8 @@ defer response.deinit();
 std.debug.print("{s}\n", .{response.value.text() orelse ""});
 ```
 
-### Streaming
+<details>
+<summary>Streaming</summary>
 
 ```zig
 try client.generateContentStreamFromText(
@@ -69,7 +145,10 @@ try client.generateContentStreamFromText(
 );
 ```
 
-### Chat
+</details>
+
+<details>
+<summary>Chat</summary>
 
 ```zig
 var chat = zenai.gemini.Chat.init(&client, "gemini-2.5-flash", .{ .temperature = 0 }, .{});
@@ -82,7 +161,10 @@ const r2 = try chat.sendMessage("What is my name?");
 std.debug.print("{s}\n", .{r2.text() orelse ""});
 ```
 
-### Function calling
+</details>
+
+<details>
+<summary>Function calling</summary>
 
 ```zig
 const tools = [_]zenai.gemini.types.Tool{.{
@@ -112,18 +194,21 @@ if (response.value.firstFunctionCall()) |fc| {
 }
 ```
 
-### Google Vertex AI
+</details>
 
-The same Gemini client can target [Vertex AI](https://cloud.google.com/vertex-ai/generative-ai/docs) instead of the Gemini Developer API. Two modes:
+<details>
+<summary>Vertex AI</summary>
 
-**Express mode** — a plain [Vertex API key](https://cloud.google.com/vertex-ai/generative-ai/docs/start/express-mode/overview), no project needed:
+The same client can target [Vertex AI](https://cloud.google.com/vertex-ai/generative-ai/docs) instead of the Developer API, in one of two modes.
+
+**Express mode** takes a plain [Vertex API key](https://cloud.google.com/vertex-ai/generative-ai/docs/start/express-mode/overview) and needs no project:
 
 ```zig
 var client = zenai.vertex.Client.init(io, allocator, api_key, .{ .vertex = .{} });
 defer client.deinit();
 ```
 
-**Project/location mode** — pass an OAuth access token as the key (refreshing it is your job; tokens expire after ~1 hour):
+**Project/location mode** takes an OAuth access token as the key. Refreshing it is your job; tokens expire after about an hour.
 
 ```bash
 export TOKEN=$(gcloud auth print-access-token)
@@ -136,9 +221,11 @@ var client = zenai.vertex.Client.init(io, allocator, token, .{
 defer client.deinit();
 ```
 
-Generation, streaming, `Chat`, and `countTokens` work in both modes. Model listing works on Vertex too, but Google's `ListPublisherModels` rejects API keys, so it needs project/location mode (OAuth). Embeddings, file uploads, and cached content are Developer-API-only and return `error.UnsupportedByBackend` on Vertex.
+Generation, streaming, `Chat` and `countTokens` work in both modes. Model listing needs project/location mode, because Google's `ListPublisherModels` rejects API keys. Embeddings, file uploads and cached content are Developer-API-only and return `error.UnsupportedByBackend` on Vertex.
 
-Through the provider abstraction, `.vertex` is env-detected when `GOOGLE_GENAI_USE_VERTEXAI=1` (or `true`) is set: express mode reads `GOOGLE_API_KEY`; project mode reads `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`/`GOOGLE_CLOUD_REGION` (default `"global"`) but needs the access token passed explicitly as the credential.
+Through the provider abstraction, `.vertex` is picked when `GOOGLE_GENAI_USE_VERTEXAI=1` (or `true`) is set. Express mode reads `GOOGLE_API_KEY`. Project mode reads `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`/`GOOGLE_CLOUD_REGION` (default `"global"`), but you still pass the access token explicitly as the credential.
+
+</details>
 
 ## OpenAI
 
@@ -161,7 +248,8 @@ defer response.deinit();
 std.debug.print("{s}\n", .{response.value.text() orelse ""});
 ```
 
-### Streaming
+<details>
+<summary>Streaming</summary>
 
 ```zig
 try client.chatCompletionStreamFromText(
@@ -179,7 +267,10 @@ try client.chatCompletionStreamFromText(
 );
 ```
 
-### Chat
+</details>
+
+<details>
+<summary>Chat</summary>
 
 ```zig
 var chat = zenai.openai.Chat.init(&client, "gpt-4o", .{ .temperature = 0 });
@@ -192,7 +283,10 @@ const r2 = try chat.sendMessage("What is my name?");
 std.debug.print("{s}\n", .{r2.text() orelse ""});
 ```
 
-### Function calling
+</details>
+
+<details>
+<summary>Function calling</summary>
 
 ```zig
 const tools = [_]zenai.openai.types.Tool{.{
@@ -212,6 +306,29 @@ if (response.value.firstToolCall()) |tc| {
     std.debug.print("Call: {s}\n", .{tc.function.?.name orelse ""});
 }
 ```
+
+</details>
+
+## ChatGPT subscription (Codex)
+
+`zenai.codex` talks to the backend Codex CLI uses (`chatgpt.com/backend-api/codex`), so requests count against a ChatGPT plan rather than API credits. It speaks the same Responses API as the OpenAI client but authenticates with the subscription's OAuth access token and the ChatGPT account id from that token's JWT.
+
+zenai doesn't run the OAuth login. Get the token yourself (the browser's `lightpanda agent` does it in `src/agent/auth/codex.zig`), then go through the provider abstraction:
+
+```zig
+var codex_client = try zenai.codex.Client.init(io, allocator, access_token, .{
+    .account_id = account_id,
+});
+defer codex_client.deinit();
+const ai: zenai.provider.Client = .{ .codex = &codex_client };
+
+var result = try ai.generateContent("gpt-5.5", &.{
+    .{ .role = .user, .content = "What is Zig?" },
+}, .{});
+defer result.deinit();
+```
+
+The backend is streaming-only; `generateContent` accumulates the stream for you. Access tokens expire, so call `ai.setApiKey(new_token)` after a refresh. It keeps the open connections, and you free the old token buffer only after it returns.
 
 ## Anthropic
 
@@ -234,7 +351,8 @@ defer response.deinit();
 std.debug.print("{s}\n", .{response.value.text() orelse ""});
 ```
 
-### Streaming
+<details>
+<summary>Streaming</summary>
 
 ```zig
 try client.createMessageStreamFromText(
@@ -255,7 +373,10 @@ try client.createMessageStreamFromText(
 );
 ```
 
-### Chat
+</details>
+
+<details>
+<summary>Chat</summary>
 
 ```zig
 var chat = zenai.anthropic.Chat.init(&client, "claude-sonnet-4-6", 1024, .{});
@@ -268,7 +389,10 @@ const r2 = try chat.sendMessage("What is my name?");
 std.debug.print("{s}\n", .{r2.text() orelse ""});
 ```
 
-### Function calling
+</details>
+
+<details>
+<summary>Function calling</summary>
 
 ```zig
 const tools = [_]zenai.anthropic.types.Tool{.{
@@ -287,13 +411,11 @@ if (response.value.firstToolUse()) |tu| {
 }
 ```
 
-## Tavily (search)
+</details>
 
-Tavily is an AI-friendly search API that returns clean `{title, url, content}` JSON results — handy as a low-noise alternative to scraping a SERP. Set your API key ([get one here](https://app.tavily.com/)):
+## Search
 
-```bash
-export TAVILY_API_KEY='tvly-...'
-```
+Every search client follows the same shape: `init` with a key, call `search`, iterate the results. Tavily as an example:
 
 ```zig
 const zenai = @import("zenai");
@@ -310,22 +432,24 @@ for (response.value.results) |r| {
 }
 ```
 
-## Brave (search)
+| Provider | Namespace | Key | Results |
+| --- | --- | --- | --- |
+| [Tavily](https://app.tavily.com/) | `zenai.search.tavily` | `TAVILY_API_KEY` | `{title, url, content}` |
+| [Brave](https://api-dashboard.search.brave.com/) | `zenai.search.brave` | `BRAVE_API_KEY` | `{title, url, description}` per section |
+| [Exa](https://dashboard.exa.ai/) | `zenai.search.exa` | `EXA_API_KEY` | metadata, text only on request |
+| [Keenable](https://keenable.ai/console) | `zenai.search.keenable` | `KEENABLE_API_KEY` (optional) | `{title, url, snippet}` |
 
-Brave Search is a web search API over Brave's independent index, returning JSON sections of `{title, url, description}` results. Set your API key ([get one here](https://api-dashboard.search.brave.com/)):
+The others differ in ways that will catch you out:
 
-```bash
-export BRAVE_API_KEY='BSA...'
-```
+<details>
+<summary>Brave: results are grouped by section</summary>
+
+Results come back under sections such as `web`, each of which may be missing. `text_decorations = false` strips the `<strong>` highlight markup from descriptions.
 
 ```zig
-const zenai = @import("zenai");
-
-const api_key = environ.getPosix("BRAVE_API_KEY") orelse return error.MissingApiKey;
 var client = zenai.search.brave.Client.init(io, allocator, api_key, .{});
 defer client.deinit();
 
-// text_decorations=false strips <strong> highlight markup from descriptions.
 var response = try client.search("what is zig", .{ .count = 5, .text_decorations = false });
 defer response.deinit();
 
@@ -336,22 +460,17 @@ if (response.value.web) |web| {
 }
 ```
 
-## Exa (search)
+</details>
 
-Exa is an embeddings-based search API aimed at agents. Snippet text is opt-in: a bare search returns metadata only, so request `contents` to get any. Set your API key ([get one here](https://dashboard.exa.ai/)):
+<details>
+<summary>Exa: snippet text is opt-in</summary>
 
-```bash
-export EXA_API_KEY='...'
-```
+A bare Exa search returns metadata only. Request `contents` to get any text; highlights are the cheapest form. `title` is nullable because Exa returns null for pages it could not title.
 
 ```zig
-const zenai = @import("zenai");
-
-const api_key = environ.getPosix("EXA_API_KEY") orelse return error.MissingApiKey;
 var client = zenai.search.exa.Client.init(io, allocator, api_key, .{});
 defer client.deinit();
 
-// Without `contents` the results carry no text at all; highlights are the cheapest form.
 var response = try client.search("what is zig", .{
     .numResults = 5,
     .contents = .{ .highlights = .{ .numSentences = 3 } },
@@ -359,25 +478,19 @@ var response = try client.search("what is zig", .{
 defer response.deinit();
 
 for (response.value.results) |r| {
-    // `title` is nullable here — Exa returns null for pages it could not title.
     std.debug.print("{s} — {s}\n", .{ r.title orelse "(untitled)", r.url });
 }
 ```
 
-## Keenable (search)
+</details>
 
-Keenable is an AI-friendly search API returning `{title, url, snippet}` JSON. Unlike the other providers here it also answers **without** an API key: pass `null` and the client calls the public endpoint (rate-limited per client IP). A key ([get one here](https://keenable.ai/console)) lifts the limits; it is not a prerequisite.
+<details>
+<summary>Keenable: works without a key</summary>
 
-```bash
-export KEENABLE_API_KEY='keen_...'   # optional
-```
+Pass `null` as the key and the client calls the public endpoint, rate-limited per client IP. A key lifts the limits. `app_title` has no default: it is sent as `X-Keenable-Title`, required when keyless, and only you know your app's name.
 
 ```zig
-const zenai = @import("zenai");
-
-// `null` selects the public endpoint. `app_title` has no default: it is sent as
-// `X-Keenable-Title`, required keyless, and only the embedder knows its own name.
-const api_key = environ.getPosix("KEENABLE_API_KEY");
+const api_key = environ.getPosix("KEENABLE_API_KEY"); // null is fine
 var client = zenai.search.keenable.Client.init(io, allocator, api_key, .{ .app_title = "my-app" });
 defer client.deinit();
 
@@ -389,9 +502,17 @@ for (response.value.results) |r| {
 }
 ```
 
+</details>
+
 ## TypeSafe (System One)
 
-TypeSafe's System One serves [Jev](https://docs.typesafe.ai), a judgement model rather than a chat model: you post the `state` under judgement plus a map of typed questions about it, and get one typed answer per question back — a probability (`noul`), a labelled `choice` with per-option probabilities, or a `score` on an ordered scale. No free text, no tool calls. Set your API key ([get one here](https://typesafe.ai/)):
+[Jev](https://docs.typesafe.ai) is a judgement model. You send the `state` under judgement plus a map of typed questions about it, and get one typed answer per question back:
+
+- `noul`: a probability
+- `choice`: a label, with per-option probabilities
+- `score`: a level on an ordered scale
+
+There is no free text and no tool calling. Set your API key ([get one here](https://typesafe.ai/)):
 
 ```bash
 export TYPESAFE_API_KEY='your-api-key'
@@ -429,7 +550,16 @@ std.debug.print("topic: {s} ({d:.2} confident)\n", .{
 });
 ```
 
-Jev ingests the state once and evaluates every question against it in parallel, so packing several questions — including speculative ones you may discard — into one request costs far less than one call each.
+Jev ingests the state once and evaluates every question against it in parallel, so packing several questions into one request, including speculative ones you may discard, costs far less than one call each.
+
+Things to know before relying on it:
+
+- **Limits.** One request carries up to 64k tokens, and the state plus the longest single question must fit in 32k. An overrun comes back as `error.ApiError` with a 422 in `client.last_error`.
+- **Validate choices.** `typesafe.validateChoice(answer, offered)` rejects an answer whose choice was never offered, whose probabilities don't cover exactly the offered set, or whose choice isn't the argmax. `response.choice(id, questions)` and `choiceEnum` run it for you.
+- **Model versions.** `response.model` is the concrete version that answered, not the alias you asked for, and aliases move without notice. It borrows the response; use `response.dupeModel(allocator)` to keep it. `client.listModels()` lists the versions behind `jev-latest` and `jev-preview`.
+
+<details>
+<summary>Describing options and structured input</summary>
 
 Options that need their own description are written out in full; `null` means the id speaks for itself:
 
@@ -443,7 +573,12 @@ Options that need their own description are written out in full; `null` means th
 } } },
 ```
 
-`instructions` and every criteria description also take structured input — `.{ .json = value }` instead of `.{ .text = "…" }` — and so does `state`, which is how you judge a whole conversation or record in one call.
+`instructions`, every criteria description, and `state` all accept `.{ .json = value }` in place of `.{ .text = "…" }`. That is how you judge a whole conversation or record in one call.
+
+</details>
+
+<details>
+<summary>Choices from an enum</summary>
 
 When the options are an enum you already have, `enumChoices` builds the criteria from its tags and `choiceEnum` maps the answer back, so the option set and the type that acts on it cannot drift apart:
 
@@ -469,138 +604,32 @@ const questions: typesafe.Questions = .init(&.{
 const verdict = try response.value.choiceEnum("verdict", questions, Verdict);
 ```
 
-Before acting on a `choice`, pass it through `typesafe.validateChoice(answer, offered)`: it rejects an answer whose choice was never offered, whose probabilities do not cover exactly the offered set, or whose choice is not the argmax. `response.choice(id, questions)` and `choiceEnum` both run it for you.
-
-`response.model` is the concrete version that answered, which is not the alias you asked for — aliases move without notice. It borrows the response, so `response.dupeModel(allocator)` is how you keep it.
-
-One request carries up to 64k tokens, of which the state plus the longest single question must fit in 32k; an overrun comes back as `error.ApiError` with a 422 in `client.last_error`. `client.listModels()` enumerates the concrete versions behind the `jev-latest` and `jev-preview` aliases.
-
-## Provider Abstraction
-
-Use `zenai.provider.Client` to write provider-agnostic code. Swap providers by changing one line:
-
-```zig
-const zenai = @import("zenai");
-
-// Pick your provider:
-var gemini_client = zenai.gemini.Client.init(io, allocator, gemini_key, .{});
-defer gemini_client.deinit();
-const ai: zenai.provider.Client = .{ .gemini = &gemini_client };
-
-// Or Vertex AI (same Gemini client, Vertex backend — see the Vertex section):
-// var vertex_client = zenai.vertex.Client.init(io, allocator, token, .{
-//     .vertex = .{ .project = "my-project" },
-// });
-// const ai: zenai.provider.Client = .{ .vertex = &vertex_client };
-
-// Or:
-// var openai_client = zenai.openai.Client.init(io, allocator, openai_key, .{});
-// const ai: zenai.provider.Client = .{ .openai = &openai_client };
-
-// Or:
-// var anthropic_client = zenai.anthropic.Client.init(io, allocator, anthropic_key, .{});
-// const ai: zenai.provider.Client = .{ .anthropic = &anthropic_client };
-
-// Or Hugging Face (OpenAI-compatible). Token comes from HF_TOKEN. Defaults to the
-// serverless router; pass `.base_url` for a dedicated Inference Endpoint:
-// var hf_client = zenai.huggingface.Client.init(io, allocator, hf_token, .{
-//     .base_url = "https://router.huggingface.co/v1",
-// });
-// const ai: zenai.provider.Client = .{ .huggingface = &hf_client };
-
-// Or a local llama.cpp `llama-server` (OpenAI-compatible). No key needed;
-// defaults to http://localhost:8080/v1 — override with `.base_url`:
-// var llama_client = zenai.llama_cpp.Client.init(io, allocator, "llama.cpp", .{
-//     .base_url = "http://localhost:8080/v1",
-// });
-// const ai: zenai.provider.Client = .{ .llama_cpp = &llama_client };
-
-// Or ZML's LLMD server, same idea on http://localhost:8000/v1:
-// var llmd_client = zenai.llmd.Client.init(io, allocator, "llmd", .{
-//     .base_url = "http://localhost:8000/v1",
-// });
-// const ai: zenai.provider.Client = .{ .llmd = &llmd_client };
-
-// Or a multi-lab gateway (OpenRouter, Vercel AI Gateway); model ids
-// are provider-prefixed, e.g. "anthropic/claude-sonnet-5":
-// var router_client = zenai.openrouter.Client.init(io, allocator, openrouter_key, .{
-//     .base_url = "https://openrouter.ai/api/v1",
-// });
-// const ai: zenai.provider.Client = .{ .openrouter = &router_client };
-
-// Or any OpenAI-compatible server (vLLM, LiteLLM, Together, Groq, etc.).
-// Auto-detected by `provider.Client.init` when OPENAI_BASE_URL is set; the
-// key comes from OPENAI_API_KEY. With the raw client, pass `.base_url`:
-// var custom_client = zenai.openai_compatible.Client.init(io, allocator, api_key, .{
-//     .base_url = "https://my-custom-server.com/v1",
-// });
-// const ai: zenai.provider.Client = .{ .openai_compatible = &custom_client };
-
-var result = try ai.generateContent("gemini-2.5-flash", &.{
-    .{ .role = .user, .content = "What is Zig?" },
-}, .{});
-defer result.deinit();
-
-std.debug.print("{s}\n", .{result.text orelse ""});
-```
-
-Drop down to provider-specific APIs when needed:
-
-```zig
-switch (ai) {
-    .gemini => |g| {
-        // Use Gemini-specific features like cached content, file uploads, etc.
-        var cached = try g.createCachedContent("gemini-2.5-flash", .{ ... });
-    },
-    else => {},
-}
-```
+</details>
 
 ## Features
 
-**Gemini:**
-- Text generation and streaming (SSE)
-- Multi-turn chat with history management
-- Function calling and tool use
-- Embeddings
-- Token counting
-- File uploads (resumable protocol)
-- Cached content
-- Model listing and info
-- Safety settings and content filtering
-- Vertex AI backend (express-mode API key, or project/location with an OAuth access token) for generation, streaming, chat, token counting, and model listing
+| | Gemini | OpenAI | Anthropic |
+| --- | :---: | :---: | :---: |
+| Generation + SSE streaming | ✓ | ✓ | ✓ |
+| Multi-turn chat | ✓ | ✓ | ✓ |
+| Function calling | ✓ | ✓ | ✓ |
+| Embeddings | ✓ | ✓ | |
+| Model listing | ✓ | ✓ | |
+| Token counting | ✓ | | |
+| File uploads (resumable) | ✓ | | |
+| Cached content | ✓ | | |
+| Safety settings | ✓ | | |
+| Extended thinking | | | ✓ |
 
-**OpenAI:**
-- Chat completions and streaming (SSE)
-- Multi-turn chat with history management
-- Function calling and tool use
-- Embeddings
-- Model listing and info
+The provider abstraction covers generation, streaming and embeddings across all of them, and `lastError()` returns the status and message behind a failed request.
 
-**Anthropic:**
-- Message creation and streaming (SSE)
-- Multi-turn chat with history management
-- Function calling and tool use
-- Extended thinking support
+Search options beyond the basics:
 
-**Search providers:**
-- Tavily (`zenai.search.tavily`) — JSON search API with optional synthesized answers, domain include/exclude, news/general topic, time-range filtering
-- Brave (`zenai.search.brave`) — independent-index web search with country/language targeting, safesearch, freshness and section filtering, extra snippets
-- Exa (`zenai.search.exa`) — embeddings-based search with search-type selection, category focus, domain include/exclude, published-date windows, and opt-in contents (highlights/text/summary)
-- Keenable (`zenai.search.keenable`) — web search that also works keyless through a public endpoint, with site restriction, published-date windows and a snippet-length hint
-
-**TypeSafe (`zenai.typesafe`):**
-- System One judgements over a text or JSON state: `noul` probabilities, `choice` with per-option probabilities and confidence, `score` on an ordered 2–10 level scale with a legend
-- Many questions per request under caller-chosen ids, evaluated against one ingestion of the state
-- `validateChoice` guard for answers that stray outside the offered option set
-- Model listing
-
-**Provider abstraction:**
-- Unified text generation, streaming, and embeddings
-- OpenAI-compatible backends: Ollama, Hugging Face, llama.cpp (`llama-server`), LLMD, Vercel AI Gateway, Mistral, OpenRouter, xAI, and any custom server via `OPENAI_BASE_URL`
-- `lastError()` to surface the status and message behind a failed request
-- Escape hatches to provider-specific APIs
+- **Tavily**: synthesized answers, domain include/exclude, news/general topic, time range
+- **Brave**: country and language targeting, safesearch, freshness, section filtering, extra snippets
+- **Exa**: search type, category, domain include/exclude, published-date windows, contents (highlights, text, summary)
+- **Keenable**: site restriction, published-date windows, snippet-length hint
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE) for details.
+Apache License 2.0. See [LICENSE](LICENSE) for details.
