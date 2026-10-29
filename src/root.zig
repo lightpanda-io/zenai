@@ -76,6 +76,10 @@ pub const search = struct {
         pub const Client = @import("search/keenable/Client.zig");
         pub const types = @import("search/keenable/types.zig");
     };
+    pub const parallel = struct {
+        pub const Client = @import("search/parallel/Client.zig");
+        pub const types = @import("search/parallel/types.zig");
+    };
 };
 
 /// TypeSafe System One — the Jev judgement model. It answers typed questions
