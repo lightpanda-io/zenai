@@ -11,7 +11,7 @@ Zig client for AI APIs, ported from the official Go SDKs ([go-genai](https://git
     - Anything else, via `OPENAI_BASE_URL`
   - [Codex](#chatgpt-subscription-codex): OpenAI models billed to your ChatGPT plan instead of API credits
   - [Anthropic](https://docs.anthropic.com/en/docs/about-claude/models)
-- **Search** (`zenai.search`): [Tavily](https://docs.tavily.com/), [Brave Search](https://brave.com/search/api/), [Exa](https://exa.ai/docs/reference/search), [Keenable](https://docs.keenable.ai/)
+- **Search** (`zenai.search`): [Tavily](https://docs.tavily.com/), [Brave Search](https://brave.com/search/api/), [Exa](https://exa.ai/docs/reference/search), [Keenable](https://docs.keenable.ai/), [Parallel](https://docs.parallel.ai/search/search-quickstart)
 - **Judgement** (`zenai.typesafe`): [TypeSafe System One](https://docs.typesafe.ai), whose Jev model answers typed questions about a piece of state (a probability, a labelled choice or a score) instead of generating text
 
 <img width="1024" height="1024" alt="Meditating panda with incense smoke" src="https://github.com/user-attachments/assets/b9c82960-05ec-4aa1-b171-092ee2126551" />
@@ -438,6 +438,7 @@ for (response.value.results) |r| {
 | [Brave](https://api-dashboard.search.brave.com/) | `zenai.search.brave` | `BRAVE_API_KEY` | `{title, url, description}` per section |
 | [Exa](https://dashboard.exa.ai/) | `zenai.search.exa` | `EXA_API_KEY` | metadata, text only on request |
 | [Keenable](https://keenable.ai/console) | `zenai.search.keenable` | `KEENABLE_API_KEY` (optional) | `{title, url, snippet}` |
+| [Parallel](https://platform.parallel.ai/) | `zenai.search.parallel` | `PARALLEL_API_KEY` | `{title, url, excerpts}` |
 
 The others differ in ways that will catch you out:
 
@@ -499,6 +500,30 @@ defer response.deinit();
 
 for (response.value.results) |r| {
     std.debug.print("{s} — {s}\n", .{ r.title, r.snippet });
+}
+```
+
+</details>
+
+<details>
+<summary>Parallel: an objective plus keyword queries</summary>
+
+Parallel picks excerpts for the request's `objective`, a natural-language statement of what you're looking for. The `query` argument is sent as the single keyword query; set `search_queries` to send several (the API recommends 2-3). `mode` trades quality for latency: `advanced` (the default, ~3s), `basic`, `fast` (~1s) or `turbo`.
+
+```zig
+var client = zenai.search.parallel.Client.init(io, allocator, api_key, .{});
+defer client.deinit();
+
+var response = try client.search("zig 0.17 release notes", .{
+    .objective = "What changed in the Zig 0.17 standard library?",
+    .mode = .fast,
+    .advanced_settings = .{ .max_results = 5 },
+});
+defer response.deinit();
+
+for (response.value.results) |r| {
+    std.debug.print("{s} — {s}\n", .{ r.title orelse "(untitled)", r.url });
+    for (r.excerpts) |e| std.debug.print("  {s}\n", .{e});
 }
 ```
 
@@ -629,6 +654,7 @@ Search options beyond the basics:
 - **Brave**: country and language targeting, safesearch, freshness, section filtering, extra snippets
 - **Exa**: search type, category, domain include/exclude, published-date windows, contents (highlights, text, summary)
 - **Keenable**: site restriction, published-date windows, snippet-length hint
+- **Parallel**: objective, multiple keyword queries, latency mode, domain include/exclude, after-date filter, live fetch policy, excerpt-length caps, location
 
 ## License
 
