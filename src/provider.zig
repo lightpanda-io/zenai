@@ -570,6 +570,7 @@ pub const Client = union(enum) {
     ollama: *openai_mod,
     huggingface: *openai_mod,
     llama_cpp: *openai_mod,
+    llmd: *openai_mod,
     /// Any OpenAI-compatible server configured via `OPENAI_BASE_URL`
     /// + `OPENAI_API_KEY`. Auto-detected when `OPENAI_BASE_URL` is set.
     openai_compatible: *openai_mod,
@@ -749,7 +750,7 @@ pub const Client = union(enum) {
             },
             // Hugging Face speaks OpenAI-compatible Chat Completions, not the
             // Responses API the `.openai` arm uses — so it gets its own arm.
-            .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral, .openrouter => |o| {
+            .huggingface, .llama_cpp, .llmd, .openai_compatible, .vercel, .mistral, .openrouter => |o| {
                 const oai_messages = try messagesToOpenAIMessages(req_alloc, messages);
                 const tools = if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
 
@@ -893,7 +894,7 @@ pub const Client = union(enum) {
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
                 }, Adapter{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Adapter.wrap);
             },
-            .openai, .huggingface, .llama_cpp, .openai_compatible, .vercel, .mistral, .openrouter, .xai => |o| {
+            .openai, .huggingface, .llama_cpp, .llmd, .openai_compatible, .vercel, .mistral, .openrouter, .xai => |o| {
                 const oai_messages = messagesToOpenAIMessages(req_alloc, messages) catch return error.OutOfMemory;
                 const tools = if (config.tools) |t| mapOpenAITools(req_alloc, t) catch return error.OutOfMemory else null;
 
@@ -990,7 +991,7 @@ pub const Client = union(enum) {
                 if (acc.err) |e| return e;
                 return anthropicResult(a.allocator, try acc.response());
             },
-            .huggingface, .openai_compatible, .llama_cpp, .vercel, .mistral, .openrouter => |o| {
+            .huggingface, .openai_compatible, .llama_cpp, .llmd, .vercel, .mistral, .openrouter => |o| {
                 const oai_messages = try messagesToOpenAIMessages(req_alloc, messages);
                 const tools = if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
 
@@ -1085,7 +1086,7 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
-            .openai, .ollama, .huggingface, .openai_compatible, .llama_cpp, .vercel, .mistral, .openrouter, .xai => |o| {
+            .openai, .ollama, .huggingface, .openai_compatible, .llama_cpp, .llmd, .vercel, .mistral, .openrouter, .xai => |o| {
                 var response = try o.embedText(model, text);
                 defer response.deinit();
                 var result = EmbedResult.init(o.allocator);
@@ -1395,6 +1396,8 @@ fn openAiPreset(tag: Tag) ?OpenAiPreset {
         .openai_compatible => null,
         // Empty default: the served model is whatever `llama-server` loaded.
         .llama_cpp => .{ .base_url = "http://localhost:8080/v1", .placeholder_key = "llama.cpp", .default_model = "", .local = true },
+        // ZML's LLMD; same as llama.cpp, the served model is whatever `--model` loaded.
+        .llmd => .{ .base_url = "http://localhost:8000/v1", .placeholder_key = "llmd", .default_model = "", .local = true },
         .vercel => .{ .base_url = "https://ai-gateway.vercel.sh/v1", .env_var = "AI_GATEWAY_API_KEY", .default_model = "openai/gpt-5.5" },
         .mistral => .{ .base_url = "https://api.mistral.ai/v1", .env_var = "MISTRAL_API_KEY", .default_model = "mistral-medium-3.5" },
         .openrouter => .{ .base_url = "https://openrouter.ai/api/v1", .env_var = "OPENROUTER_API_KEY", .default_model = "openai/gpt-5.5" },
@@ -1469,6 +1472,7 @@ pub fn envVarName(tag: Tag) []const u8 {
 pub const ollama_default_base_url = openAiPreset(.ollama).?.base_url;
 pub const huggingface_default_base_url = openAiPreset(.huggingface).?.base_url;
 pub const llama_cpp_default_base_url = openAiPreset(.llama_cpp).?.base_url;
+pub const llmd_default_base_url = openAiPreset(.llmd).?.base_url;
 
 /// Recommended default chat model for `tag` when the user hasn't picked one.
 pub fn defaultModel(tag: Tag) []const u8 {
@@ -1724,6 +1728,12 @@ test "llama_cpp: placeholder key, loopback default, excluded from auto-detect" {
     }
 }
 
+test "llmd: placeholder key, loopback default, excluded from auto-detect" {
+    try std.testing.expectEqualStrings("llmd", envApiKey(.empty, .llmd).?);
+    try std.testing.expect(isLoopbackUrl(llmd_default_base_url));
+    for (default_candidates) |t| try std.testing.expect(t != .llmd);
+}
+
 test "cloud gateway presets: real key, default model, auto-detectable" {
     for ([_]Tag{ .vercel, .mistral, .openrouter, .xai }) |tag| {
         try std.testing.expect(openAiPreset(tag).?.env_var != null);
@@ -1731,7 +1741,7 @@ test "cloud gateway presets: real key, default model, auto-detectable" {
         // Real keys, so they join env auto-detection; the keyless local servers don't.
         try std.testing.expect(std.mem.findScalar(Tag, default_candidates, tag) != null);
     }
-    for (default_candidates) |t| try std.testing.expect(t != .ollama and t != .llama_cpp);
+    for (default_candidates) |t| try std.testing.expect(t != .ollama and t != .llama_cpp and t != .llmd);
 }
 
 test "openai_compatible: no static preset, env-gated key detection" {
