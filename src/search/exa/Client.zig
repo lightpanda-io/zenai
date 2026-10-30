@@ -8,6 +8,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const http = @import("../../http.zig");
 const retry = @import("../../retry.zig");
+const provider = @import("../../provider.zig");
 
 pub const RetryPolicy = retry.RetryPolicy;
 
@@ -23,6 +24,13 @@ http_client: std.http.Client,
 retry_policy: RetryPolicy,
 request_timeout_ms: ?u32,
 last_error: http.ErrorDetail = .{},
+
+/// The environment variable `envApiKey` reads.
+pub const env_var_name = "EXA_API_KEY";
+
+pub fn envApiKey(environ: std.process.Environ) ?[:0]const u8 {
+    return provider.envGet(environ, env_var_name);
+}
 
 pub const InitOptions = struct {
     base_url: []const u8 = "https://api.exa.ai",
