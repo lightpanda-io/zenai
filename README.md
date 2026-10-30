@@ -420,7 +420,7 @@ Every search client follows the same shape: `init` with a key, call `search`, it
 ```zig
 const zenai = @import("zenai");
 
-const api_key = environ.getPosix("TAVILY_API_KEY") orelse return error.MissingApiKey;
+const api_key = zenai.search.tavily.Client.envApiKey(environ) orelse return error.MissingApiKey;
 var client = zenai.search.tavily.Client.init(io, allocator, api_key, .{});
 defer client.deinit();
 
@@ -432,7 +432,7 @@ for (response.value.results) |r| {
 }
 ```
 
-| Provider | Namespace | Key | Results |
+| Provider | Namespace | Key (`Client.env_var_name`) | Results |
 | --- | --- | --- | --- |
 | [Tavily](https://app.tavily.com/) | `zenai.search.tavily` | `TAVILY_API_KEY` | `{title, url, content}` |
 | [Brave](https://api-dashboard.search.brave.com/) | `zenai.search.brave` | `BRAVE_API_KEY` | `{title, url, description}` per section |
@@ -491,7 +491,7 @@ for (response.value.results) |r| {
 Pass `null` as the key and the client calls the public endpoint, rate-limited per client IP. A key lifts the limits. `app_title` has no default: it is sent as `X-Keenable-Title`, required when keyless, and only you know your app's name.
 
 ```zig
-const api_key = environ.getPosix("KEENABLE_API_KEY"); // null is fine
+const api_key = zenai.search.keenable.Client.envApiKey(environ); // null is fine
 var client = zenai.search.keenable.Client.init(io, allocator, api_key, .{ .app_title = "my-app" });
 defer client.deinit();
 
