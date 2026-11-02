@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const json = @import("json.zig");
 const retry = @import("retry.zig");
 
+const log = std.log.scoped(.zenai);
+
 /// Error set returned by `fetchJsonWithRetry`. Each provider's `ApiError`
 /// is a superset, adding its own preflight errors (`MissingApiKey` for the
 /// keyed providers; keenable, which supports keyless calls, adds
@@ -30,7 +32,7 @@ pub const ErrorDetail = struct {
         if (self.message) |old| allocator.free(old);
         self.message = null;
         if (body.len > 0) {
-            if (log_tag) |tag| std.log.err("{s} API error (HTTP {d}): {s}", .{ tag, status, body });
+            if (log_tag) |tag| log.err("{s} API error (HTTP {d}): {s}", .{ tag, status, body });
             self.message = extractErrorMessage(allocator, body) orelse (allocator.dupe(u8, body) catch null);
         }
     }
@@ -716,7 +718,7 @@ fn streamLinesOnce(
         }
 
         const parsed = std.json.parseFromSlice(EventT, allocator, json_data, .{ .ignore_unknown_fields = true }) catch |err| {
-            std.log.err("stream: failed to parse chunk: {}", .{err});
+            log.err("stream: failed to parse chunk: {}", .{err});
             setUnparsedDetail(error_handler, status_code, err, json_data);
             return error.InvalidSseData;
         };
