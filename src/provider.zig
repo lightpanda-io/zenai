@@ -11,7 +11,7 @@ const anthropic_mod = @import("anthropic/Client.zig");
 const gemini_types = @import("gemini/types.zig");
 const openai_types = @import("openai/types.zig");
 const anthropic_types = @import("anthropic/types.zig");
-const ollama_native = @import("openai/ollama.zig");
+const ollama_mod = @import("ollama/Client.zig");
 
 /// See `env.get`.
 pub const envGet = env.get;
@@ -476,7 +476,7 @@ pub const Client = union(enum) {
     gemini: *gemini_mod,
     vertex: *gemini_mod,
     openai: *openai_mod,
-    ollama: *openai_mod,
+    ollama: *ollama_mod,
     huggingface: *openai_mod,
     llama_cpp: *openai_mod,
     llmd: *openai_mod,
@@ -494,6 +494,7 @@ pub const Client = union(enum) {
     /// The backend client's HTTP plumbing.
     pub fn transport(self: Client) *http.Transport {
         return switch (self) {
+            .ollama => |c| &c.openai.transport,
             inline else => |c| &c.transport,
         };
     }
@@ -514,9 +515,11 @@ pub const Client = union(enum) {
         /// Borrowed `std.http.Client` to share a connection pool with other
         /// clients; see `http.Transport.Options.http_client`. Null owns one.
         http_client: ?*std.http.Client = null,
-        /// Hugging Face org to bill via `X-HF-Bill-To`. Only applied to the
-        /// OpenAI-compatible clients; ignored by gemini/anthropic.
-        bill_to: ?[]const u8 = null,
+        /// Headers sent on every request, e.g. Hugging Face's `X-HF-Bill-To`.
+        /// Only applied to the OpenAI-compatible clients (and `.ollama`);
+        /// ignored by gemini/anthropic/codex. Borrowed: the slice and its
+        /// strings must outlive the client.
+        extra_headers: []const std.http.Header = &.{},
         /// GCP project for `.vertex` project/location mode (falls back to
         /// GOOGLE_CLOUD_PROJECT in `environ`). When set, the init `key` must
         /// be an OAuth access token, not an API key. Ignored by other
@@ -557,7 +560,7 @@ pub const Client = union(enum) {
                     .http_client = options.http_client,
                 };
                 if (base_url) |u| impl_opts.base_url = u;
-                if (@hasField(Impl.InitOptions, "bill_to")) impl_opts.bill_to = options.bill_to;
+                if (@hasField(Impl.InitOptions, "extra_headers")) impl_opts.extra_headers = options.extra_headers;
                 if (@hasField(Impl.InitOptions, "account_id")) impl_opts.account_id = options.account_id;
                 if (@hasField(Impl.InitOptions, "session_id")) impl_opts.session_id = options.session_id;
                 if (tag == .vertex) impl_opts.vertex = vertexConfigFromEnv(options.environ, options.project, options.location);
@@ -695,12 +698,12 @@ pub const Client = union(enum) {
             .ollama => |o| {
                 const call = try mapOllamaCall(ra, messages, config);
                 const hook = on_text orelse {
-                    var response = try ollama_native.chat(o, model, call.messages, call.tools, call.think, call.format, call.options);
+                    var response = try o.chat(model, call.messages, call.tools, call.think, call.format, call.options);
                     defer response.deinit();
                     return ollamaResult(self.clientAllocator(), response.value);
                 };
-                var acc = ollama_native.StreamAccumulator.init(ra, hook.context, hook.onText);
-                ollama_native.chatStream(o, model, call.messages, call.tools, call.think, call.format, call.options, &acc, ollama_native.StreamAccumulator.onChunk) catch |err| return streamFailed(err);
+                var acc = ollama_mod.StreamAccumulator.init(ra, hook.context, hook.onText);
+                o.chatStream(model, call.messages, call.tools, call.think, call.format, call.options, &acc, ollama_mod.StreamAccumulator.onChunk) catch |err| return streamFailed(err);
                 if (acc.err) |e| return e;
                 return ollamaResult(self.clientAllocator(), acc.response());
             },
@@ -748,6 +751,7 @@ pub const Client = union(enum) {
     fn openAiClient(self: Client) *openai_mod {
         return switch (self) {
             .anthropic, .gemini, .vertex, .codex => unreachable,
+            .ollama => |o| &o.openai,
             inline else => |o| o,
         };
     }
@@ -811,8 +815,8 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
-            .openai, .ollama, .huggingface, .openai_compatible, .llama_cpp, .llmd, .vercel, .mistral, .openrouter, .xai => |o| {
-                var response = try o.embedText(model, text);
+            .openai, .ollama, .huggingface, .openai_compatible, .llama_cpp, .llmd, .vercel, .mistral, .openrouter, .xai => {
+                var response = try self.openAiClient().embedText(model, text);
                 defer response.deinit();
                 var result = EmbedResult.init(self.clientAllocator());
                 if (response.value.data) |data| {
@@ -1902,9 +1906,9 @@ fn messagesToOpenAIMessages(allocator: std.mem.Allocator, input: []const Message
 /// Like `messagesToOpenAIMessages`, but keeps tool-call arguments as objects
 /// (not stringified) and answers tool results with `tool_name` (Ollama matches
 /// by name, not id).
-fn messagesToOllamaMessages(allocator: std.mem.Allocator, input: []const Message) ![]ollama_native.Message {
+fn messagesToOllamaMessages(allocator: std.mem.Allocator, input: []const Message) ![]ollama_mod.Message {
     const messages = try splitToolImages(allocator, input);
-    var out: std.ArrayList(ollama_native.Message) = .empty;
+    var out: std.ArrayList(ollama_mod.Message) = .empty;
 
     for (messages) |msg| {
         if (msg.role == .tool) {
@@ -1922,9 +1926,9 @@ fn messagesToOllamaMessages(allocator: std.mem.Allocator, input: []const Message
             continue;
         }
 
-        var native_tool_calls: ?[]const ollama_native.ToolCall = null;
+        var native_tool_calls: ?[]const ollama_mod.ToolCall = null;
         if (msg.tool_calls) |calls| {
-            const arr = try allocator.alloc(ollama_native.ToolCall, calls.len);
+            const arr = try allocator.alloc(ollama_mod.ToolCall, calls.len);
             for (calls, 0..) |call, i| {
                 arr[i] = .{
                     .id = if (call.id.len > 0) call.id else null,
@@ -2346,7 +2350,7 @@ fn mapOllamaThink(level: ?Effort) ?bool {
     return l != .none;
 }
 
-fn mapOllamaFinishReason(response: ollama_native.ChatResponse) FinishReason {
+fn mapOllamaFinishReason(response: ollama_mod.ChatResponse) FinishReason {
     // A tool call wins over done_reason ("stop").
     if (response.message) |m| {
         if (m.tool_calls) |tc| {
@@ -2359,7 +2363,7 @@ fn mapOllamaFinishReason(response: ollama_native.ChatResponse) FinishReason {
     return .unknown;
 }
 
-fn mapOllamaUsage(response: ollama_native.ChatResponse) Usage {
+fn mapOllamaUsage(response: ollama_mod.ChatResponse) Usage {
     const prompt = response.prompt_eval_count;
     const completion = response.eval_count;
     return .{
@@ -2375,11 +2379,11 @@ fn mapOllamaUsage(response: ollama_native.ChatResponse) Usage {
 /// Native `/api/chat` request inputs mapped from a `GenerationConfig`. Shared by
 /// the buffered and streaming `.ollama` arms.
 const OllamaCall = struct {
-    messages: []ollama_native.Message,
+    messages: []ollama_mod.Message,
     tools: ?[]const openai_types.Tool,
     think: ?bool,
     format: ?[]const u8,
-    options: ollama_native.Options,
+    options: ollama_mod.Options,
 };
 
 fn mapOllamaCall(allocator: std.mem.Allocator, messages: []const Message, config: GenerationConfig) !OllamaCall {
@@ -2430,7 +2434,7 @@ const ToolCalls = struct {
 
 /// Map a native `/api/chat` `ChatResponse` (buffered or stream-reassembled) into
 /// the unified `GenerateResult`. Shared by the buffered and streaming arms.
-fn ollamaResult(alloc: std.mem.Allocator, response: ollama_native.ChatResponse) Client.Error!GenerateResult {
+fn ollamaResult(alloc: std.mem.Allocator, response: ollama_mod.ChatResponse) Client.Error!GenerateResult {
     var result = GenerateResult.init(alloc);
     errdefer result.deinit();
     const ra = result.arena.allocator();

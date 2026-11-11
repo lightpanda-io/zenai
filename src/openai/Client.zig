@@ -21,14 +21,10 @@ api_key: []const u8,
 base_url: []const u8,
 organization: ?[]const u8,
 project: ?[]const u8,
-/// Hugging Face org to bill via `X-HF-Bill-To`, so the router charges a
-/// Team/Enterprise org instead of the token owner. Ignored by OpenAI/Ollama.
-bill_to: ?[]const u8,
+/// Sent after the auth headers on every request. Borrowed, see
+/// `InitOptions.extra_headers`.
+extra_headers: []const std.http.Header,
 bearer: http.BearerAuth = .{},
-/// Per-model cache of the Ollama context window (see `ollama.zig`), so the
-/// `/api/show` lookup runs once per model. `model` is owned by the transport's allocator;
-/// `len` is null when the lookup missed (cached so it isn't retried).
-ollama_ctx: ?struct { model: []const u8, len: ?i32 } = null,
 
 /// Options for customizing the API endpoint.
 pub const InitOptions = struct {
@@ -38,8 +34,11 @@ pub const InitOptions = struct {
     organization: ?[]const u8 = null,
     /// Project ID for API requests.
     project: ?[]const u8 = null,
-    /// Hugging Face org to bill via the `X-HF-Bill-To` header (see field docs).
-    bill_to: ?[]const u8 = null,
+    /// Headers sent on every request after the auth headers, for what a
+    /// backend reads beyond the OpenAI API (e.g. Hugging Face's
+    /// `X-HF-Bill-To`). Borrowed: the slice and its strings must outlive the
+    /// client.
+    extra_headers: []const std.http.Header = &.{},
     /// Retry policy for transient HTTP failures (5xx, 429, and known
     /// flaky network errors). Pass `RetryPolicy.disabled` to opt out.
     retry_policy: RetryPolicy = .{},
@@ -65,15 +64,13 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
         .base_url = options.base_url,
         .organization = options.organization,
         .project = options.project,
-        .bill_to = options.bill_to,
+        .extra_headers = options.extra_headers,
     };
 }
 
 /// Release all resources held by the client, including HTTP connections.
 pub fn deinit(self: *Client) void {
-    const allocator = self.transport.allocator;
-    self.bearer.deinit(allocator);
-    if (self.ollama_ctx) |c| allocator.free(c.model);
+    self.bearer.deinit(self.transport.allocator);
     self.transport.deinit();
 }
 
@@ -83,29 +80,37 @@ pub const ApiError = error{MissingApiKey} || http.FetchError;
 
 // --- Internal helpers ---
 
-/// `X-HF-Bill-To` is only emitted when `bill_to` is set, so providers that
-/// don't recognize it never see it.
-fn authHeaders(self: *Client, buf: *[4]std.http.Header) ![]const std.http.Header {
+fn authHeaders(self: *Client, buf: *[3]std.http.Header) ![]const std.http.Header {
     buf[0] = try self.bearer.header(self.transport.allocator, self.api_key);
     buf[1] = .{ .name = "OpenAI-Organization", .value = self.organization orelse "" };
     buf[2] = .{ .name = "OpenAI-Project", .value = self.project orelse "" };
-    if (self.bill_to) |org| {
-        buf[3] = .{ .name = "X-HF-Bill-To", .value = org };
-        return buf[0..4];
-    }
-    return buf[0..3];
+    return self.withExtraHeaders(buf);
+}
+
+/// `base` followed by `extra_headers`: `base` itself when there are none,
+/// else a copy to release with `freeHeaders`.
+pub fn withExtraHeaders(self: *Client, base: []const std.http.Header) std.mem.Allocator.Error![]const std.http.Header {
+    if (self.extra_headers.len == 0) return base;
+    return std.mem.concat(self.transport.allocator, std.http.Header, &.{ base, self.extra_headers });
+}
+
+/// Release what `withExtraHeaders(base)` returned.
+pub fn freeHeaders(self: *Client, base: []const std.http.Header, headers: []const std.http.Header) void {
+    if (headers.ptr != base.ptr) self.transport.allocator.free(headers);
 }
 
 fn fetchGet(self: *Client, url: []const u8, comptime T: type) ApiError!Response(T) {
-    var hdr_buf: [4]std.http.Header = undefined;
-    const auth = try self.authHeaders(&hdr_buf);
-    return self.transport.getJson(url, auth, T);
+    var hdr_buf: [3]std.http.Header = undefined;
+    const headers = try self.authHeaders(&hdr_buf);
+    defer self.freeHeaders(&hdr_buf, headers);
+    return self.transport.getJson(url, headers, T);
 }
 
 fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) ApiError!Response(T) {
-    var hdr_buf: [4]std.http.Header = undefined;
-    const auth = try self.authHeaders(&hdr_buf);
-    return self.transport.postJson(url, auth, body, T);
+    var hdr_buf: [3]std.http.Header = undefined;
+    const headers = try self.authHeaders(&hdr_buf);
+    defer self.freeHeaders(&hdr_buf, headers);
+    return self.transport.postJson(url, headers, body, T);
 }
 
 // --- Chat Completions ---
@@ -210,9 +215,10 @@ pub fn createResponseStream(
     var req_body = request;
     req_body.stream = true;
 
-    var hdr_buf: [4]std.http.Header = undefined;
-    const auth = try self.authHeaders(&hdr_buf);
-    return self.transport.streamSse(url, auth, req_body, ResponseStreamEvent, context, callback);
+    var hdr_buf: [3]std.http.Header = undefined;
+    const headers = try self.authHeaders(&hdr_buf);
+    defer self.freeHeaders(&hdr_buf, headers);
+    return self.transport.streamSse(url, headers, req_body, ResponseStreamEvent, context, callback);
 }
 
 // --- Streaming ---
@@ -255,9 +261,10 @@ pub fn chatCompletionStream(
         .providerOptions = config.providerOptions,
     };
 
-    var hdr_buf: [4]std.http.Header = undefined;
-    const auth = try self.authHeaders(&hdr_buf);
-    return self.transport.streamSse(url, auth, req_body, ChatCompletionResponse, context, callback);
+    var hdr_buf: [3]std.http.Header = undefined;
+    const headers = try self.authHeaders(&hdr_buf);
+    defer self.freeHeaders(&hdr_buf, headers);
+    return self.transport.streamSse(url, headers, req_body, ChatCompletionResponse, context, callback);
 }
 
 /// Convenience: stream a chat completion from a single text prompt.
@@ -562,19 +569,27 @@ test "Client init and deinit" {
     try std.testing.expectEqualStrings("https://api.openai.com/v1", client.base_url);
 }
 
-test "authHeaders emits X-HF-Bill-To only when bill_to is set" {
-    var buf: [4]std.http.Header = undefined;
+test "authHeaders appends extra_headers after the auth headers" {
+    var buf: [3]std.http.Header = undefined;
 
     var plain = Client.init(std.testing.io, std.testing.allocator, "k", .{});
     defer plain.deinit();
-    try std.testing.expectEqual(@as(usize, 3), (try plain.authHeaders(&buf)).len);
+    const auth = try plain.authHeaders(&buf);
+    defer plain.freeHeaders(&buf, auth);
+    try std.testing.expectEqual(@as(usize, 3), auth.len);
+    try std.testing.expectEqual(@as([*]const std.http.Header, &buf), auth.ptr);
 
-    var billed = Client.init(std.testing.io, std.testing.allocator, "k", .{ .bill_to = "my-org" });
+    var billed = Client.init(std.testing.io, std.testing.allocator, "k", .{
+        .extra_headers = &.{ .{ .name = "X-HF-Bill-To", .value = "my-org" }, .{ .name = "X-Other", .value = "v" } },
+    });
     defer billed.deinit();
     const headers = try billed.authHeaders(&buf);
-    try std.testing.expectEqual(@as(usize, 4), headers.len);
+    defer billed.freeHeaders(&buf, headers);
+    try std.testing.expectEqual(@as(usize, 5), headers.len);
+    try std.testing.expectEqualStrings("Bearer k", headers[0].value);
     try std.testing.expectEqualStrings("X-HF-Bill-To", headers[3].name);
     try std.testing.expectEqualStrings("my-org", headers[3].value);
+    try std.testing.expectEqualStrings("X-Other", headers[4].name);
 }
 
 test "isChatModel keeps chat families" {

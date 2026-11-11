@@ -7,8 +7,12 @@ pub const gemini = struct {
 pub const openai = struct {
     pub const Client = @import("openai/Client.zig");
     pub const types = @import("openai/types.zig");
-    /// Native Ollama `/api/chat` (so `num_ctx` can be set).
-    pub const ollama = @import("openai/ollama.zig");
+};
+
+/// Ollama: native `/api/chat` (so `num_ctx` can be set), `/v1` for the rest.
+/// Reuses the openai types; see `ollama/Client.zig`.
+pub const ollama = struct {
+    pub const Client = @import("ollama/Client.zig");
 };
 
 pub const anthropic = struct {
