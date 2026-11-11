@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const json = @import("json.zig");
 const retry = @import("retry.zig");
 const http = @import("http.zig");
+const env = @import("env.zig");
 const gemini_mod = @import("gemini/Client.zig");
 const openai_mod = @import("openai/Client.zig");
 const codex_mod = @import("codex/Client.zig");
@@ -12,100 +13,8 @@ const openai_types = @import("openai/types.zig");
 const anthropic_types = @import("anthropic/types.zig");
 const ollama_native = @import("openai/ollama.zig");
 
-/// `Environ.getPosix` that also works on Windows, where std only offers a
-/// WTF-16 lookup. There, values come from a WTF-8 copy of the process
-/// environment made once on first use and kept for the process lifetime,
-/// the same lifetime getPosix values have, so lookups never allocate.
-/// Returns null if the variable is unset, or on Windows if that one-time
-/// copy cannot be allocated.
-pub fn envGet(environ: std.process.Environ, key: []const u8) ?[:0]const u8 {
-    if (comptime builtin.os.tag != .windows) return environ.getPosix(key);
-    if (!environ.block.use_global) return null;
-    const block = @atomicLoad(?[*:0]const u8, &windows_env.block, .acquire) orelse
-        windows_env.init() orelse return null;
-    return windows_env.lookup(block, key);
-}
-
-const windows_env = struct {
-    var block: ?[*:0]const u8 = null;
-
-    fn init() ?[*:0]const u8 {
-        const windows = std.os.windows;
-        const peb = windows.peb();
-        const copy = copy: {
-            std.debug.assert(windows.ntdll.RtlEnterCriticalSection(peb.FastPebLock) == .SUCCESS);
-            defer std.debug.assert(windows.ntdll.RtlLeaveCriticalSection(peb.FastPebLock) == .SUCCESS);
-            break :copy toWtf8(std.heap.page_allocator, peb.ProcessParameters.Environment) catch return null;
-        };
-        // Another thread may have won the race to publish its copy.
-        if (@cmpxchgStrong(?[*:0]const u8, &block, null, copy.ptr, .acq_rel, .acquire)) |winner| {
-            std.heap.page_allocator.free(copy);
-            return winner;
-        }
-        return copy.ptr;
-    }
-
-    /// Transcodes a Windows environment block ("k=v\0k=v\0\0") to WTF-8,
-    /// keeping the NUL separators and the final empty entry.
-    fn toWtf8(allocator: std.mem.Allocator, wblock: [*:0]const u16) ![:0]u8 {
-        var len: usize = 0;
-        while (wblock[len] != 0) len += std.mem.len(wblock + len) + 1;
-        const wtf16 = wblock[0..len];
-        const out = try allocator.allocSentinel(u8, std.unicode.calcWtf8Len(wtf16), 0);
-        _ = std.unicode.wtf16LeToWtf8(out, wtf16);
-        return out;
-    }
-
-    /// Case-insensitive, like getWindows. Entries may start with '=' (the
-    /// hidden per-drive "=C:" variables), so the separator search starts
-    /// at index 1.
-    fn lookup(wtf8_block: [*:0]const u8, key: []const u8) ?[:0]const u8 {
-        if (key.len == 0 or std.mem.findScalar(u8, key[1..], '=') != null) return null;
-        if (!std.unicode.wtf8ValidateSlice(key)) return null;
-        var i: usize = 0;
-        while (wtf8_block[i] != 0) {
-            const entry = std.mem.span(wtf8_block + i);
-            i += entry.len + 1;
-            const eq = std.mem.findScalarPos(u8, entry, 1, '=') orelse continue;
-            if (std.os.windows.eqlIgnoreCaseWtf8(key, entry[0..eq])) return entry[eq + 1 ..];
-        }
-        return null;
-    }
-};
-
-test "envGet: windows environment block lookup" {
-    // The Windows path reads the live PEB, so exercise the transcode and
-    // lookup on a synthetic block, which runs on every target.
-    const wblock = std.unicode.wtf8ToWtf16LeStringLiteral(
-        "=C:=C:\\work\x00" ++
-            "Path=C:\\bin\x00" ++
-            "OPENAI_API_KEY=sk-\xc3\xa9\x00" ++
-            "LONE=\xed\xa0\x80\x00" ++
-            "EMPTY=\x00",
-    );
-    const block = try windows_env.toWtf8(std.testing.allocator, wblock);
-    defer std.testing.allocator.free(block);
-
-    try std.testing.expectEqualStrings("C:\\bin", windows_env.lookup(block, "PATH").?);
-    try std.testing.expectEqualStrings("sk-\xc3\xa9", windows_env.lookup(block, "openai_api_key").?);
-    // An unpaired surrogate is valid WTF-16 and comes back as WTF-8.
-    try std.testing.expectEqualStrings("\xed\xa0\x80", windows_env.lookup(block, "LONE").?);
-    try std.testing.expectEqualStrings("", windows_env.lookup(block, "EMPTY").?);
-    try std.testing.expectEqualStrings("C:\\work", windows_env.lookup(block, "=C:").?);
-    try std.testing.expect(windows_env.lookup(block, "MISSING") == null);
-    try std.testing.expect(windows_env.lookup(block, "Pa=th") == null);
-    try std.testing.expect(windows_env.lookup(block, "") == null);
-}
-
-test "envGet: windows reads the live process environment" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
-    // PATH is set in every process. The second lookup must return the same
-    // memory: values point into the one-time copy, nothing per call.
-    const value = envGet(.{ .block = .global }, "PATH") orelse return error.SkipZigTest;
-    try std.testing.expect(value.len > 0);
-    try std.testing.expectEqual(value.ptr, envGet(.{ .block = .global }, "path").?.ptr);
-    try std.testing.expect(envGet(.empty, "PATH") == null);
-}
+/// See `env.get`.
+pub const envGet = env.get;
 
 // --- Types ---
 
@@ -581,7 +490,6 @@ pub const Client = union(enum) {
     codex: *codex_mod,
 
     pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError || codex_mod.ApiError;
-    pub const StreamError = gemini_mod.StreamError || openai_mod.StreamError || anthropic_mod.StreamError || codex_mod.StreamError;
 
     fn clientAllocator(self: Client) std.mem.Allocator {
         return switch (self) {
@@ -591,7 +499,7 @@ pub const Client = union(enum) {
 
     pub const InitOptions = struct {
         /// Overrides the provider's default base URL. Ollama falls back to
-        /// `ollama_default_base_url` when null; the others use their own.
+        /// `defaultBaseUrl(.ollama)` when null; the others use their own.
         base_url: ?[:0]const u8 = null,
         retry_policy: retry.RetryPolicy = .{},
         /// Per-attempt wall-clock bound on non-streaming requests, from an
@@ -633,7 +541,7 @@ pub const Client = union(enum) {
                 const base_url: ?[:0]const u8 = options.base_url orelse switch (tag) {
                     // Never fall through to api.openai.com.
                     .openai_compatible => envGet(options.environ, "OPENAI_BASE_URL") orelse return error.MissingBaseUrl,
-                    else => if (openAiPreset(tag)) |p| p.base_url else null,
+                    else => info(tag).base_url,
                 };
                 var impl_opts: Impl.InitOptions = .{ .retry_policy = options.retry_policy, .request_timeout_ms = options.request_timeout_ms };
                 if (base_url) |u| impl_opts.base_url = u;
@@ -696,95 +604,143 @@ pub const Client = union(enum) {
         self: Client,
         model: []const u8,
         messages: []const Message,
+        config: GenerationConfig,
+    ) Error!GenerateResult {
+        return self.generate(model, messages, config, null);
+    }
+
+    /// Streaming counterpart of `generateContent`: forwards each text delta to
+    /// `on_text` as it arrives and returns the same reassembled `GenerateResult`
+    /// (text, tool calls, reasoning, usage) the buffered call would.
+    pub fn generateContentStream(
+        self: Client,
+        model: []const u8,
+        messages: []const Message,
+        config: GenerationConfig,
+        on_text: TextDeltaHook,
+    ) Error!GenerateResult {
+        return self.generate(model, messages, config, on_text);
+    }
+
+    /// Build the backend's request once, then send it buffered (`on_text`
+    /// null) or streamed into an accumulator that yields the same result.
+    fn generate(
+        self: Client,
+        model: []const u8,
+        messages: []const Message,
         config_in: GenerationConfig,
+        on_text: ?TextDeltaHook,
     ) Error!GenerateResult {
         const config = flooredConfig(config_in);
-        // The Codex backend rejects `stream:false`, so one-shot is the
-        // streaming path accumulated into a discard-text sink.
-        if (self == .codex) return self.generateContentStreamAccumulate(model, messages, config, .{ .context = undefined, .onText = noopOnText });
-
         var req_arena = std.heap.ArenaAllocator.init(self.clientAllocator());
         defer req_arena.deinit();
-        const req_alloc = req_arena.allocator();
+        const ra = req_arena.allocator();
 
         switch (self) {
             .gemini, .vertex => |g| {
-                const separated = try separateSystemMessages(req_alloc, messages);
-                const contents = separated.contents;
-                const sys_instruction: ?gemini_types.Content = if (separated.system_text) |sys|
-                    gemini_types.Content{ .parts = @as([]const gemini_types.Part, &.{.{ .text = sys }}) }
-                else
-                    null;
-
-                const tools = if (config.tools) |t| try mapGeminiTools(req_alloc, t) else null;
-
-                var response = try g.generateContent(model, contents, mapGeminiGenerationConfig(model, config), .{
-                    .systemInstruction = sys_instruction,
-                    .tools = tools,
+                const separated = try separateSystemMessages(ra, messages);
+                const gen_config = mapGeminiGenerationConfig(model, config);
+                const opts: gemini_mod.RequestOptions = .{
+                    .systemInstruction = if (separated.system_text) |sys|
+                        .{ .parts = try ra.dupe(gemini_types.Part, &.{.{ .text = sys }}) }
+                    else
+                        null,
+                    .tools = if (config.tools) |t| try mapGeminiTools(ra, t) else null,
                     .toolConfig = mapToolChoiceToGemini(config.tool_choice),
-                });
-                defer response.deinit();
-
-                return geminiResult(g.allocator, response.value);
+                };
+                const hook = on_text orelse {
+                    var response = try g.generateContent(model, separated.contents, gen_config, opts);
+                    defer response.deinit();
+                    return geminiResult(g.allocator, response.value);
+                };
+                var acc = gemini_mod.StreamAccumulator.init(ra, hook.context, hook.onText);
+                g.generateContentStream(model, separated.contents, gen_config, opts, &acc, gemini_mod.StreamAccumulator.onEvent) catch |err| return streamFailed(err);
+                if (acc.err) |e| return e;
+                return geminiResult(g.allocator, try acc.response());
             },
-            // xAI treats Chat Completions as legacy; Responses is its primary API.
-            .openai, .xai => |o| {
-                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, "system", self, model);
-                const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
-
-                var response = try o.createResponse(self.responsesRequest(model, input, tools, config));
-                defer response.deinit();
-
-                return openAiResponsesResult(o.allocator, response.value, self, model);
+            // OpenAI and xAI speak the Responses API (Chat Completions 400s on
+            // function tools + reasoning for gpt-5; xAI treats it as legacy).
+            // Codex is the same API behind ChatGPT auth, and stream-only.
+            .openai, .xai, .codex => {
+                const system_role = if (self == .codex) codex_system_role else "system";
+                const input = try messagesToOpenAIResponsesInput(ra, messages, system_role, self, model);
+                const tools = if (config.tools) |t| try mapOpenAIResponsesTools(ra, t) else null;
+                const request = if (self == .codex) codexRequest(model, input, tools, config) else self.responsesRequest(model, input, tools, config);
+                const hook = on_text orelse if (self == .codex) TextDeltaHook{ .context = undefined, .onText = noopOnText } else {
+                    const o = self.openAiClient();
+                    var response = try o.createResponse(request);
+                    defer response.deinit();
+                    return openAiResponsesResult(o.allocator, response.value, self, model);
+                };
+                var acc = openai_mod.ResponsesStreamAccumulator.init(ra, hook.context, hook.onText);
+                const sent = switch (self) {
+                    .codex => |c| c.createResponseStream(request, &acc, openai_mod.ResponsesStreamAccumulator.onEvent),
+                    else => self.openAiClient().createResponseStream(request, &acc, openai_mod.ResponsesStreamAccumulator.onEvent),
+                };
+                sent catch |err| return streamFailed(err);
+                if (acc.err) |e| return e;
+                return openAiResponsesResult(self.clientAllocator(), try acc.response(), self, model);
             },
-            // Handled by the early return above, before the arena is created.
-            .codex => unreachable,
-            // Native `/api/chat` so `num_ctx` can be sized — see `openai/ollama.zig`.
+            // Native `/api/chat` (NDJSON when streamed) so `num_ctx` can be
+            // sized: the `/v1` shim defaults to 4096 and silently truncates.
             .ollama => |o| {
-                const call = try mapOllamaCall(req_alloc, messages, config);
-
-                var response = try ollama_native.chat(o, model, call.messages, call.tools, call.think, call.format, call.options);
-                defer response.deinit();
-
-                return ollamaResult(o.allocator, response.value);
+                const call = try mapOllamaCall(ra, messages, config);
+                const hook = on_text orelse {
+                    var response = try ollama_native.chat(o, model, call.messages, call.tools, call.think, call.format, call.options);
+                    defer response.deinit();
+                    return ollamaResult(o.allocator, response.value);
+                };
+                var acc = ollama_native.StreamAccumulator.init(ra, hook.context, hook.onText);
+                ollama_native.chatStream(o, model, call.messages, call.tools, call.think, call.format, call.options, &acc, ollama_native.StreamAccumulator.onChunk) catch |err| return streamFailed(err);
+                if (acc.err) |e| return e;
+                return ollamaResult(o.allocator, acc.response());
             },
-            // Hugging Face speaks OpenAI-compatible Chat Completions, not the
-            // Responses API the `.openai` arm uses — so it gets its own arm.
             .huggingface, .llama_cpp, .llmd, .openai_compatible, .vercel, .mistral, .openrouter => |o| {
-                const oai_messages = try messagesToOpenAIMessages(req_alloc, messages);
-                const tools = if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
-
-                var response = try o.chatCompletion(model, oai_messages, self.openAiCompletionConfig(model, config, tools));
-                defer response.deinit();
-
-                return openAiChatResult(o.allocator, response.value);
+                const oai_messages = try messagesToOpenAIMessages(ra, messages);
+                const tools = if (config.tools) |t| try mapOpenAITools(ra, t) else null;
+                const cfg = self.openAiCompletionConfig(model, config, tools);
+                const hook = on_text orelse {
+                    var response = try o.chatCompletion(model, oai_messages, cfg);
+                    defer response.deinit();
+                    return openAiChatResult(o.allocator, response.value);
+                };
+                var acc = openai_mod.StreamAccumulator.init(ra, hook.context, hook.onText);
+                o.chatCompletionStream(model, oai_messages, cfg, &acc, openai_mod.StreamAccumulator.onEvent) catch |err| return streamFailed(err);
+                if (acc.err) |e| return e;
+                return openAiChatResult(o.allocator, try acc.response());
             },
             .anthropic => |a| {
-                const system_text = try extractSystemText(req_alloc, messages);
-                const ant_messages = try messagesToAnthropicMessages(req_alloc, messages);
-
-                const system_blocks: ?[]const anthropic_types.TextBlock = if (system_text) |sys|
-                    @as([]const anthropic_types.TextBlock, &.{.{ .text = sys }})
-                else
-                    null;
-
-                const tools = if (config.tools) |t| try mapAnthropicTools(req_alloc, t) else null;
+                const system_text = try extractSystemText(ra, messages);
+                const ant_messages = try messagesToAnthropicMessages(ra, messages);
                 const reasoning = mapEffortToAnthropic(config.effort, config.max_tokens orelse 4096);
-
-                var response = try a.createMessage(model, ant_messages, reasoning.max_tokens, .{
-                    .system = system_blocks,
+                // Anthropic has no native JSON mode; response_format is ignored.
+                const opts: anthropic_mod.MessageConfig = .{
+                    .system = if (system_text) |sys| try ra.dupe(anthropic_types.TextBlock, &.{.{ .text = sys }}) else null,
                     .stop_sequences = config.stop,
-                    .tools = tools,
+                    .tools = if (config.tools) |t| try mapAnthropicTools(ra, t) else null,
                     .tool_choice = mapToolChoiceToAnthropic(config.tool_choice),
                     .thinking = reasoning.thinking,
                     .output_config = reasoning.output_config,
-                    // Anthropic has no native JSON mode; response_format is ignored.
-                });
-                defer response.deinit();
-
-                return anthropicResult(a.allocator, response.value);
+                };
+                const hook = on_text orelse {
+                    var response = try a.createMessage(model, ant_messages, reasoning.max_tokens, opts);
+                    defer response.deinit();
+                    return anthropicResult(a.allocator, response.value);
+                };
+                var acc = anthropic_mod.StreamAccumulator.init(ra, hook.context, hook.onText);
+                a.createMessageStream(model, ant_messages, reasoning.max_tokens, opts, &acc, anthropic_mod.StreamAccumulator.onEvent) catch |err| return streamFailed(err);
+                if (acc.err) |e| return e;
+                return anthropicResult(a.allocator, try acc.response());
             },
         }
+    }
+
+    /// The OpenAI client behind an OpenAI-family tag.
+    fn openAiClient(self: Client) *openai_mod {
+        return switch (self) {
+            .anthropic, .gemini, .vertex, .codex => unreachable,
+            inline else => |o| o,
+        };
     }
 
     /// Anthropic caches only behind explicit breakpoints, which each gateway
@@ -828,246 +784,6 @@ pub const Client = union(enum) {
         };
     }
 
-    fn StreamAdapter(
-        comptime CtxT: type,
-        comptime ResponseT: type,
-        comptime mapFinish: fn (ResponseT) FinishReason,
-        comptime mapUsage: fn (ResponseT) Usage,
-    ) type {
-        return struct {
-            user_ctx: CtxT,
-            user_cb: *const fn (CtxT, GenerateResult) void,
-            alloc: std.mem.Allocator,
-
-            fn wrap(ctx: @This(), response: ResponseT) void {
-                var result = GenerateResult.init(ctx.alloc);
-                defer result.deinit();
-                result.text = response.text();
-                result.finish_reason = mapFinish(response);
-                result.usage = mapUsage(response);
-                ctx.user_cb(ctx.user_ctx, result);
-            }
-        };
-    }
-
-    /// Stream generated content from a list of messages.
-    pub fn generateContentStream(
-        self: Client,
-        model: []const u8,
-        messages: []const Message,
-        config_in: GenerationConfig,
-        context: anytype,
-        callback: *const fn (@TypeOf(context), GenerateResult) void,
-    ) StreamError!void {
-        const config = flooredConfig(config_in);
-        // Ollama's native chat is non-streaming; codex reuses this one-shot
-        // fallback since the agent drives it via generateContentStreamAccumulate.
-        if (self == .ollama or self == .codex) {
-            var result = self.generateContent(model, messages, config) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.ApiError,
-            };
-            defer result.deinit();
-            callback(context, result);
-            return;
-        }
-
-        var req_arena = std.heap.ArenaAllocator.init(self.clientAllocator());
-        defer req_arena.deinit();
-        const req_alloc = req_arena.allocator();
-
-        switch (self) {
-            .gemini, .vertex => |g| {
-                const separated = separateSystemMessages(req_alloc, messages) catch return error.OutOfMemory;
-                const contents = separated.contents;
-                const sys_instruction: ?gemini_types.Content = if (separated.system_text) |sys|
-                    gemini_types.Content{ .parts = @as([]const gemini_types.Part, &.{.{ .text = sys }}) }
-                else
-                    null;
-
-                const tools = if (config.tools) |t| mapGeminiTools(req_alloc, t) catch return error.OutOfMemory else null;
-
-                const Adapter = StreamAdapter(@TypeOf(context), gemini_types.GenerateContentResponse, mapGeminiFinishReason, mapGeminiUsage);
-                try g.generateContentStream(model, contents, mapGeminiGenerationConfig(model, config), .{
-                    .systemInstruction = sys_instruction,
-                    .tools = tools,
-                    .toolConfig = mapToolChoiceToGemini(config.tool_choice),
-                }, Adapter{ .user_ctx = context, .user_cb = callback, .alloc = g.allocator }, &Adapter.wrap);
-            },
-            .openai, .huggingface, .llama_cpp, .llmd, .openai_compatible, .vercel, .mistral, .openrouter, .xai => |o| {
-                const oai_messages = messagesToOpenAIMessages(req_alloc, messages) catch return error.OutOfMemory;
-                const tools = if (config.tools) |t| mapOpenAITools(req_alloc, t) catch return error.OutOfMemory else null;
-
-                const Adapter = StreamAdapter(@TypeOf(context), openai_types.ChatCompletionResponse, mapOpenAIFinishReason, mapOpenAIUsage);
-                try o.chatCompletionStream(model, oai_messages, self.openAiCompletionConfig(model, config, tools), Adapter{ .user_ctx = context, .user_cb = callback, .alloc = o.allocator }, &Adapter.wrap);
-            },
-            // Handled by the early return above, before the arena is created.
-            .ollama, .codex => unreachable,
-            .anthropic => |a| {
-                const system_text = extractSystemText(req_alloc, messages) catch return error.OutOfMemory;
-                const ant_messages = messagesToAnthropicMessages(req_alloc, messages) catch return error.OutOfMemory;
-
-                const system_blocks: ?[]const anthropic_types.TextBlock = if (system_text) |sys|
-                    @as([]const anthropic_types.TextBlock, &.{.{ .text = sys }})
-                else
-                    null;
-
-                const tools = if (config.tools) |t| mapAnthropicTools(req_alloc, t) catch return error.OutOfMemory else null;
-                const reasoning = mapEffortToAnthropic(config.effort, config.max_tokens orelse 4096);
-
-                const Ctx = struct {
-                    user_ctx: @TypeOf(context),
-                    user_cb: *const fn (@TypeOf(context), GenerateResult) void,
-                    alloc: std.mem.Allocator,
-
-                    fn wrap(ctx: @This(), event: anthropic_types.StreamEvent) void {
-                        const text_content = if (event.delta) |delta| delta.text else null;
-                        var result = GenerateResult.init(ctx.alloc);
-                        defer result.deinit();
-                        result.text = text_content;
-                        if (event.delta) |delta| {
-                            if (delta.stop_reason) |reason| {
-                                result.finish_reason = mapAnthropicStopReason(reason);
-                            }
-                        }
-                        result.usage = convertAnthropicUsage(event.usage);
-                        ctx.user_cb(ctx.user_ctx, result);
-                    }
-                };
-
-                try a.createMessageStream(model, ant_messages, reasoning.max_tokens, .{
-                    .system = system_blocks,
-                    .stop_sequences = config.stop,
-                    .tools = tools,
-                    .tool_choice = mapToolChoiceToAnthropic(config.tool_choice),
-                    .thinking = reasoning.thinking,
-                    .output_config = reasoning.output_config,
-                    // Anthropic has no native JSON mode; response_format is ignored.
-                }, Ctx{ .user_ctx = context, .user_cb = callback, .alloc = a.allocator }, &Ctx.wrap);
-            },
-        }
-    }
-
-    /// Streaming counterpart of `generateContent`: reassembles the full
-    /// response — text and tool-use blocks — into a buffered `GenerateResult`
-    /// while forwarding each text delta to `on_text` as it arrives. Used by
-    /// `runTools` when a `TextDeltaHook` is configured. The returned struct is
-    /// shape-identical to `generateContent`'s, so the tool loop is unaffected.
-    fn generateContentStreamAccumulate(
-        self: Client,
-        model: []const u8,
-        messages: []const Message,
-        config_in: GenerationConfig,
-        on_text: TextDeltaHook,
-    ) Error!GenerateResult {
-        const config = flooredConfig(config_in);
-        var req_arena = std.heap.ArenaAllocator.init(self.clientAllocator());
-        defer req_arena.deinit();
-        const req_alloc = req_arena.allocator();
-
-        switch (self) {
-            .anthropic => |a| {
-                const system_text = try extractSystemText(req_alloc, messages);
-                const ant_messages = try messagesToAnthropicMessages(req_alloc, messages);
-                const system_blocks: ?[]const anthropic_types.TextBlock = if (system_text) |sys|
-                    @as([]const anthropic_types.TextBlock, &.{.{ .text = sys }})
-                else
-                    null;
-                const tools = if (config.tools) |t| try mapAnthropicTools(req_alloc, t) else null;
-                const reasoning = mapEffortToAnthropic(config.effort, config.max_tokens orelse 4096);
-
-                var acc = anthropic_mod.StreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
-                a.createMessageStream(model, ant_messages, reasoning.max_tokens, .{
-                    .system = system_blocks,
-                    .stop_sequences = config.stop,
-                    .tools = tools,
-                    .tool_choice = mapToolChoiceToAnthropic(config.tool_choice),
-                    .thinking = reasoning.thinking,
-                    .output_config = reasoning.output_config,
-                }, &acc, anthropic_mod.StreamAccumulator.onEvent) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.ApiError,
-                };
-                if (acc.err) |e| return e;
-                return anthropicResult(a.allocator, try acc.response());
-            },
-            .huggingface, .openai_compatible, .llama_cpp, .llmd, .vercel, .mistral, .openrouter => |o| {
-                const oai_messages = try messagesToOpenAIMessages(req_alloc, messages);
-                const tools = if (config.tools) |t| try mapOpenAITools(req_alloc, t) else null;
-
-                var acc = openai_mod.StreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
-                o.chatCompletionStream(model, oai_messages, self.openAiCompletionConfig(model, config, tools), &acc, openai_mod.StreamAccumulator.onEvent) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.ApiError,
-                };
-                if (acc.err) |e| return e;
-                return openAiChatResult(o.allocator, try acc.response());
-            },
-            .gemini, .vertex => |g| {
-                const separated = try separateSystemMessages(req_alloc, messages);
-                const contents = separated.contents;
-                const sys_instruction: ?gemini_types.Content = if (separated.system_text) |sys|
-                    gemini_types.Content{ .parts = @as([]const gemini_types.Part, &.{.{ .text = sys }}) }
-                else
-                    null;
-                const tools = if (config.tools) |t| try mapGeminiTools(req_alloc, t) else null;
-
-                var acc = gemini_mod.StreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
-                g.generateContentStream(model, contents, mapGeminiGenerationConfig(model, config), .{
-                    .systemInstruction = sys_instruction,
-                    .tools = tools,
-                    .toolConfig = mapToolChoiceToGemini(config.tool_choice),
-                }, &acc, gemini_mod.StreamAccumulator.onEvent) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.ApiError,
-                };
-                if (acc.err) |e| return e;
-                return geminiResult(g.allocator, try acc.response());
-            },
-            // Native OpenAI streams via the Responses API: Chat Completions 400s
-            // on function tools + reasoning for the gpt-5 family, and the buffered
-            // path already uses Responses, so streaming stays consistent with it.
-            .openai, .xai => |o| {
-                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, "system", self, model);
-                const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
-
-                var acc = openai_mod.ResponsesStreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
-                o.createResponseStream(self.responsesRequest(model, input, tools, config), &acc, openai_mod.ResponsesStreamAccumulator.onEvent) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.ApiError,
-                };
-                if (acc.err) |e| return e;
-                return openAiResponsesResult(o.allocator, try acc.response(), self, model);
-            },
-            .codex => |c| {
-                const input = try messagesToOpenAIResponsesInput(req_alloc, messages, codex_system_role, self, model);
-                const tools = if (config.tools) |t| try mapOpenAIResponsesTools(req_alloc, t) else null;
-
-                var acc = openai_mod.ResponsesStreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
-                c.createResponseStream(codexRequest(model, input, tools, config), &acc, openai_mod.ResponsesStreamAccumulator.onEvent) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.ApiError,
-                };
-                if (acc.err) |e| return e;
-                return openAiResponsesResult(c.allocator, try acc.response(), self, model);
-            },
-            // Native `/api/chat` streaming (NDJSON) keeps the `num_ctx` sizing
-            // that the OpenAI-compatible `/v1` shim (used by the other local
-            // arms) lacks — it defaults to 4096 and silently truncates.
-            .ollama => |o| {
-                const call = try mapOllamaCall(req_alloc, messages, config);
-
-                var acc = ollama_native.StreamAccumulator.init(req_alloc, on_text.context, on_text.onText);
-                ollama_native.chatStream(o, model, call.messages, call.tools, call.think, call.format, call.options, &acc, ollama_native.StreamAccumulator.onChunk) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.ApiError,
-                };
-                if (acc.err) |e| return e;
-                return ollamaResult(o.allocator, acc.response());
-            },
-        }
-    }
-
     /// Generate an embedding for a text string.
     pub fn embed(
         self: Client,
@@ -1099,9 +815,7 @@ pub const Client = union(enum) {
                 }
                 return result;
             },
-            .anthropic, .codex => {
-                return error.ApiError;
-            },
+            .anthropic, .codex => return error.UnsupportedByBackend,
         }
     }
 
@@ -1265,7 +979,7 @@ pub const Client = union(enum) {
                 .effort = config.effort,
             };
             var gen_result = if (config.stream) |hook|
-                try self.generateContentStreamAccumulate(model, messages.items, gen_config, hook)
+                try self.generateContentStream(model, messages.items, gen_config, hook)
             else
                 try self.generateContent(model, messages.items, gen_config);
             defer gen_result.deinit();
@@ -1374,37 +1088,60 @@ pub const Client = union(enum) {
 /// Provider tag used in switches and helper APIs.
 pub const Tag = std.meta.Tag(Client);
 
-/// Config for the OpenAI-compatible providers, which share the `*openai_mod`
-/// client and differ only in these fields. `openAiPreset` returns null for the
-/// ones with bespoke config (native openai, anthropic, gemini).
-const OpenAiPreset = struct {
-    base_url: [:0]const u8,
-    /// Env var holding the key; null for keyless local servers.
+/// What differs per provider beyond its wire format, in one place.
+pub const Info = struct {
+    /// Default base URL; null when the client has its own default, or (for
+    /// `.openai_compatible`) when it comes from OPENAI_BASE_URL.
+    base_url: ?[:0]const u8 = null,
+    /// Env var holding the key, for the providers whose lookup is just that.
     env_var: ?[:0]const u8 = null,
     /// Placeholder key for keyless local servers, so the client's key check passes.
     placeholder_key: ?[:0]const u8 = null,
+    /// What `envVarName` reports when it isn't `env_var`.
+    key_hint: ?[]const u8 = null,
+    /// Recommended chat model; empty when the server decides (local servers).
     default_model: []const u8,
+    /// Effort to use unless the caller picks one; null defers to the caller.
+    default_effort: ?Effort = null,
     /// Local server: loopback-aware list retry, and excluded from auto-detection.
     local: bool = false,
 };
 
-fn openAiPreset(tag: Tag) ?OpenAiPreset {
+pub fn info(tag: Tag) Info {
     return switch (tag) {
+        .anthropic => .{ .env_var = "ANTHROPIC_API_KEY", .default_model = "claude-sonnet-5-5" },
+        .gemini => .{ .key_hint = "GOOGLE_API_KEY/GEMINI_API_KEY", .default_model = "gemini-3.8-flash" },
+        .vertex => .{ .key_hint = "VERTEX_API_KEY/GOOGLE_API_KEY", .default_model = "gemini-3.8-flash" },
+        .openai => .{ .key_hint = "OPENAI_API_KEY", .default_model = "gpt-6-luna" },
+        .codex => .{ .key_hint = "a ChatGPT subscription (OAuth)", .default_model = "gpt-5.5" },
         .ollama => .{ .base_url = "http://localhost:11434/v1", .placeholder_key = "ollama", .default_model = "qwen3.5:latest", .local = true },
         .huggingface => .{ .base_url = "https://router.huggingface.co/v1", .env_var = "HF_TOKEN", .default_model = "Qwen/Qwen3.5-122B-A10B" },
-        // No static preset: the base URL comes from OPENAI_BASE_URL.
-        .openai_compatible => null,
-        // Empty default: the served model is whatever `llama-server` loaded.
+        // The base URL comes from OPENAI_BASE_URL; the model from the server.
+        .openai_compatible => .{ .key_hint = "OPENAI_API_KEY", .default_model = "" },
+        // The served model is whatever `llama-server` loaded.
         .llama_cpp => .{ .base_url = "http://localhost:8080/v1", .placeholder_key = "llama.cpp", .default_model = "", .local = true },
-        // ZML's LLMD; same as llama.cpp, the served model is whatever `--model` loaded.
+        // ZML's LLMD; the served model is whatever `--model` loaded.
         .llmd => .{ .base_url = "http://localhost:8000/v1", .placeholder_key = "llmd", .default_model = "", .local = true },
         .vercel => .{ .base_url = "https://ai-gateway.vercel.sh/v1", .env_var = "AI_GATEWAY_API_KEY", .default_model = "openai/gpt-5.5" },
-        .mistral => .{ .base_url = "https://api.mistral.ai/v1", .env_var = "MISTRAL_API_KEY", .default_model = "mistral-medium-3.5" },
+        // `.null`: codestral and ministral reject any `reasoning_effort`.
+        .mistral => .{ .base_url = "https://api.mistral.ai/v1", .env_var = "MISTRAL_API_KEY", .default_model = "mistral-medium-3.5", .default_effort = .null },
         .openrouter => .{ .base_url = "https://openrouter.ai/api/v1", .env_var = "OPENROUTER_API_KEY", .default_model = "openai/gpt-5.5" },
         .xai => .{ .base_url = "https://api.x.ai/v1", .env_var = "XAI_API_KEY", .default_model = "grok-4.7" },
-        .anthropic, .gemini, .vertex, .openai, .codex => null,
     };
 }
+
+/// Keyless servers on this machine, in enum order.
+pub const local_providers: []const Tag = blk: {
+    const all = std.enums.values(Tag);
+    var arr: [all.len]Tag = undefined;
+    var n: usize = 0;
+    for (all) |t| if (info(t).local) {
+        arr[n] = t;
+        n += 1;
+    };
+    const out = arr[0..n].*;
+    break :blk &out;
+};
 
 /// Look up the API key for `tag` from the conventional env var(s). Keyless local
 /// servers return a placeholder so OpenAI-shaped clients clear their key check.
@@ -1417,12 +1154,7 @@ pub fn useVertex(environ: std.process.Environ) bool {
 }
 
 pub fn envApiKey(environ: std.process.Environ, tag: Tag) ?[:0]const u8 {
-    if (openAiPreset(tag)) |p| {
-        if (p.env_var) |v| return envGet(environ, v);
-        return p.placeholder_key;
-    }
     return switch (tag) {
-        .anthropic => envGet(environ, "ANTHROPIC_API_KEY"),
         // OPENAI_BASE_URL gates OPENAI_API_KEY between `.openai` and
         // `.openai_compatible` so exactly one of them can ever detect it,
         // mirroring the `.gemini`/`.vertex` split on GOOGLE_API_KEY.
@@ -1450,50 +1182,34 @@ pub fn envApiKey(environ: std.process.Environ, tag: Tag) ?[:0]const u8 {
         // Codex authenticates with an OAuth subscription token supplied by the
         // caller, not an env var — never env-detected.
         .codex => null,
-        else => unreachable,
+        else => {
+            const i = info(tag);
+            return if (i.env_var) |v| envGet(environ, v) else i.placeholder_key;
+        },
     };
 }
 
 /// Human-readable env var name(s) read by `envApiKey`, for diagnostics. Gemini
-/// joins its two names with `/`; keyless local servers have none.
+/// joins its two names with `/`; keyless local servers give their tag name.
 pub fn envVarName(tag: Tag) []const u8 {
-    if (openAiPreset(tag)) |p| return p.env_var orelse @tagName(tag);
-    return switch (tag) {
-        .anthropic => "ANTHROPIC_API_KEY",
-        .openai => "OPENAI_API_KEY",
-        .gemini => "GOOGLE_API_KEY/GEMINI_API_KEY",
-        .vertex => "VERTEX_API_KEY/GOOGLE_API_KEY",
-        .openai_compatible => "OPENAI_API_KEY",
-        .codex => "a ChatGPT subscription (OAuth)",
-        else => unreachable,
-    };
+    const i = info(tag);
+    if (i.key_hint) |h| return h;
+    return i.env_var orelse @tagName(tag);
 }
 
-pub const ollama_default_base_url = openAiPreset(.ollama).?.base_url;
-pub const huggingface_default_base_url = openAiPreset(.huggingface).?.base_url;
-pub const llama_cpp_default_base_url = openAiPreset(.llama_cpp).?.base_url;
-pub const llmd_default_base_url = openAiPreset(.llmd).?.base_url;
+/// The provider's default base URL, if it has one of its own.
+pub fn defaultBaseUrl(tag: Tag) ?[:0]const u8 {
+    return info(tag).base_url;
+}
 
 /// Recommended default chat model for `tag` when the user hasn't picked one.
 pub fn defaultModel(tag: Tag) []const u8 {
-    if (openAiPreset(tag)) |p| return p.default_model;
-    return switch (tag) {
-        .anthropic => "claude-sonnet-5-5",
-        .openai => "gpt-6-luna",
-        .codex => "gpt-5.5",
-        .gemini, .vertex => "gemini-3.8-flash",
-        .openai_compatible => "",
-        else => unreachable,
-    };
+    return info(tag).default_model;
 }
 
 /// Default effort for `tag`, or null to defer to the caller's own default.
-/// `.null` for Mistral: codestral and ministral reject any `reasoning_effort`.
 pub fn defaultEffort(tag: Tag) ?Effort {
-    return switch (tag) {
-        .mistral => .null,
-        else => null,
-    };
+    return info(tag).default_effort;
 }
 
 /// A provider whose key was found in the environment (`detectKeys`) or served
@@ -1511,7 +1227,7 @@ pub const default_candidates: []const Tag = blk: {
     var n: usize = 0;
     for (all) |t| {
         // openai_compatible is included; envApiKey gates it on OPENAI_BASE_URL.
-        if (openAiPreset(t)) |p| if (p.local) continue;
+        if (info(t).local) continue;
         arr[n] = t;
         n += 1;
     }
@@ -1606,9 +1322,10 @@ pub fn listChatModelIds(
 
     // Preset catalogs don't follow isChatModel's naming, so none filters. A
     // not-running loopback server refuses instantly — disable retry there.
-    if (openAiPreset(tag)) |p| {
-        const url = options.base_url orelse p.base_url;
-        const policy: retry.RetryPolicy = if (p.local and isLoopbackUrl(url)) .disabled else .{};
+    const i = info(tag);
+    if (i.base_url) |preset_url| {
+        const url = options.base_url orelse preset_url;
+        const policy: retry.RetryPolicy = if (i.local and isLoopbackUrl(url)) .disabled else .{};
         try listOpenAICompatibleModelIds(io, allocator, arena, &ids, api_key, url, policy);
     } else switch (tag) {
         .openai_compatible => {
@@ -1687,7 +1404,7 @@ test "envApiKey: ollama returns placeholder regardless of env" {
 }
 
 test "isLoopbackUrl: loopback hosts disable retry, remote hosts keep it" {
-    try std.testing.expect(isLoopbackUrl(ollama_default_base_url));
+    try std.testing.expect(isLoopbackUrl(defaultBaseUrl(.ollama).?));
     try std.testing.expect(isLoopbackUrl("http://127.0.0.1:11434/v1"));
     try std.testing.expect(isLoopbackUrl("http://[::1]:11434/v1"));
     try std.testing.expect(!isLoopbackUrl("http://ollama.example.com:11434/v1"));
@@ -1696,7 +1413,7 @@ test "isLoopbackUrl: loopback hosts disable retry, remote hosts keep it" {
 }
 
 test "vertex: gemini-backed, no OpenAI preset, gated auto-detection" {
-    try std.testing.expect(openAiPreset(.vertex) == null);
+    try std.testing.expect(defaultBaseUrl(.vertex) == null);
     try std.testing.expectEqualStrings(defaultModel(.gemini), defaultModel(.vertex));
     try std.testing.expect(envVarName(.vertex).len > 0);
     // Candidacy is runtime-gated by GOOGLE_GENAI_USE_VERTEXAI (useVertex),
@@ -1721,7 +1438,7 @@ test "huggingface: reads HF_TOKEN and has sensible defaults" {
 
 test "llama_cpp: placeholder key, loopback default, excluded from auto-detect" {
     try std.testing.expectEqualStrings("llama.cpp", envApiKey(.empty, .llama_cpp).?);
-    try std.testing.expect(isLoopbackUrl(llama_cpp_default_base_url));
+    try std.testing.expect(isLoopbackUrl(defaultBaseUrl(.llama_cpp).?));
     // Placeholder key, so it must be live-probed — never env-auto-detected.
     for (default_candidates) |t| {
         try std.testing.expect(t != .llama_cpp);
@@ -1730,22 +1447,23 @@ test "llama_cpp: placeholder key, loopback default, excluded from auto-detect" {
 
 test "llmd: placeholder key, loopback default, excluded from auto-detect" {
     try std.testing.expectEqualStrings("llmd", envApiKey(.empty, .llmd).?);
-    try std.testing.expect(isLoopbackUrl(llmd_default_base_url));
+    try std.testing.expect(isLoopbackUrl(defaultBaseUrl(.llmd).?));
     for (default_candidates) |t| try std.testing.expect(t != .llmd);
 }
 
 test "cloud gateway presets: real key, default model, auto-detectable" {
     for ([_]Tag{ .vercel, .mistral, .openrouter, .xai }) |tag| {
-        try std.testing.expect(openAiPreset(tag).?.env_var != null);
+        try std.testing.expect(info(tag).env_var != null);
         try std.testing.expect(defaultModel(tag).len > 0);
         // Real keys, so they join env auto-detection; the keyless local servers don't.
         try std.testing.expect(std.mem.findScalar(Tag, default_candidates, tag) != null);
     }
-    for (default_candidates) |t| try std.testing.expect(t != .ollama and t != .llama_cpp and t != .llmd);
+    for (default_candidates) |t| try std.testing.expect(!info(t).local);
+    try std.testing.expectEqualSlices(Tag, &.{ .ollama, .llama_cpp, .llmd }, local_providers);
 }
 
 test "openai_compatible: no static preset, env-gated key detection" {
-    try std.testing.expect(openAiPreset(.openai_compatible) == null);
+    try std.testing.expect(defaultBaseUrl(.openai_compatible) == null);
     // Without OPENAI_BASE_URL the key must not be detected — that's `.openai`.
     try std.testing.expect(envApiKey(.empty, .openai_compatible) == null);
 }
@@ -2000,29 +1718,11 @@ fn separateSystemMessages(allocator: std.mem.Allocator, messages: []const Messag
 
         if (msg.tool_results) |results| {
             for (results) |res| {
-                var response_val: ?std.json.Value = null;
-                if (res.content.len > 0) {
-                    const parsed = std.json.parseFromSlice(std.json.Value, allocator, res.content, .{}) catch null;
-                    if (parsed) |p| {
-                        // Gemini requires response to be a JSON object (Struct)
-                        if (p.value == .object) {
-                            response_val = p.value;
-                        } else {
-                            var obj: std.json.ObjectMap = .empty;
-                            try obj.put(allocator, "result", p.value);
-                            response_val = std.json.Value{ .object = obj };
-                        }
-                    } else {
-                        var obj: std.json.ObjectMap = .empty;
-                        try obj.put(allocator, "result", std.json.Value{ .string = res.content });
-                        response_val = std.json.Value{ .object = obj };
-                    }
-                }
                 try parts.append(allocator, .{
                     .functionResponse = .{
                         .id = res.id,
                         .name = res.name,
-                        .response = response_val,
+                        .response = if (res.content.len > 0) try gemini_types.ResponseBody.fromToolOutput(allocator, res.content) else null,
                     },
                     .thoughtSignature = res.thought_signature,
                 });
@@ -2309,6 +2009,12 @@ fn mapOpenAITools(allocator: std.mem.Allocator, tools: []const Tool) ![]openai_t
 const codex_system_role = "developer";
 
 fn noopOnText(_: *anyopaque, _: []const u8) void {}
+
+/// A backend stream error, collapsed into `Client.Error`; the detail is in
+/// the backend's `last_error`.
+fn streamFailed(err: anyerror) Client.Error {
+    return if (err == error.OutOfMemory) error.OutOfMemory else error.ApiError;
+}
 
 /// Build the Codex Responses request from already-mapped input/tools. Codex
 /// requires `store=false` on the stateless backend and echoes encrypted
@@ -2687,6 +2393,32 @@ fn mapOllamaCall(allocator: std.mem.Allocator, messages: []const Message, config
     };
 }
 
+/// Collects a response's tool calls, copied into the result arena `ra`.
+const ToolCalls = struct {
+    ra: std.mem.Allocator,
+    list: std.ArrayList(ToolCall) = .empty,
+
+    /// Arguments arrive parsed (most APIs) or as a JSON string (OpenAI);
+    /// a string that fails to parse becomes null.
+    const Args = union(enum) { value: ?std.json.Value, text: ?[]const u8 };
+
+    fn add(self: *ToolCalls, id: ?[]const u8, name: ?[]const u8, args: Args, thought_signature: ?[]const u8) error{OutOfMemory}!void {
+        try self.list.append(self.ra, .{
+            .id = if (id) |v| try self.ra.dupe(u8, v) else "",
+            .name = if (name) |v| try self.ra.dupe(u8, v) else "",
+            .arguments = switch (args) {
+                .value => |v| if (v) |val| try json.dupeValue(self.ra, val) else null,
+                .text => |t| if (t) |a| std.json.parseFromSliceLeaky(std.json.Value, self.ra, a, .{}) catch null else null,
+            },
+            .thought_signature = if (thought_signature) |v| try self.ra.dupe(u8, v) else null,
+        });
+    }
+
+    fn slice(self: *ToolCalls) error{OutOfMemory}!?[]const ToolCall {
+        return if (self.list.items.len == 0) null else try self.list.toOwnedSlice(self.ra);
+    }
+};
+
 /// Map a native `/api/chat` `ChatResponse` (buffered or stream-reassembled) into
 /// the unified `GenerateResult`. Shared by the buffered and streaming arms.
 fn ollamaResult(alloc: std.mem.Allocator, response: ollama_native.ChatResponse) Client.Error!GenerateResult {
@@ -2702,19 +2434,12 @@ fn ollamaResult(alloc: std.mem.Allocator, response: ollama_native.ChatResponse) 
             if (c.len > 0) result.text = try ra.dupe(u8, c);
         }
         if (msg.tool_calls) |calls| {
-            var tool_calls: std.ArrayList(ToolCall) = .empty;
+            var tool_calls: ToolCalls = .{ .ra = ra };
             for (calls) |call| {
-                if (call.function) |f| {
-                    try tool_calls.append(ra, .{
-                        .id = if (call.id) |id| try ra.dupe(u8, id) else "",
-                        .name = if (f.name) |n| try ra.dupe(u8, n) else "",
-                        .arguments = if (f.arguments) |v| try json.dupeValue(ra, v) else null,
-                    });
-                }
+                const f = call.function orelse continue;
+                try tool_calls.add(call.id, f.name, .{ .value = f.arguments }, null);
             }
-            if (tool_calls.items.len > 0) {
-                result.tool_calls = try tool_calls.toOwnedSlice(ra);
-            }
+            result.tool_calls = try tool_calls.slice();
         }
     }
     return result;
@@ -2732,17 +2457,12 @@ fn geminiResult(alloc: std.mem.Allocator, response: gemini_types.GenerateContent
     if (response.candidates) |candidates| {
         if (candidates.len > 0) {
             if (candidates[0].content) |content| {
-                var tool_calls: std.ArrayList(ToolCall) = .empty;
+                var tool_calls: ToolCalls = .{ .ra = ra };
                 for (content.parts) |p| {
                     const fc = p.functionCall orelse continue;
-                    try tool_calls.append(ra, .{
-                        .id = if (fc.id) |id| try ra.dupe(u8, id) else "",
-                        .name = if (fc.name) |n| try ra.dupe(u8, n) else "",
-                        .arguments = if (fc.args) |v| try json.dupeValue(ra, v) else null,
-                        .thought_signature = if (p.thoughtSignature) |ts| try ra.dupe(u8, ts) else null,
-                    });
+                    try tool_calls.add(fc.id, fc.name, .{ .value = fc.args }, p.thoughtSignature);
                 }
-                if (tool_calls.items.len > 0) result.tool_calls = try tool_calls.toOwnedSlice(ra);
+                result.tool_calls = try tool_calls.slice();
             }
         }
     }
@@ -2760,17 +2480,13 @@ fn anthropicResult(alloc: std.mem.Allocator, response: anthropic_types.MessageRe
     result.finish_reason = mapAnthropicFinishReason(response);
     result.usage = mapAnthropicUsage(response);
     if (response.content) |blocks| {
-        var tool_calls: std.ArrayList(ToolCall) = .empty;
+        var tool_calls: ToolCalls = .{ .ra = ra };
         for (blocks) |block| {
             const t = block.type orelse continue;
             if (!std.mem.eql(u8, t, "tool_use")) continue;
-            try tool_calls.append(ra, .{
-                .id = if (block.id) |id| try ra.dupe(u8, id) else "",
-                .name = if (block.name) |n| try ra.dupe(u8, n) else "",
-                .arguments = if (block.input) |v| try json.dupeValue(ra, v) else null,
-            });
+            try tool_calls.add(block.id, block.name, .{ .value = block.input }, null);
         }
-        if (tool_calls.items.len > 0) result.tool_calls = try tool_calls.toOwnedSlice(ra);
+        result.tool_calls = try tool_calls.slice();
     }
     return result;
 }
@@ -2794,21 +2510,12 @@ fn openAiChatResult(alloc: std.mem.Allocator, response: openai_types.ChatComplet
         const msg = choices[0].message orelse break :extract;
         const calls = msg.tool_calls orelse break :extract;
 
-        var tool_calls: std.ArrayList(ToolCall) = .empty;
+        var tool_calls: ToolCalls = .{ .ra = ga };
         for (calls) |call| {
             const f = call.function orelse continue;
-            // Chat Completions returns arguments as a JSON string.
-            const args_val: ?std.json.Value = if (f.arguments) |a|
-                (std.json.parseFromSliceLeaky(std.json.Value, ga, a, .{}) catch null)
-            else
-                null;
-            try tool_calls.append(ga, .{
-                .id = if (call.id) |id| try ga.dupe(u8, id) else "",
-                .name = if (f.name) |n| try ga.dupe(u8, n) else "",
-                .arguments = args_val,
-            });
+            try tool_calls.add(call.id, f.name, .{ .text = f.arguments }, null);
         }
-        if (tool_calls.items.len > 0) result.tool_calls = try tool_calls.toOwnedSlice(ga);
+        result.tool_calls = try tool_calls.slice();
     }
     return result;
 }
@@ -2826,7 +2533,7 @@ fn openAiResponsesResult(alloc: std.mem.Allocator, response: openai_types.Respon
     result.usage = mapOpenAIResponsesUsage(response);
 
     if (response.output) |items| {
-        var tool_calls: std.ArrayList(ToolCall) = .empty;
+        var tool_calls: ToolCalls = .{ .ra = ga };
         var reasoning: std.ArrayList(ReasoningItem) = .empty;
         for (items) |item| {
             const item_type = item.type orelse continue;
@@ -2847,17 +2554,9 @@ fn openAiResponsesResult(alloc: std.mem.Allocator, response: openai_types.Respon
                 continue;
             }
             if (!std.mem.eql(u8, item_type, "function_call")) continue;
-            const args_val: ?std.json.Value = if (item.arguments) |a|
-                (std.json.parseFromSliceLeaky(std.json.Value, ga, a, .{}) catch null)
-            else
-                null;
-            try tool_calls.append(ga, .{
-                .id = if (item.call_id) |id| try ga.dupe(u8, id) else "",
-                .name = if (item.name) |n| try ga.dupe(u8, n) else "",
-                .arguments = args_val,
-            });
+            try tool_calls.add(item.call_id, item.name, .{ .text = item.arguments }, null);
         }
-        if (tool_calls.items.len > 0) result.tool_calls = try tool_calls.toOwnedSlice(ga);
+        result.tool_calls = try tool_calls.slice();
         if (reasoning.items.len > 0) result.reasoning = try reasoning.toOwnedSlice(ga);
     }
     return result;
@@ -3075,23 +2774,6 @@ test "GenerateResult deinit with no backing response" {
     result.text = "test";
     result.finish_reason = .stop;
     result.deinit(); // Should not crash
-}
-
-test "generateContentStream: generic body is analyzed for every backend" {
-    // The function is generic over `context`, so Zig only type-checks its
-    // body once something instantiates it. Nothing in the library did, which
-    // let broken optional captures ship (issue #14). Instantiate it behind a
-    // runtime-false guard so every provider prong is analyzed without doing
-    // a network call.
-    const Cb = struct {
-        fn onDelta(_: void, _: GenerateResult) void {}
-    };
-    var run = false;
-    _ = &run;
-    if (run) {
-        var client: Client = undefined;
-        try client.generateContentStream("model", &.{}, .{}, {}, &Cb.onDelta);
-    }
 }
 
 test "floorMaxTokens: a tight cap gets reasoning headroom, a generous one is left alone" {

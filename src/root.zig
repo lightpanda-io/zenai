@@ -1,13 +1,11 @@
 pub const gemini = struct {
     pub const Client = @import("gemini/Client.zig");
-    pub const Chat = @import("gemini/Chat.zig");
     pub const types = @import("gemini/types.zig");
     pub const decisions = @import("gemini/decisions.zig");
 };
 
 pub const openai = struct {
     pub const Client = @import("openai/Client.zig");
-    pub const Chat = @import("openai/Chat.zig");
     pub const types = @import("openai/types.zig");
     /// Native Ollama `/api/chat` (so `num_ctx` can be set).
     pub const ollama = @import("openai/ollama.zig");
@@ -15,7 +13,6 @@ pub const openai = struct {
 
 pub const anthropic = struct {
     pub const Client = @import("anthropic/Client.zig");
-    pub const Chat = @import("anthropic/Chat.zig");
     pub const types = @import("anthropic/types.zig");
 };
 
@@ -24,39 +21,6 @@ pub const anthropic = struct {
 pub const codex = struct {
     pub const Client = @import("codex/Client.zig");
 };
-
-/// Vertex AI uses the Gemini client with `InitOptions.vertex` set — express
-/// mode (API key) or project/location mode (OAuth access token from e.g.
-/// `gcloud auth print-access-token`).
-pub const vertex = gemini;
-
-/// Ollama uses the OpenAI-compatible API with a different default base URL.
-pub const ollama = openai;
-
-/// Hugging Face Inference uses the OpenAI-compatible Chat Completions API with a
-/// different default base URL — the serverless router, or a dedicated Inference
-/// Endpoint passed via `base_url`.
-pub const huggingface = openai;
-
-/// llama.cpp's `llama-server` uses the OpenAI-compatible Chat Completions API
-/// with a different default base URL (`http://localhost:8080/v1`).
-pub const llama_cpp = openai;
-
-/// ZML's LLMD inference server uses the OpenAI-compatible Chat Completions API
-/// with a different default base URL (`http://localhost:8000/v1`).
-pub const llmd = openai;
-
-/// Generic OpenAI-compatible Chat Completions API. Auto-detected when
-/// `OPENAI_BASE_URL` is set — use it for any server that speaks the OpenAI
-/// chat completions wire format (vLLM, LiteLLM, Together, Groq, etc.).
-pub const openai_compatible = openai;
-
-/// Vercel AI Gateway, Mistral, OpenRouter and xAI all use the
-/// OpenAI-compatible Chat Completions API with their own default base URLs.
-pub const vercel = openai;
-pub const mistral = openai;
-pub const openrouter = openai;
-pub const xai = openai;
 
 /// Search providers — separate namespace from the LLM clients above.
 /// Serper/Google CSE could land as siblings here.
@@ -88,18 +52,8 @@ pub const search = struct {
 pub const typesafe = struct {
     pub const Client = @import("typesafe/Client.zig");
     pub const types = @import("typesafe/types.zig");
-    /// Shorthands for building questions.
-    pub const Question = types.Question;
-    pub const Questions = types.Questions;
-    pub const QuestionEntry = types.QuestionEntry;
-    pub const ChoiceEntry = types.ChoiceCriteria.Entry;
-    pub const Content = types.Content;
-    pub const enumChoices = types.enumChoices;
-
     pub const env_var_name = Client.env_var_name;
-    pub const envApiKey = Client.envApiKey;
     pub const base_url_env_var_name = Client.base_url_env_var_name;
-    pub const envBaseUrl = Client.envBaseUrl;
 };
 
 /// Decision models, from whichever provider has a key: TypeSafe System One
@@ -134,6 +88,8 @@ pub const decisions = struct {
 };
 
 pub const provider = @import("provider.zig");
+/// Multi-turn conversation on `provider.Client`, for any backend.
+pub const Chat = @import("Chat.zig");
 pub const retry = @import("retry.zig");
 pub const json = @import("json.zig");
 pub const http = @import("http.zig");
