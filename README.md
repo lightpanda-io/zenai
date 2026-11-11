@@ -637,7 +637,7 @@ const verdict = try response.value.choiceEnum("verdict", questions, Verdict);
 
 ### Either provider: `zenai.decisions`
 
-Gemini's [Decisions API](#gemini) takes the same three question types. `zenai.decisions.Pool` asks whichever provider has a key, using the TypeSafe types above, and converts for Gemini (JSON content is sent as compact JSON text). It reads the environment on every ask, so exporting a key mid-run takes effect without a restart, and it keeps one warm client per concurrent caller:
+Gemini's [Decisions API](#gemini) takes the same three question types. `zenai.decisions.Pool` asks whichever provider has a key. Its questions and answers are its own provider-neutral types in `zenai.decisions.types`, shaped like the TypeSafe ones above (with the same `choices`, `levels`, `enumChoices`, `choice` and `choiceEnum` helpers), and `decisions.typesafe` and `decisions.gemini` convert them to and from each wire schema (Gemini gets JSON content as compact JSON text). It reads the environment on every ask, so exporting a key mid-run takes effect without a restart, and it keeps one warm client per concurrent caller:
 
 ```zig
 var pool: zenai.decisions.Pool = .init(io, allocator, environFn, .{
@@ -646,6 +646,9 @@ var pool: zenai.decisions.Pool = .init(io, allocator, environFn, .{
 });
 defer pool.deinit();
 
+const questions: zenai.decisions.Questions = .init(&.{
+    .{ .key = "is_complaint", .value = .noulText("Is the customer complaining?") },
+});
 var failure: zenai.http.ErrorDetail = .{};
 var response = try pool.ask(arena, .{ .text = "The pizza arrived cold." }, questions, .{}, &failure);
 defer response.deinit();

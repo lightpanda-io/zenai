@@ -1,10 +1,9 @@
-//! The provider-neutral questions and answers (TypeSafe's shapes, which are
-//! the superset) to and from Gemini's Decisions API. Gemini takes only strings
-//! where TypeSafe also takes JSON, so JSON content is sent as compact JSON
-//! text.
+//! The provider-neutral questions and answers to and from Gemini's Decisions
+//! API. Gemini takes only strings where the neutral types also take JSON, so
+//! JSON content is sent as compact JSON text.
 
 const std = @import("std");
-const types = @import("../typesafe/types.zig");
+const types = @import("types.zig");
 const gemini = @import("../gemini/decisions.zig");
 const http = @import("../http.zig");
 const jsonutil = @import("../json.zig");
@@ -64,18 +63,20 @@ fn optionalText(arena: std.mem.Allocator, content: ?Content) std.mem.Allocator.E
     return if (content) |c| try text(arena, c) else null;
 }
 
-pub const ToNeutralError = std.mem.Allocator.Error || error{InputBlocked};
+pub const FromGeminiError = std.mem.Allocator.Error || error{InputBlocked};
 
-/// Gemini's answers as an `AskResponse` that owns its own memory, so the Gemini
-/// response can be freed right away. A blocked input is `error.InputBlocked`,
-/// with the reason in `failure` (allocated in `arena`).
+/// Gemini's answers as a neutral `Response`, which takes over `wire`'s memory:
+/// on success `wire` must not be freed; on error it is still the caller's.
+/// `model` is the one asked, as Gemini does not echo it; it is copied. A
+/// blocked input is `error.InputBlocked`, with the reason in `failure`
+/// (allocated in `arena`).
 pub fn fromGemini(
-    allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
-    response: gemini.CreateDecisionResponse,
+    wire: *http.Response(gemini.CreateDecisionResponse),
     model: []const u8,
     failure: *http.ErrorDetail,
-) ToNeutralError!http.Response(types.AskResponse) {
+) FromGeminiError!types.Response {
+    const response = wire.value;
     if (response.prompt_feedback) |feedback| {
         if (feedback.block_reason) |reason| {
             failure.* = .{ .message = if (feedback.block_reason_message) |m|
@@ -86,56 +87,42 @@ pub fn fromGemini(
         }
     }
 
-    const owned = try allocator.create(std.heap.ArenaAllocator);
-    owned.* = .init(allocator);
-    errdefer {
-        owned.deinit();
-        allocator.destroy(owned);
-    }
-    const a = owned.allocator();
-
+    const a = wire.parsed.arena.allocator();
     var answers: std.ArrayList(types.Answers.Entry) = try .initCapacity(a, response.answers.count());
     for (response.answers.entries) |entry| {
         const answer: types.Answer = switch (entry.value) {
             .noul => |n| .{ .noul = .{ .noul = n.noul } },
             .choice => |c| .{ .choice = .{
-                .choice = try a.dupe(u8, c.choice),
-                .probabilities = try dupeProbabilities(a, c.probabilities),
+                .choice = c.choice,
+                .probabilities = c.probabilities,
                 .confidence = c.confidence,
             } },
             .score => |s| .{ .score = .{
                 .score = s.score,
-                .legend = try dupeLegend(a, s.legend),
-                .probabilities = try dupeProbabilities(a, s.probabilities),
+                .legend = try legend(a, s.legend),
+                .probabilities = s.probabilities,
                 .confidence = s.confidence,
             } },
             // An answer type the neutral shapes cannot hold reads as missing.
             .unknown => continue,
         };
-        answers.appendAssumeCapacity(.{ .key = try a.dupe(u8, entry.key), .value = answer });
+        answers.appendAssumeCapacity(.{ .key = entry.key, .value = answer });
     }
 
     const usage: gemini.Usage = response.usage orelse .{};
-    const value: types.AskResponse = .{
+    return types.adopt(wire, .{
         .model = try a.dupe(u8, model),
         .answers = .init(answers.items),
         .usage = .{
             .input_tokens = usage.total_input_tokens orelse 0,
             .output_tokens = usage.total_output_tokens orelse 0,
         },
-    };
-    return .{ .value = value, .json_buf = .init(allocator), .parsed = .{ .arena = owned, .value = value } };
+    });
 }
 
-fn dupeProbabilities(a: std.mem.Allocator, p: gemini.Probabilities) std.mem.Allocator.Error!types.Probabilities {
-    const out = try a.alloc(types.Probabilities.Entry, p.count());
-    for (p.entries, out) |entry, *o| o.* = .{ .key = try a.dupe(u8, entry.key), .value = entry.value };
-    return .init(out);
-}
-
-fn dupeLegend(a: std.mem.Allocator, legend: gemini.Legend) std.mem.Allocator.Error!types.Legend {
-    const out = try a.alloc(types.Legend.Entry, legend.count());
-    for (legend.entries, out) |entry, *o| o.* = .{ .key = try a.dupe(u8, entry.key), .value = .{ .text = try a.dupe(u8, entry.value) } };
+fn legend(a: std.mem.Allocator, wire: gemini.Legend) std.mem.Allocator.Error!types.Legend {
+    const out = try a.alloc(types.Legend.Entry, wire.count());
+    for (wire.entries, out) |entry, *o| o.* = .{ .key = entry.key, .value = .{ .text = entry.value } };
     return .init(out);
 }
 
@@ -173,19 +160,24 @@ test "toGemini sends JSON content as compact JSON text" {
     );
 }
 
-test "fromGemini copies the answers out of the Gemini response" {
+fn testWire(source: []const u8) !http.Response(gemini.CreateDecisionResponse) {
+    const parsed = try std.json.parseFromSlice(gemini.CreateDecisionResponse, std.testing.allocator, source, .{ .ignore_unknown_fields = true });
+    return .{ .value = parsed.value, .json_buf = .init(std.testing.allocator), .parsed = parsed };
+}
+
+test "fromGemini takes over the Gemini response" {
     var failure: http.ErrorDetail = .{};
-    var response = blk: {
-        const parsed = try std.json.parseFromSlice(gemini.CreateDecisionResponse, std.testing.allocator,
-            \\{"answers":{
-            \\  "blocked":{"type":"noul","noul":0.9,"confidence":0.9},
-            \\  "pick":{"type":"choice","choice":"1","probabilities":{"1":0.8,"none":0.2},"confidence":0.8},
-            \\  "level":{"type":"score","score":0.7,"legend":{"0":"low","1":"high"},"probabilities":{"0":0.3,"1":0.7},"confidence":0.7},
-            \\  "future":{"type":"ranking"}
-            \\},"usage":{"total_input_tokens":12,"total_output_tokens":0}}
-        , .{ .ignore_unknown_fields = true });
-        defer parsed.deinit();
-        break :blk try fromGemini(std.testing.allocator, std.testing.allocator, parsed.value, gemini.default_model, &failure);
+    var wire = try testWire(
+        \\{"answers":{
+        \\  "blocked":{"type":"noul","noul":0.9,"confidence":0.9},
+        \\  "pick":{"type":"choice","choice":"1","probabilities":{"1":0.8,"none":0.2},"confidence":0.8},
+        \\  "level":{"type":"score","score":0.7,"legend":{"0":"low","1":"high"},"probabilities":{"0":0.3,"1":0.7},"confidence":0.7},
+        \\  "future":{"type":"ranking"}
+        \\},"usage":{"total_input_tokens":12,"total_output_tokens":0}}
+    );
+    var response = fromGemini(std.testing.allocator, &wire, gemini.default_model, &failure) catch |err| {
+        wire.deinit();
+        return err;
     };
     defer response.deinit();
     const r = response.value;
@@ -204,9 +196,11 @@ test "fromGemini turns a blocked input into an error" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
 
+    var wire = try testWire(
+        \\{"answers":{},"prompt_feedback":{"block_reason":"safety","block_reason_message":"nope"}}
+    );
+    defer wire.deinit();
     var failure: http.ErrorDetail = .{};
-    try std.testing.expectError(error.InputBlocked, fromGemini(std.testing.allocator, arena_state.allocator(), .{
-        .prompt_feedback = .{ .block_reason = "safety", .block_reason_message = "nope" },
-    }, gemini.default_model, &failure));
+    try std.testing.expectError(error.InputBlocked, fromGemini(arena_state.allocator(), &wire, gemini.default_model, &failure));
     try std.testing.expectEqualStrings("safety: nope", failure.message.?);
 }

@@ -13,7 +13,7 @@
 //!       - `{question, levels}`           — a `score` over 2-10 levels
 
 const std = @import("std");
-const types = @import("../typesafe/types.zig");
+const types = @import("types.zig");
 
 const ChoiceEntry = types.ChoiceCriteria.Entry;
 const Content = types.Content;
@@ -267,7 +267,7 @@ fn prepareFromSource(arena: std.mem.Allocator, source: []const u8) PrepareError!
     });
 }
 
-test "typesafe.json: an array is one choice question" {
+test "decisions.json: an array is one choice question" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const prepared = try prepareFromSource(arena.allocator(),
@@ -280,7 +280,7 @@ test "typesafe.json: an array is one choice question" {
     try std.testing.expect(question.choice.criteria.has("product"));
 }
 
-test "typesafe.json: the category question asks what the caller worded" {
+test "decisions.json: the category question asks what the caller worded" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const prepared = try prepareQuestions(arena.allocator(), .{ .string =
@@ -292,14 +292,14 @@ test "typesafe.json: the category question asks what the caller worded" {
     );
 }
 
-test "typesafe.json: an empty array has no categories, an empty object no questions" {
+test "decisions.json: an empty array has no categories, an empty object no questions" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(error.EmptyQuestions, prepareFromSource(arena.allocator(), "[]"));
     try std.testing.expectError(error.EmptyObject, prepareFromSource(arena.allocator(), "{}"));
 }
 
-test "typesafe.json: the vocabulary names a question the request only keys" {
+test "decisions.json: the vocabulary names a question the request only keys" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const prepared = try prepareFromSource(arena.allocator(),
@@ -312,7 +312,7 @@ test "typesafe.json: the vocabulary names a question the request only keys" {
     try std.testing.expectEqualStrings("Is it spelled out?", prepared.questions.get("spelled").?.noul.instructions.text);
 }
 
-test "typesafe.json: an empty string needs the vocabulary to name it" {
+test "decisions.json: an empty string needs the vocabulary to name it" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const prepared = try prepareFromSource(arena.allocator(),
@@ -327,7 +327,7 @@ test "typesafe.json: an empty string needs the vocabulary to name it" {
     ));
 }
 
-test "typesafe.json: options and criteria both make a choice" {
+test "decisions.json: options and criteria both make a choice" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const prepared = try prepareFromSource(arena.allocator(),
@@ -345,7 +345,7 @@ test "typesafe.json: options and criteria both make a choice" {
     try std.testing.expectEqualStrings("listed", prepared.questions.get("listed").?.choice.instructions.text);
 }
 
-test "typesafe.json: levels make a score, between two and ten of them" {
+test "decisions.json: levels make a score, between two and ten of them" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const prepared = try prepareFromSource(arena.allocator(),
@@ -359,7 +359,7 @@ test "typesafe.json: levels make a score, between two and ten of them" {
     ));
 }
 
-test "typesafe.json: addQuestions keeps what was asked and adds the rest" {
+test "decisions.json: addQuestions keeps what was asked and adds the rest" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -382,7 +382,7 @@ test "typesafe.json: addQuestions keeps what was asked and adds the rest" {
     try std.testing.expectError(error.InvalidQuestionFormat, addQuestions(aa, categories, extra));
 }
 
-test "typesafe.json: formatAnswers shapes itself by what was asked" {
+test "decisions.json: formatAnswers shapes itself by what was asked" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -413,7 +413,7 @@ test "typesafe.json: formatAnswers shapes itself by what was asked" {
     , try formatAnswers(aa, noul_answer, asked));
 }
 
-test "typesafe.json: formatAnswers names a score's levels" {
+test "decisions.json: formatAnswers names a score's levels" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
