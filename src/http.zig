@@ -697,7 +697,13 @@ fn streamLinesOnce(
         return error.ApiError;
     }
 
+    // One arena for every event, reset after each callback: a long stream of
+    // small deltas reuses the same memory instead of a heap arena per event.
+    var event_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer event_arena.deinit();
+
     while (true) {
+        _ = event_arena.reset(.retain_capacity);
         const line = reader.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => return error.InvalidSseData,
             error.ReadFailed => {
@@ -717,13 +723,12 @@ fn streamLinesOnce(
             return error.ApiError;
         }
 
-        const parsed = std.json.parseFromSlice(EventT, allocator, json_data, .{ .ignore_unknown_fields = true }) catch |err| {
+        const event = std.json.parseFromSliceLeaky(EventT, event_arena.allocator(), json_data, .{ .ignore_unknown_fields = true }) catch |err| {
             log.err("stream: failed to parse chunk: {}", .{err});
             setUnparsedDetail(error_handler, status_code, err, json_data);
             return error.InvalidSseData;
         };
-        defer parsed.deinit();
-        callback(context, parsed.value);
+        callback(context, event);
     }
 }
 

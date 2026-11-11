@@ -255,9 +255,68 @@ pub const FunctionResponse = struct {
     id: ?[]const u8 = null,
     /// The name of the function called. Matches `FunctionCall.name`.
     name: ?[]const u8 = null,
-    /// The function response in JSON object format.
-    response: ?std.json.Value = null,
+    /// The function response; Gemini requires a JSON object.
+    response: ?ResponseBody = null,
 };
+
+/// A `FunctionResponse.response`. A tool's output is usually JSON text
+/// already, so it is written verbatim rather than parsed into a tree and
+/// re-encoded on every request that carries it.
+pub const ResponseBody = union(enum) {
+    value: std.json.Value,
+    /// Valid JSON text: an object is written as is, any other value as
+    /// `{"result":<json>}`.
+    json: []const u8,
+    /// Plain text, written as `{"result":"<text>"}`.
+    text: []const u8,
+
+    /// Classify a tool's output as JSON or plain text.
+    pub fn fromToolOutput(allocator: std.mem.Allocator, content: []const u8) std.mem.Allocator.Error!ResponseBody {
+        return if (try std.json.validate(allocator, content)) .{ .json = content } else .{ .text = content };
+    }
+
+    pub fn jsonStringify(self: ResponseBody, w: *std.json.Stringify) std.json.Stringify.Error!void {
+        switch (self) {
+            .value => |v| try w.write(v),
+            .json => |j| {
+                const t = std.mem.trim(u8, j, " \t\r\n");
+                if (t[0] == '{') return w.print("{s}", .{t});
+                try w.beginObject();
+                try w.objectField("result");
+                try w.print("{s}", .{t});
+                try w.endObject();
+            },
+            .text => |t| {
+                try w.beginObject();
+                try w.objectField("result");
+                try w.write(t);
+                try w.endObject();
+            },
+        }
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ResponseBody {
+        return .{ .value = try std.json.innerParse(std.json.Value, allocator, source, options) };
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !ResponseBody {
+        return .{ .value = try std.json.innerParseFromValue(std.json.Value, allocator, source, options) };
+    }
+};
+
+test "ResponseBody writes tool output without re-parsing it" {
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = " {\"a\": 1}\n", .want = "{\"a\": 1}" },
+        .{ .in = "[1,2]", .want = "{\"result\":[1,2]}" },
+        .{ .in = "plain \"text\"", .want = "{\"result\":\"plain \\\"text\\\"\"}" },
+    };
+    for (cases) |c| {
+        const body = try ResponseBody.fromToolOutput(std.testing.allocator, c.in);
+        const out = try std.json.Stringify.valueAlloc(std.testing.allocator, body, .{});
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+}
 
 /// Model-generated code that is intended to be executed.
 /// Only generated when using the `CodeExecution` tool.
@@ -981,124 +1040,6 @@ pub const ContentEmbedding = struct {
 /// Response from the embedContent endpoint.
 pub const EmbedContentResponse = struct {
     embedding: ?ContentEmbedding = null,
-};
-
-// --- Files ---
-
-/// Processing state of an uploaded file. Known values are void tags; any value
-/// the API adds later is preserved in `unknown` rather than failing the parse.
-pub const FileState = union(enum) {
-    STATE_UNSPECIFIED,
-    PROCESSING,
-    ACTIVE,
-    FAILED,
-    unknown: []const u8,
-
-    pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
-    pub const jsonStringify = jsonutil.StringUnionMethods(@This()).jsonStringify;
-};
-
-/// A file uploaded to the API.
-pub const File = struct {
-    /// Resource name of the file (e.g. "files/abc123").
-    name: ?[]const u8 = null,
-    /// Human-readable display name (max 512 characters).
-    displayName: ?[]const u8 = null,
-    /// MIME type of the file.
-    mimeType: ?[]const u8 = null,
-    /// Size of the file in bytes.
-    sizeBytes: ?[]const u8 = null,
-    /// Timestamp when the file was created.
-    createTime: ?[]const u8 = null,
-    /// Timestamp when the file was last updated.
-    updateTime: ?[]const u8 = null,
-    /// Timestamp when the file will be deleted.
-    expirationTime: ?[]const u8 = null,
-    /// SHA-256 hash of the uploaded file.
-    sha256Hash: ?[]const u8 = null,
-    /// URI for referencing the file in API calls.
-    uri: ?[]const u8 = null,
-    /// Processing state of the file.
-    state: ?FileState = null,
-};
-
-/// Internal request body for file upload initialization.
-pub const UploadFileRequest = struct {
-    file: ?UploadFileMetadata = null,
-};
-
-/// Metadata for a file being uploaded.
-pub const UploadFileMetadata = struct {
-    name: ?[]const u8 = null,
-    displayName: ?[]const u8 = null,
-    mimeType: ?[]const u8 = null,
-};
-
-/// Response from the file upload endpoint.
-pub const UploadFileResponse = struct {
-    file: ?File = null,
-};
-
-/// Response from the listFiles endpoint.
-pub const ListFilesResponse = struct {
-    files: ?[]const File = null,
-    /// Token for fetching the next page of results.
-    nextPageToken: ?[]const u8 = null,
-};
-
-// --- Cached Content ---
-
-/// Usage metadata for cached content.
-pub const CachedContentUsageMetadata = struct {
-    /// Total number of tokens in the cached content.
-    totalTokenCount: ?i32 = null,
-};
-
-/// A resource used in LLM queries for users to explicitly specify what to cache.
-pub const CachedContent = struct {
-    /// Server-generated resource name of the cached content.
-    name: ?[]const u8 = null,
-    /// User-provided display name.
-    displayName: ?[]const u8 = null,
-    /// The model to use for cached content.
-    model: ?[]const u8 = null,
-    /// Timestamp when the cache was created.
-    createTime: ?[]const u8 = null,
-    /// Timestamp when the cache was last updated.
-    updateTime: ?[]const u8 = null,
-    /// Timestamp when the cache expires.
-    expireTime: ?[]const u8 = null,
-    /// Usage metadata for the cached content.
-    usageMetadata: ?CachedContentUsageMetadata = null,
-};
-
-/// Request body for creating cached content.
-pub const CreateCachedContentRequest = struct {
-    model: ?[]const u8 = null,
-    contents: ?[]const Content = null,
-    systemInstruction: ?Content = null,
-    tools: ?[]const Tool = null,
-    toolConfig: ?ToolConfig = null,
-    displayName: ?[]const u8 = null,
-    /// Duration string (e.g. "3600s" for 1 hour).
-    ttl: ?[]const u8 = null,
-    /// RFC 3339 timestamp (e.g. "2026-04-01T00:00:00Z").
-    expireTime: ?[]const u8 = null,
-};
-
-/// Request body for updating cached content expiration.
-pub const UpdateCachedContentRequest = struct {
-    /// Duration string (e.g. "3600s" for 1 hour).
-    ttl: ?[]const u8 = null,
-    /// RFC 3339 timestamp (e.g. "2026-04-01T00:00:00Z").
-    expireTime: ?[]const u8 = null,
-};
-
-/// Response from the listCachedContents endpoint.
-pub const ListCachedContentsResponse = struct {
-    cachedContents: ?[]const CachedContent = null,
-    /// Token for fetching the next page of results.
-    nextPageToken: ?[]const u8 = null,
 };
 
 // --- Tests ---

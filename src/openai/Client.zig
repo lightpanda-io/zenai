@@ -84,11 +84,7 @@ pub fn deinit(self: *Client) void {
 
 pub const Response = http.Response;
 
-pub const ApiError = error{
-    ApiError,
-    MissingApiKey,
-    EmptyResponse,
-} || std.http.Client.FetchError || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error || std.Uri.ParseError;
+pub const ApiError = error{MissingApiKey} || http.FetchError;
 
 // --- Internal helpers ---
 
@@ -233,11 +229,7 @@ pub fn createResponseStream(
 
 // --- Streaming ---
 
-pub const StreamError = error{
-    ApiError,
-    MissingApiKey,
-    InvalidSseData,
-} || std.http.Client.RequestError || std.http.Client.Request.ReceiveHeadError || std.Io.Writer.Error || std.Io.Reader.DelimiterError || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error || std.Uri.ParseError;
+pub const StreamError = error{MissingApiKey} || http.SseError;
 
 /// Stream a chat completion via Server-Sent Events.
 /// The `callback` is invoked for each chunk as it arrives.

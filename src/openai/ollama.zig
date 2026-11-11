@@ -121,19 +121,8 @@ fn fetchModelContextLength(client: *Client, model: []const u8) !?i32 {
     const url = try showUrl(client.allocator, client.base_url);
     defer client.allocator.free(url);
 
-    var payload_buf: std.Io.Writer.Allocating = .init(client.allocator);
-    defer payload_buf.deinit();
-    std.json.Stringify.value(.{ .model = model }, .{ .emit_null_optional_fields = false }, &payload_buf.writer) catch
-        return error.OutOfMemory;
-
     const auth = [_]std.http.Header{.{ .name = "Authorization", .value = client.api_key }};
-    var response = try http.fetchJsonWithRetry(client.allocator, &client.http_client, client.retry_policy, client.request_timeout_ms, .{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = payload_buf.written(),
-        .extra_headers = &auth,
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-    }, ShowResponse, client);
+    var response = try http.postJsonWithRetry(client.allocator, &client.http_client, client.retry_policy, client.request_timeout_ms, url, &auth, .{ .model = model }, ShowResponse, client);
     defer response.deinit();
 
     const info = response.value.model_info orelse return null;
@@ -196,12 +185,12 @@ fn buildChatRequest(
     };
 
     if (req.options.num_ctx == null) {
-        var measure: std.Io.Writer.Allocating = .init(client.allocator);
-        defer measure.deinit();
-        std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &measure.writer) catch
-            return error.OutOfMemory;
+        // Only the encoded size matters: count it without keeping the bytes.
+        var buf: [256]u8 = undefined;
+        var measure: std.Io.Writer.Discarding = .init(&buf);
+        std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &measure.writer) catch unreachable;
         const model_max = modelContextLength(client, model);
-        req.options.num_ctx = computeNumCtx(measure.written().len, req.options.num_predict orelse 4096, model_max);
+        req.options.num_ctx = computeNumCtx(@intCast(measure.fullCount()), req.options.num_predict orelse 4096, model_max);
     }
     return req;
 }
