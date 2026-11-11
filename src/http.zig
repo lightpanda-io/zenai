@@ -218,47 +218,112 @@ pub fn armInterrupt(interrupt: ?*Interrupt, req: *std.http.Client.Request) Inter
     return .{ .interrupt = interrupt, .req = req };
 }
 
-/// Bounds one request's wall-clock time from an established connection to
-/// the end of the response body. A private `Interrupt` shuts the socket
-/// down at the deadline, exactly as a Ctrl-C would, so the blocking read
-/// fails instead of waiting on the server. The connect phase is out of
-/// reach: std's `ConnectTcpOptions.timeout` is declared but unimplemented.
+/// Bounds a request's wall-clock time from an established connection to the
+/// end of the response body. A `Transport` makes one on its first timed
+/// request and keeps it until `deinit`: a thread that sleeps until the armed
+/// deadline, then shuts the connection's socket down through a private
+/// `Interrupt`, exactly as a Ctrl-C would, so the blocking read fails instead
+/// of waiting on the server. The connect phase is out of reach: std's
+/// `ConnectTcpOptions.timeout` is declared but unimplemented.
 ///
-/// A raw `std.Thread` rather than `io.concurrent`: consumers run a
-/// single-threaded `Io.Threaded`, where `concurrent` is unavailable and
-/// cancellation is a no-op. One fixed deadline for the whole exchange, so
-/// not suitable for long-lived streams without a resettable deadline.
+/// A thread because std 0.17 has no portable deadline on a stream read:
+/// `Stream.Reader` reads through `io.operate` with no timeout; `SO_RCVTIMEO`
+/// makes the read fail with `EAGAIN`, which `Io.Threaded` treats as a bug
+/// (a panic in debug builds); `operateTimeout` on Windows returns without
+/// cancelling the pending receive; and consumers run a single-threaded
+/// `Io.Threaded`, where `io.concurrent` is unavailable and cancellation is a
+/// no-op. One slot, since a transport runs one request at a time, and one
+/// fixed deadline per attempt, so not suitable for long-lived streams.
 const Watchdog = struct {
+    io: std.Io,
+    thread: std.Thread,
+    /// Guards `deadline` and `stopping`, and firing `interrupt`: once
+    /// `disarm` holds it, the thread can no longer touch the socket.
+    mutex: std.Io.Mutex = .init,
+    /// Bumped under `mutex` on every change; the thread futex-waits on it.
+    epoch: std.atomic.Value(u32) = .init(0),
+    deadline: ?std.Io.Clock.Timestamp = null,
+    stopping: bool = false,
     interrupt: Interrupt = .{},
-    done: std.Io.Event = .unset,
-    thread: ?std.Thread = null,
 
-    fn start(self: *Watchdog, io: std.Io, req: *std.http.Client.Request, timeout_ms: u32) error{SystemResources}!void {
-        _ = armInterrupt(&self.interrupt, req);
-        const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
+    fn create(io: std.Io, allocator: std.mem.Allocator) error{ OutOfMemory, SystemResources }!*Watchdog {
+        const self = try allocator.create(Watchdog);
+        errdefer allocator.destroy(self);
+        self.* = .{ .io = io, .thread = undefined };
         // Default stack: under libc it also holds the host's static TLS, which
         // can outgrow a small fixed size and fail the spawn.
-        self.thread = std.Thread.spawn(.{}, run, .{ self, io, deadline }) catch return error.SystemResources;
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch return error.SystemResources;
+        return self;
     }
 
-    fn run(self: *Watchdog, io: std.Io, deadline: std.Io.Clock.Timestamp) void {
-        // Spurious wakeups (e.g. EINTR) also report Timeout; only the deadline counts.
-        while (true) {
-            if (self.done.waitTimeout(io, .{ .deadline = deadline })) |_| return else |_| {}
-            if (deadline.compare(.lte, .now(io, .awake))) break;
+    fn destroy(self: *Watchdog, allocator: std.mem.Allocator) void {
+        self.mutex.lockUncancelable(self.io);
+        self.stopping = true;
+        self.unlockChanged();
+        self.thread.join();
+        allocator.destroy(self);
+    }
+
+    fn run(self: *Watchdog) void {
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        while (!self.stopping) {
+            const epoch = self.epoch.load(.monotonic);
+            var timeout: std.Io.Timeout = .none;
+            if (self.deadline) |d| {
+                if (d.compare(.lte, .now(io, .awake))) {
+                    self.interrupt.fire();
+                    self.deadline = null;
+                    continue;
+                }
+                timeout = .{ .deadline = d };
+            }
+            self.mutex.unlock(io);
+            // Wakes on a change, the deadline, or spuriously; the loop rechecks.
+            io.futexWaitTimeout(u32, &self.epoch.raw, epoch, timeout) catch {};
+            self.mutex.lockUncancelable(io);
         }
-        self.interrupt.fire();
     }
 
-    /// Must run before `req.deinit`: joins the thread so a late `fire` can't
-    /// hit a recycled socket, and poisons a connection the deadline shut down
-    /// just after the body had already completed.
-    fn stop(self: *Watchdog, io: std.Io, guard: InterruptGuard) void {
-        const thread = self.thread orelse return;
-        self.done.set(io);
-        thread.join();
-        if (self.interrupt.isFired()) guard.poison();
+    /// Shut `req`'s connection down `timeout_ms` from now unless `disarm`
+    /// comes first.
+    fn arm(self: *Watchdog, req: *std.http.Client.Request, timeout_ms: u32) void {
+        self.mutex.lockUncancelable(self.io);
+        self.interrupt.reset();
+        if (req.connection) |conn| self.interrupt.arm(&conn.stream_reader);
+        self.deadline = .fromNow(self.io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
+        self.unlockChanged();
     }
+
+    /// Must run before `req.deinit`, so the thread can't shut down a socket
+    /// the pool has recycled. Returns whether the deadline fired, possibly
+    /// just after the body had already completed: the caller poisons the
+    /// connection either way.
+    fn disarm(self: *Watchdog) bool {
+        self.mutex.lockUncancelable(self.io);
+        self.deadline = null;
+        self.interrupt.disarm();
+        const fired = self.interrupt.isFired();
+        self.unlockChanged();
+        return fired;
+    }
+
+    fn isFired(self: *const Watchdog) bool {
+        return self.interrupt.isFired();
+    }
+
+    fn unlockChanged(self: *Watchdog) void {
+        _ = self.epoch.fetchAdd(1, .monotonic);
+        self.mutex.unlock(self.io);
+        self.io.futexWake(u32, &self.epoch.raw, 1);
+    }
+};
+
+/// A per-attempt time bound: the transport's watchdog and the limit.
+const Deadline = struct {
+    watchdog: *Watchdog,
+    timeout_ms: u32,
 };
 
 /// The HTTP plumbing every API client shares: the `std.http.Client` and its
@@ -278,6 +343,8 @@ pub const Transport = struct {
     /// Per-attempt wall-clock bound on non-streaming requests, from an
     /// established connection to the end of the body (connect excluded);
     /// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
+    /// The first timed request starts one thread that serves every later one
+    /// (see `Watchdog`); `deinit` stops it.
     request_timeout_ms: ?u32,
     /// Names the provider when a failed request is logged; null logs nothing.
     log_tag: ?[]const u8,
@@ -285,6 +352,9 @@ pub const Transport = struct {
     last_error: ErrorDetail = .{},
     /// Set by the host so a SIGINT can abort an in-flight request mid-read.
     interrupt: ?*Interrupt = null,
+    /// Enforces `request_timeout_ms`; started on the first timed request.
+    /// Heap-allocated so the transport can still be moved.
+    watchdog: ?*Watchdog = null,
 
     pub const Options = struct {
         retry_policy: retry.RetryPolicy = .{},
@@ -321,9 +391,11 @@ pub const Transport = struct {
         };
     }
 
-    /// Frees `last_error`, and closes the connections of a client it owns.
+    /// Frees `last_error`, stops the timeout thread, and closes the
+    /// connections of a client it owns.
     pub fn deinit(self: *Transport) void {
         self.last_error.deinit(self.allocator);
+        if (self.watchdog) |w| w.destroy(self.allocator);
         switch (self.http_client) {
             .owned => |*c| c.deinit(),
             .borrowed => {},
@@ -349,6 +421,13 @@ pub const Transport = struct {
     pub fn fetchJson(self: *Transport, options: std.http.Client.FetchOptions, comptime T: type) FetchError!Response(T) {
         const client = self.httpClient();
         const policy = self.retry_policy;
+        const deadline: ?Deadline = if (self.request_timeout_ms) |ms| .{
+            .watchdog = self.watchdog orelse w: {
+                self.watchdog = try Watchdog.create(client.io, self.allocator);
+                break :w self.watchdog.?;
+            },
+            .timeout_ms = ms,
+        } else null;
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
             var response_buf: std.Io.Writer.Allocating = .init(self.allocator);
@@ -356,7 +435,7 @@ pub const Transport = struct {
             defer if (!keep_buf) response_buf.deinit();
 
             var retry_after_ms: ?u32 = null;
-            const status = fetchCapturingRetryAfter(self.allocator, client, options, &response_buf.writer, self.interrupt, self.request_timeout_ms, &retry_after_ms) catch |err| {
+            const status = fetchCapturingRetryAfter(self.allocator, client, options, &response_buf.writer, self.interrupt, deadline, &retry_after_ms) catch |err| {
                 // Don't retry a request the user cancelled.
                 if (self.interrupted()) return err;
                 if (retry.isRetryableFetchError(err) and attempt + 1 < policy.max_attempts) {
@@ -520,7 +599,7 @@ fn retryAfterFromHead(head: std.http.Client.Response.Head) ?u32 {
 /// `fetchInterruptible` plus capture of the response's Retry-After hint into
 /// `retry_after_ms` (read from the head before the body is streamed, while
 /// the header bytes are still valid) so `Transport.fetchJson` can honor it,
-/// and an optional `timeout_ms` after which the exchange fails with
+/// and an optional `deadline` after which the exchange fails with
 /// `error.Timeout` (see `Watchdog`).
 fn fetchCapturingRetryAfter(
     allocator: std.mem.Allocator,
@@ -528,10 +607,10 @@ fn fetchCapturingRetryAfter(
     options: std.http.Client.FetchOptions,
     response_writer: *std.Io.Writer,
     interrupt: ?*Interrupt,
-    timeout_ms: ?u32,
+    deadline: ?Deadline,
     retry_after_ms: *?u32,
 ) std.http.Client.FetchError!std.http.Status {
-    return reconnectOnStale(std.http.Client.FetchError!std.http.Status, interrupt, fetchOnce, .{ allocator, client, options, response_writer, interrupt, timeout_ms, retry_after_ms });
+    return reconnectOnStale(std.http.Client.FetchError!std.http.Status, interrupt, fetchOnce, .{ allocator, client, options, response_writer, interrupt, deadline, retry_after_ms });
 }
 
 fn fetchOnce(
@@ -540,7 +619,7 @@ fn fetchOnce(
     options: std.http.Client.FetchOptions,
     response_writer: *std.Io.Writer,
     interrupt: ?*Interrupt,
-    timeout_ms: ?u32,
+    deadline: ?Deadline,
     retry_after_ms: *?u32,
 ) std.http.Client.FetchError!std.http.Status {
     const uri = switch (options.location) {
@@ -579,14 +658,18 @@ fn fetchOnce(
     defer guard.deinit();
     errdefer guard.poison();
 
-    var watchdog: Watchdog = .{};
-    if (timeout_ms) |ms| try watchdog.start(client.io, &req, ms);
-    defer watchdog.stop(client.io, guard);
+    if (deadline) |d| d.watchdog.arm(&req, d.timeout_ms);
+    defer if (deadline) |d| if (d.watchdog.disarm()) guard.poison();
 
-    return exchange(allocator, &req, redirect_behavior, options, response_writer, retry_after_ms) catch |err| {
-        if (watchdog.interrupt.isFired()) return error.Timeout;
+    const status = exchange(allocator, &req, redirect_behavior, options, response_writer, retry_after_ms) catch |err| {
+        if (deadline) |d| if (d.watchdog.isFired()) return error.Timeout;
         return err;
     };
+    // A shutdown mid-body can also end it "cleanly": std's Content-Length
+    // reader takes the EOF that follows as the end of the body, which would
+    // then be returned truncated.
+    if (deadline) |d| if (d.watchdog.isFired()) return error.Timeout;
+    return status;
 }
 
 /// The send/receive half of `fetchOnce`, split out so its
@@ -1071,6 +1154,9 @@ const Serve = enum {
     /// Send a head and part of the body, then close with the request still
     /// unread, which makes the kernel reset the connection mid-body.
     reset_mid_body,
+    /// Send a head and part of the body, then hold the socket open, silent,
+    /// until the client gives up.
+    stall_mid_body,
     /// Answer two requests on the one connection, then close.
     respond_twice,
     /// Answer as a CDN fronting an API does: gzip and chunked when the request
@@ -1096,6 +1182,14 @@ fn serveOnce(server: *std.Io.net.Server, serve: Serve) void {
             writer.interface.flush() catch return;
             // Let the client take the head before the reset discards it.
             io.sleep(.fromMilliseconds(50), .awake) catch {};
+        },
+        .stall_mid_body => {
+            writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{") catch return;
+            writer.interface.flush() catch return;
+            // Returns once the client shuts its end down.
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(io, &read_buf);
+            _ = reader.interface.discardRemaining() catch {};
         },
         .respond => {
             var read_buf: [4096]u8 = undefined;
@@ -1182,14 +1276,34 @@ test "watchdog turns a stalled response into error.Timeout" {
     // Never accept: the kernel completes the handshake into the backlog and
     // buffers the request, so the client blocks in receiveHead until the
     // watchdog shuts the socket down.
+    t.transport.request_timeout_ms = 50;
+    try std.testing.expectError(error.Timeout, t.fetchOk());
+    try std.testing.expectEqual(0, t.transport.httpClient().connection_pool.free_len);
+}
 
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    var retry_after_ms: ?u32 = null;
-    try std.testing.expectError(
-        error.Timeout,
-        fetchCapturingRetryAfter(std.testing.allocator, t.transport.httpClient(), .{ .location = .{ .url = t.url } }, &out.writer, null, 50, &retry_after_ms),
-    );
+test "watchdog times out a body that stalls midway, and its thread serves the next call" {
+    var t: Loopback = try .init();
+    defer t.deinit();
+
+    // Head and part of the body, then the server holds the socket open past
+    // the deadline: only the watchdog can end the body read.
+    // Not through `served`: its unblocking connect after a failed call would
+    // be accepted by the next call's server instead of that call's request.
+    t.transport.request_timeout_ms = 100;
+    const thread = try std.Thread.spawn(.{}, serveOnce, .{ &t.server, Serve.stall_mid_body });
+    const stalled = t.fetchOk();
+    thread.join();
+    try std.testing.expectError(error.Timeout, stalled);
+    try std.testing.expectEqual(0, t.transport.httpClient().connection_pool.free_len);
+    const watchdog = t.transport.watchdog.?;
+
+    // The same thread bounds the next call, which a fired deadline must not
+    // carry over into, and which pools its connection.
+    var response = try t.fetch(.respond_negotiated);
+    defer response.deinit();
+    try std.testing.expect(response.value.ok);
+    try std.testing.expectEqual(watchdog, t.transport.watchdog.?);
+    try std.testing.expectEqual(1, t.transport.httpClient().connection_pool.free_len);
 }
 
 test "a pooled socket the server closed while idle is reconnected despite RetryPolicy.disabled" {
