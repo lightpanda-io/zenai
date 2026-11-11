@@ -137,6 +137,49 @@ pub fn StringMap(comptime V: type) type {
     };
 }
 
+/// A JSON value held either as a parsed tree or as JSON text. Parsing yields
+/// `.value`; `.text` is written verbatim, so a value already held as text is
+/// not parsed just to be re-encoded.
+pub const ValueOrText = union(enum) {
+    value: std.json.Value,
+    /// Valid JSON text.
+    text: []const u8,
+
+    pub fn jsonStringify(self: ValueOrText, w: *std.json.Stringify) std.json.Stringify.Error!void {
+        switch (self) {
+            .value => |v| try w.write(v),
+            .text => |t| try w.print("{s}", .{std.mem.trim(u8, t, " \t\r\n")}),
+        }
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ValueOrText {
+        return .{ .value = try std.json.innerParse(std.json.Value, allocator, source, options) };
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !ValueOrText {
+        return .{ .value = try std.json.innerParseFromValue(std.json.Value, allocator, source, options) };
+    }
+
+    /// Deep copy into `a`.
+    pub fn dupe(self: ValueOrText, a: std.mem.Allocator) std.mem.Allocator.Error!ValueOrText {
+        return switch (self) {
+            .value => |v| .{ .value = try dupeValue(a, v) },
+            .text => |t| .{ .text = try a.dupe(u8, t) },
+        };
+    }
+};
+
+test "ValueOrText writes text verbatim and parses into a value" {
+    const T = struct { args: ValueOrText };
+    const out = try stringifyAlloc(std.testing.allocator, T{ .args = .{ .text = " {\"q\": [1, 2]}\n" } }, .{});
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("{\"args\":{\"q\": [1, 2]}}", out);
+
+    const parsed = try std.json.parseFromSlice(T, std.testing.allocator, out, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.args.value.object.get("q").?.array.items[1].integer);
+}
+
 /// Deep-copy a `std.json.Value`, duplicating all owned strings and containers.
 pub fn dupeValue(a: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.Error!std.json.Value {
     return switch (value) {

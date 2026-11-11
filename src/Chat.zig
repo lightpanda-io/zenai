@@ -261,3 +261,52 @@ test "a failed turn leaves the history as it was" {
     try std.testing.expect(std.meta.isError(chat.send("hello")));
     try std.testing.expectEqual(0, chat.messages().len);
 }
+
+test "sendWithTools runs the tool and sends its arguments back as given" {
+    const tool_call =
+        \\{"choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"search","arguments":"{\"q\": \"cats\"}"}}]},"finish_reason":"tool_calls"}]}
+    ;
+    const loopback: std.Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var server: CannedServer = .{
+        .server = try loopback.listen(std.testing.io, .{}),
+        .replies = &.{ tool_call, completion("Cats found.") },
+    };
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, CannedServer.run, .{&server});
+    defer thread.join();
+
+    const client = try server.client();
+    defer client.deinit(std.testing.allocator);
+
+    var chat: Chat = .init(std.testing.allocator, client, "m", .{});
+    defer chat.deinit();
+
+    const Search = struct {
+        fn call(_: *anyopaque, allocator: std.mem.Allocator, name: []const u8, arguments: []const u8) Client.ToolHandler.Result {
+            const args = provider.ToolCall.parseArguments(allocator, arguments) catch return .{ .content = "bad args", .is_error = true };
+            const q = args.object.get("q").?.string;
+            return .{ .content = allocator.print("{s}: 3 results for {s}", .{ name, q }) catch unreachable };
+        }
+    };
+    var ctx: u8 = 0;
+    var result = try chat.sendWithTools("find cats", .{ .context = &ctx, .callFn = Search.call }, .{
+        .tools = &.{.{ .name = "search", .description = "web", .parameters = .null }},
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("Cats found.", result.text.?);
+    const made = result.tool_calls_made;
+    try std.testing.expectEqual(1, made.len);
+    try std.testing.expectEqualStrings("search", made[0].name);
+    try std.testing.expectEqualStrings("{\"q\": \"cats\"}", made[0].arguments);
+    try std.testing.expectEqualStrings("search: 3 results for cats", made[0].result);
+
+    // user, assistant tool call, tool result, assistant answer.
+    try std.testing.expectEqual(4, chat.messages().len);
+    try std.testing.expectEqualStrings(made[0].result, chat.messages()[2].tool_results.?[0].content);
+
+    // The follow-up request echoes the arguments text unchanged.
+    const sent = server.requests[1];
+    try std.testing.expect(std.mem.indexOf(u8, sent, "\"arguments\":\"{\\\"q\\\": \\\"cats\\\"}\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "search: 3 results for cats") != null);
+}

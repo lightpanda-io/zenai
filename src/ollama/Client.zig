@@ -56,10 +56,11 @@ pub fn deinit(self: *Client) void {
 pub const ApiError = OpenAIClient.ApiError;
 pub const StreamError = OpenAIClient.StreamError;
 
-/// Ollama delivers arguments as a JSON object both ways, mapping to `Value`.
+/// Ollama delivers arguments as a JSON object both ways. Parsed responses
+/// hold `.value`.
 pub const FunctionCall = struct {
     name: ?[]const u8 = null,
-    arguments: ?std.json.Value = null,
+    arguments: ?json.ValueOrText = null,
 };
 
 /// `id`/`type` are echoed when present; Ollama matches tool results by name.
@@ -336,7 +337,7 @@ pub const StreamAccumulator = struct {
                     .id = if (call.id) |id| try self.arena.dupe(u8, id) else null,
                     .function = .{
                         .name = if (f.name) |n| try self.arena.dupe(u8, n) else null,
-                        .arguments = if (f.arguments) |v| try json.dupeValue(self.arena, v) else null,
+                        .arguments = if (f.arguments) |v| try v.dupe(self.arena) else null,
                     },
                 });
             };
@@ -414,7 +415,7 @@ test "ChatResponse parses tool calls with object arguments" {
     const msg = parsed.value.message.?;
     const call = msg.tool_calls.?[0];
     try std.testing.expectEqualStrings("goto", call.function.?.name.?);
-    try std.testing.expectEqualStrings("https://news.ycombinator.com/", call.function.?.arguments.?.object.get("url").?.string);
+    try std.testing.expectEqualStrings("https://news.ycombinator.com/", call.function.?.arguments.?.value.object.get("url").?.string);
     try std.testing.expectEqual(@as(i32, 71), parsed.value.eval_count.?);
 }
 
@@ -463,7 +464,7 @@ test "StreamAccumulator dupes a tool call so it survives chunk free" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"url\":\"https://x.test/\"}", .{});
     acc.onChunk(.{ .message = .{ .role = "assistant", .content = "", .tool_calls = &.{.{
         .id = "call_1",
-        .function = .{ .name = "goto", .arguments = parsed.value },
+        .function = .{ .name = "goto", .arguments = .{ .value = parsed.value } },
     }} }, .done = false });
     parsed.deinit();
     acc.onChunk(.{ .done = true, .done_reason = "stop" });
@@ -472,5 +473,5 @@ test "StreamAccumulator dupes a tool call so it survives chunk free" {
     const calls = acc.response().message.?.tool_calls.?;
     try std.testing.expectEqual(@as(usize, 1), calls.len);
     try std.testing.expectEqualStrings("goto", calls[0].function.?.name.?);
-    try std.testing.expectEqualStrings("https://x.test/", calls[0].function.?.arguments.?.object.get("url").?.string);
+    try std.testing.expectEqualStrings("https://x.test/", calls[0].function.?.arguments.?.value.object.get("url").?.string);
 }

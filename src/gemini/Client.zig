@@ -401,7 +401,7 @@ pub const StreamAccumulator = struct {
                 .functionCall = .{
                     .id = if (fc.id) |id| try self.arena.dupe(u8, id) else null,
                     .name = if (fc.name) |n| try self.arena.dupe(u8, n) else null,
-                    .args = if (fc.args) |v| try json.dupeValue(self.arena, v) else null,
+                    .args = if (fc.args) |v| try v.dupe(self.arena) else null,
                 },
                 .thoughtSignature = if (p.thoughtSignature) |ts| try self.arena.dupe(u8, ts) else null,
             });
@@ -788,7 +788,7 @@ test "StreamAccumulator reassembles text and a function call into a GenerateCont
     var acc = StreamAccumulator.init(arena.allocator(), &probe, TextProbe.cb);
     const text_a = [_]Part{.{ .text = "Search" }};
     const text_b = [_]Part{.{ .text = "ing." }};
-    const fc = [_]Part{.{ .functionCall = .{ .name = "search", .args = args.value } }};
+    const fc = [_]Part{.{ .functionCall = .{ .name = "search", .args = .{ .value = args.value } } }};
     const chunks = [_]GenerateContentResponse{
         .{ .candidates = &.{.{ .content = .{ .parts = &text_a } }} },
         .{ .candidates = &.{.{ .content = .{ .parts = &text_b } }} },
@@ -805,7 +805,7 @@ test "StreamAccumulator reassembles text and a function call into a GenerateCont
 
     const call = resp.firstFunctionCall().?;
     try std.testing.expectEqualStrings("search", call.name.?);
-    try std.testing.expectEqualStrings("birds", call.args.?.object.get("q").?.string);
+    try std.testing.expectEqualStrings("birds", call.args.?.value.object.get("q").?.string);
 }
 
 /// Test server for the continuation tests: answers one request per entry of
