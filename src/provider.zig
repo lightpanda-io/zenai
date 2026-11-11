@@ -333,10 +333,9 @@ test "dupeToolResults: preserves is_error flag" {
 }
 
 /// Categorical effort level for model reasoning.
+/// A null `GenerationConfig.effort` sends no effort field, so the model
+/// default applies.
 pub const Effort = enum {
-    /// Send no effort field; the model default applies. Same as a null
-    /// `GenerationConfig.effort`.
-    null,
     /// Reasoning off, sent explicitly.
     none,
     minimal,
@@ -360,7 +359,7 @@ pub const GenerationConfig = struct {
     tools: ?[]const Tool = null,
     tool_choice: ?ToolChoice = null,
     response_format: ?ResponseFormat = null,
-    /// reasoning/thinking effort level.
+    /// Reasoning/thinking effort level; null sends none.
     effort: ?Effort = null,
 };
 
@@ -1193,8 +1192,9 @@ pub const Info = struct {
     key_hint: ?[]const u8 = null,
     /// Recommended chat model; empty when the server decides (local servers).
     default_model: []const u8,
-    /// Effort to use unless the caller picks one; null defers to the caller.
-    default_effort: ?Effort = null,
+    /// Send no effort unless the caller picks one, instead of the caller's
+    /// own default. See `omitsEffort`.
+    omit_effort: bool = false,
     /// Local server: loopback-aware list retry, and excluded from auto-detection.
     local: bool = false,
 };
@@ -1215,8 +1215,8 @@ pub fn info(tag: Tag) Info {
         // ZML's LLMD; the served model is whatever `--model` loaded.
         .llmd => .{ .base_url = "http://localhost:8000/v1", .placeholder_key = "llmd", .default_model = "", .local = true },
         .vercel => .{ .base_url = "https://ai-gateway.vercel.sh/v1", .env_var = "AI_GATEWAY_API_KEY", .default_model = "openai/gpt-5.5" },
-        // `.null`: codestral and ministral reject any `reasoning_effort`.
-        .mistral => .{ .base_url = "https://api.mistral.ai/v1", .env_var = "MISTRAL_API_KEY", .default_model = "mistral-medium-3.5", .default_effort = .null },
+        // codestral and ministral reject any `reasoning_effort`.
+        .mistral => .{ .base_url = "https://api.mistral.ai/v1", .env_var = "MISTRAL_API_KEY", .default_model = "mistral-medium-3.5", .omit_effort = true },
         .openrouter => .{ .base_url = "https://openrouter.ai/api/v1", .env_var = "OPENROUTER_API_KEY", .default_model = "openai/gpt-5.5" },
         .xai => .{ .base_url = "https://api.x.ai/v1", .env_var = "XAI_API_KEY", .default_model = "grok-4.7" },
     };
@@ -1299,9 +1299,11 @@ pub fn defaultModel(tag: Tag) []const u8 {
     return info(tag).default_model;
 }
 
-/// Default effort for `tag`, or null to defer to the caller's own default.
-pub fn defaultEffort(tag: Tag) ?Effort {
-    return info(tag).default_effort;
+/// True when `tag` should get no effort unless the user picks one, rather
+/// than the caller's own default (Mistral: codestral and ministral reject any
+/// `reasoning_effort`).
+pub fn omitsEffort(tag: Tag) bool {
+    return info(tag).omit_effort;
 }
 
 /// A provider whose key was found in the environment (`detectKeys`) or served
@@ -1588,15 +1590,14 @@ test "openai_compatible: present in default_candidates (runtime-gated)" {
     try std.testing.expect(found);
 }
 
-test "defaultEffort: null for Mistral, unset elsewhere" {
-    try std.testing.expectEqual(@as(?Effort, .null), defaultEffort(.mistral));
-    try std.testing.expectEqual(@as(?Effort, null), defaultEffort(.anthropic));
-    try std.testing.expectEqual(@as(?Effort, null), defaultEffort(.openai));
+test "omitsEffort: Mistral only" {
+    try std.testing.expect(omitsEffort(.mistral));
+    try std.testing.expect(!omitsEffort(.anthropic));
+    try std.testing.expect(!omitsEffort(.openai));
 }
 
 test "reasoning_effort: omitted for a null effort, sent otherwise" {
     const tools: ?[]const openai_types.Tool = null;
-    try std.testing.expectEqual(@as(?openai_types.ReasoningEffort, null), mapOpenAICompletionConfig(flooredConfig(.{ .effort = .null }), tools).reasoning_effort);
     try std.testing.expectEqual(@as(?openai_types.ReasoningEffort, null), mapOpenAICompletionConfig(.{ .effort = null }, tools).reasoning_effort);
     try std.testing.expectEqual(@as(?openai_types.ReasoningEffort, .none), mapOpenAICompletionConfig(.{ .effort = .none }, tools).reasoning_effort);
     try std.testing.expectEqual(@as(?openai_types.ReasoningEffort, .low), mapOpenAICompletionConfig(.{ .effort = .low }, tools).reasoning_effort);
@@ -2702,7 +2703,6 @@ fn mapEffortToGeminiConfig(model: []const u8, level: Effort) gemini_types.Thinki
 /// `MINIMAL` with HTTP 400 where `.low` works.
 fn mapEffortToGemini(level: Effort) ?gemini_types.ThinkingLevel {
     return switch (level) {
-        .null => unreachable, // see `flooredConfig`
         .none => null,
         .minimal => .MINIMAL,
         .low => .LOW,
@@ -2717,7 +2717,6 @@ fn mapEffortToGemini(level: Effort) ?gemini_types.ThinkingLevel {
 /// so `.none` will fail on that model — accepted tradeoff.
 fn mapEffortToGeminiBudget(level: Effort) i32 {
     return switch (level) {
-        .null => unreachable, // see `flooredConfig`
         .none => 0,
         .minimal => 512,
         .low => 2048,
@@ -2746,7 +2745,6 @@ fn mapOpenAICompletionConfig(config: GenerationConfig, tools: ?[]const openai_ty
 /// Mistral accepts only "none" and "high".
 fn mapEffortToMistral(level: Effort) openai_types.ReasoningEffort {
     return switch (level) {
-        .null => unreachable, // see `flooredConfig`
         .none => .none,
         .minimal, .low, .medium, .high, .xhigh => .high,
     };
@@ -2755,7 +2753,6 @@ fn mapEffortToMistral(level: Effort) openai_types.ReasoningEffort {
 /// Grok reasoning can't be disabled: it takes low, medium, high and xhigh.
 fn mapEffortToXai(level: Effort) openai_types.ReasoningEffort {
     return switch (level) {
-        .null => unreachable, // see `flooredConfig`
         .none, .minimal, .low => .low,
         .medium => .medium,
         .high => .high,
@@ -2773,8 +2770,8 @@ const AnthropicReasoning = struct {
 /// yields mostly thinking followed by a truncated answer.
 fn floorMaxTokens(effort: ?Effort, max_tokens: i32) i32 {
     const answer_room = 4096;
-    const floor: i32 = switch (effort orelse .null) {
-        .null, .none => return max_tokens,
+    const floor: i32 = switch (effort orelse return max_tokens) {
+        .none => return max_tokens,
         .minimal, .low => 1024 + answer_room,
         .medium => 4096 + answer_room,
         .high => 16384 + answer_room,
@@ -2784,11 +2781,9 @@ fn floorMaxTokens(effort: ?Effort, max_tokens: i32) i32 {
 }
 
 /// Null `max_tokens` means "provider default", which is generous, so it is
-/// left alone rather than pinned to the floor. Also folds `.null` into a null
-/// effort, so the mappers never see it.
+/// left alone rather than pinned to the floor.
 fn flooredConfig(config: GenerationConfig) GenerationConfig {
     var floored = config;
-    if (config.effort == .null) floored.effort = null;
     if (config.max_tokens) |requested| floored.max_tokens = floorMaxTokens(config.effort, requested);
     return floored;
 }
@@ -2804,7 +2799,6 @@ fn mapEffortToAnthropic(effort: ?Effort, max_tokens: i32) AnthropicReasoning {
     // explicit `.none` must say so; models that can't disable it return a 400.
     const disabled: AnthropicReasoning = .{ .thinking = .{ .type = "disabled" }, .output_config = null, .max_tokens = max_tokens };
     const wire: []const u8 = switch (effort orelse return off) {
-        .null => return off,
         .none => return disabled,
         .minimal, .low => "low",
         .medium => "medium",
@@ -2820,7 +2814,6 @@ fn mapEffortToAnthropic(effort: ?Effort, max_tokens: i32) AnthropicReasoning {
 
 fn mapEffortToOpenAI(level: Effort) openai_types.ReasoningEffort {
     return switch (level) {
-        .null => unreachable, // see `flooredConfig`
         .none => .none,
         .minimal => .minimal,
         .low => .low,
