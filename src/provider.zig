@@ -6,7 +6,6 @@ const http = @import("http.zig");
 const env = @import("env.zig");
 const gemini_mod = @import("gemini/Client.zig");
 const openai_mod = @import("openai/Client.zig");
-const codex_mod = @import("codex/Client.zig");
 const anthropic_mod = @import("anthropic/Client.zig");
 const gemini_types = @import("gemini/types.zig");
 const openai_types = @import("openai/types.zig");
@@ -487,9 +486,11 @@ pub const Client = union(enum) {
     mistral: *openai_mod,
     openrouter: *openai_mod,
     xai: *openai_mod,
-    codex: *codex_mod,
+    /// The ChatGPT-subscription backend: the OpenAI client under
+    /// `openai_mod.initChatGpt` auth.
+    codex: *openai_mod,
 
-    pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError || codex_mod.ApiError;
+    pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError;
 
     /// The backend client's HTTP plumbing.
     pub fn transport(self: Client) *http.Transport {
@@ -516,9 +517,9 @@ pub const Client = union(enum) {
         /// clients; see `http.Transport.Options.http_client`. Null owns one.
         http_client: ?*std.http.Client = null,
         /// Headers sent on every request, e.g. Hugging Face's `X-HF-Bill-To`.
-        /// Only applied to the OpenAI-compatible clients (and `.ollama`);
-        /// ignored by gemini/anthropic/codex. Borrowed: the slice and its
-        /// strings must outlive the client.
+        /// Only applied to the OpenAI-family clients (and `.ollama`);
+        /// ignored by gemini/anthropic. Borrowed: the slice and its strings
+        /// must outlive the client.
         extra_headers: []const std.http.Header = &.{},
         /// GCP project for `.vertex` project/location mode (falls back to
         /// GOOGLE_CLOUD_PROJECT in `environ`). When set, the init `key` must
@@ -534,9 +535,10 @@ pub const Client = union(enum) {
         /// `.empty` disables env detection.
         environ: std.process.Environ = .empty,
         /// ChatGPT account id for `.codex` (`ChatGPT-Account-Id` header),
-        /// derived from the OAuth JWT. Ignored by other providers.
+        /// derived from the OAuth JWT; copied. Ignored by other providers.
         account_id: ?[]const u8 = null,
-        /// Session id for `.codex` (`session-id` header). Ignored by others.
+        /// Session id for `.codex` (`session-id` header); borrowed. Ignored by
+        /// others.
         session_id: ?[]const u8 = null,
     };
 
@@ -561,10 +563,11 @@ pub const Client = union(enum) {
                 };
                 if (base_url) |u| impl_opts.base_url = u;
                 if (@hasField(Impl.InitOptions, "extra_headers")) impl_opts.extra_headers = options.extra_headers;
-                if (@hasField(Impl.InitOptions, "account_id")) impl_opts.account_id = options.account_id;
-                if (@hasField(Impl.InitOptions, "session_id")) impl_opts.session_id = options.session_id;
                 if (tag == .vertex) impl_opts.vertex = vertexConfigFromEnv(options.environ, options.project, options.location);
-                const impl = Impl.init(io, allocator, key, impl_opts);
+                const impl = if (tag == .codex)
+                    Impl.initChatGpt(io, allocator, key, impl_opts, .{ .account_id = options.account_id, .session_id = options.session_id })
+                else
+                    Impl.init(io, allocator, key, impl_opts);
                 client.* = if (@typeInfo(@TypeOf(impl)) == .error_union) try impl else impl;
                 break :blk @unionInit(Client, @tagName(tag), client);
             },
@@ -673,23 +676,17 @@ pub const Client = union(enum) {
             // OpenAI and xAI speak the Responses API (Chat Completions 400s on
             // function tools + reasoning for gpt-5; xAI treats it as legacy).
             // Codex is the same API behind ChatGPT auth, and stream-only.
-            .openai, .xai, .codex => {
-                const system_role = if (self == .codex) codex_system_role else "system";
-                const input = try messagesToOpenAIResponsesInput(ra, messages, system_role, self, model);
+            .openai, .xai, .codex => |o| {
+                const input = try messagesToOpenAIResponsesInput(ra, messages, self.responsesSystemRole(), self, model);
                 const tools = if (config.tools) |t| try mapOpenAIResponsesTools(ra, t) else null;
-                const request = if (self == .codex) codexRequest(model, input, tools, config) else self.responsesRequest(model, input, tools, config);
+                const request = self.responsesRequest(model, input, tools, config);
                 const hook = on_text orelse if (self == .codex) TextDeltaHook{ .context = undefined, .onText = noopOnText } else {
-                    const o = self.openAiClient();
                     var response = try o.createResponse(request);
                     defer response.deinit();
                     return openAiResponsesResult(self.clientAllocator(), response.value, self, model);
                 };
                 var acc = openai_mod.ResponsesStreamAccumulator.init(ra, hook.context, hook.onText);
-                const sent = switch (self) {
-                    .codex => |c| c.createResponseStream(request, &acc, openai_mod.ResponsesStreamAccumulator.onEvent),
-                    else => self.openAiClient().createResponseStream(request, &acc, openai_mod.ResponsesStreamAccumulator.onEvent),
-                };
-                sent catch |err| return streamFailed(err);
+                o.createResponseStream(request, &acc, openai_mod.ResponsesStreamAccumulator.onEvent) catch |err| return streamFailed(err);
                 if (acc.err) |e| return e;
                 return openAiResponsesResult(self.clientAllocator(), try acc.response(), self, model);
             },
@@ -750,7 +747,7 @@ pub const Client = union(enum) {
     /// The OpenAI client behind an OpenAI-family tag.
     fn openAiClient(self: Client) *openai_mod {
         return switch (self) {
-            .anthropic, .gemini, .vertex, .codex => unreachable,
+            .anthropic, .gemini, .vertex => unreachable,
             .ollama => |o| &o.openai,
             inline else => |o| o,
         };
@@ -777,9 +774,15 @@ pub const Client = union(enum) {
         return cfg;
     }
 
-    /// Responses request for the `.openai` and `.xai` arms, which differ only
-    /// in which effort levels the model accepts. Both round-trip encrypted
-    /// reasoning like `codexRequest`.
+    /// Role for system messages in Responses `input`: the Codex backend 400s
+    /// on `system`, and `developer` is its equivalent.
+    fn responsesSystemRole(self: Client) []const u8 {
+        return if (self == .codex) "developer" else "system";
+    }
+
+    /// Responses request for the `.openai`, `.xai` and `.codex` arms. xAI
+    /// accepts fewer effort levels; Codex asks for reasoning summaries and,
+    /// like codex-cli, sends no `max_output_tokens`.
     fn responsesRequest(self: Client, model: []const u8, input: []const openai_types.ResponseInputItem, tools: ?[]const openai_types.ResponseTool, config: GenerationConfig) openai_types.ResponsesRequest {
         return .{
             .model = model,
@@ -788,8 +791,9 @@ pub const Client = union(enum) {
             .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
             .reasoning = if (config.effort) |tl| .{
                 .effort = if (self == .xai) mapEffortToXai(tl) else mapEffortToOpenAI(tl),
+                .summary = if (self == .codex) "auto" else null,
             } else null,
-            .max_output_tokens = config.max_tokens,
+            .max_output_tokens = if (self == .codex) null else config.max_tokens,
             .temperature = config.temperature,
             // Stateless: the encrypted reasoning travels in `input` instead.
             .store = false,
@@ -1126,7 +1130,7 @@ pub fn info(tag: Tag) Info {
         .gemini => .{ .key_hint = "GOOGLE_API_KEY/GEMINI_API_KEY", .default_model = "gemini-3.8-flash" },
         .vertex => .{ .key_hint = "VERTEX_API_KEY/GOOGLE_API_KEY", .default_model = "gemini-3.8-flash" },
         .openai => .{ .key_hint = "OPENAI_API_KEY", .default_model = "gpt-6-luna" },
-        .codex => .{ .key_hint = "a ChatGPT subscription (OAuth)", .default_model = "gpt-5.5" },
+        .codex => .{ .base_url = openai_mod.codex_base_url, .key_hint = "a ChatGPT subscription (OAuth)", .default_model = "gpt-5.5" },
         .ollama => .{ .base_url = "http://localhost:11434/v1", .placeholder_key = "ollama", .default_model = "qwen3.5:latest", .local = true },
         .huggingface => .{ .base_url = "https://router.huggingface.co/v1", .env_var = "HF_TOKEN", .default_model = "Qwen/Qwen3.5-122B-A10B" },
         // The base URL comes from OPENAI_BASE_URL; the model from the server.
@@ -1336,6 +1340,9 @@ pub fn listChatModelIds(
     // Preset catalogs don't follow isChatModel's naming, so none filters. A
     // not-running loopback server refuses instantly — disable retry there.
     const i = info(tag);
+    // Codex has no listable models endpoint under OAuth; callers fall back to
+    // the models.dev catalog.
+    if (tag == .codex) return ids.toOwnedSlice(arena);
     if (i.base_url) |preset_url| {
         const url = options.base_url orelse preset_url;
         const policy: retry.RetryPolicy = if (i.local and isLoopbackUrl(url)) .disabled else .{};
@@ -1397,9 +1404,6 @@ pub fn listChatModelIds(
                 try ids.append(arena, try arena.dupe(u8, stripped));
             }
         },
-        // Codex has no listable models endpoint under OAuth; callers fall back
-        // to the models.dev catalog. Return an empty list rather than panic.
-        .codex => {},
         else => unreachable,
     }
 
@@ -1543,6 +1547,28 @@ test "responsesRequest: xAI never sends none, OpenAI does" {
     // Stateless: encrypted reasoning is requested and carried in `input`.
     try std.testing.expectEqual(@as(?bool, false), req.store);
     try std.testing.expectEqualStrings("reasoning.encrypted_content", req.include.?[0]);
+}
+
+test "responsesRequest: codex body matches the former Codex client" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const codex: Client = .{ .codex = undefined };
+    const msgs = [_]Message{ .{ .role = .system, .content = "be brief" }, .{ .role = .user, .content = "hi" } };
+    const input = try messagesToOpenAIResponsesInput(a, &msgs, codex.responsesSystemRole(), codex, "gpt-5.5");
+    const tools = try mapOpenAIResponsesTools(a, &.{.{ .name = "search", .description = "web", .parameters = .null }});
+    const req = codex.responsesRequest("gpt-5.5", input, tools, .{ .effort = .high, .max_tokens = 1000, .temperature = 0.5, .tool_choice = .auto });
+    // Captured from the standalone Codex client's request builder.
+    try std.testing.expectEqualStrings(
+        \\{"model":"gpt-5.5","input":[{"type":"message","role":"developer","content":"be brief"},{"type":"message","role":"user","content":"hi"}],"tools":[{"type":"function","name":"search","description":"web","parameters":null}],"tool_choice":"auto","reasoning":{"effort":"high","summary":"auto"},"temperature":0.5,"store":false,"include":["reasoning.encrypted_content"]}
+    , try stringifyForTest(a, req));
+
+    // OpenAI keeps max_output_tokens and the system role, and asks for no summary.
+    const oai: Client = .{ .openai = undefined };
+    const oai_req = oai.responsesRequest("gpt-5.5", input, tools, .{ .effort = .high, .max_tokens = 1000 });
+    try std.testing.expectEqual(@as(?i32, 1000), oai_req.max_output_tokens);
+    try std.testing.expectEqual(@as(?[]const u8, null), oai_req.reasoning.?.summary);
+    try std.testing.expectEqualStrings("system", oai.responsesSystemRole());
 }
 
 test "openAiResponsesResult: keeps reasoning with its origin, skips ciphertext-less items" {
@@ -2018,31 +2044,12 @@ fn mapOpenAITools(allocator: std.mem.Allocator, tools: []const Tool) ![]openai_t
     return out;
 }
 
-// The Codex backend 400s on `system` messages; `developer` is its equivalent.
-const codex_system_role = "developer";
-
 fn noopOnText(_: *anyopaque, _: []const u8) void {}
 
 /// A backend stream error, collapsed into `Client.Error`; the detail is in
 /// the backend's `transport.last_error` (see `lastError`).
 fn streamFailed(err: anyerror) Client.Error {
     return if (err == error.OutOfMemory) error.OutOfMemory else error.ApiError;
-}
-
-/// Build the Codex Responses request from already-mapped input/tools. Codex
-/// requires `store=false` on the stateless backend and echoes encrypted
-/// reasoning via `include`; it omits `max_output_tokens` to match codex-cli.
-fn codexRequest(model: []const u8, input: []const openai_types.ResponseInputItem, tools: ?[]const openai_types.ResponseTool, config: GenerationConfig) openai_types.ResponsesRequest {
-    return .{
-        .model = model,
-        .input = input,
-        .tools = tools,
-        .tool_choice = mapToolChoiceToOpenAI(config.tool_choice),
-        .reasoning = if (config.effort) |tl| .{ .effort = mapEffortToOpenAI(tl), .summary = "auto" } else null,
-        .temperature = config.temperature,
-        .store = false,
-        .include = &.{"reasoning.encrypted_content"},
-    };
 }
 
 /// Flatten the normalized conversation into Responses-API `input` items: each

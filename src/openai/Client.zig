@@ -12,15 +12,20 @@ const ResponsesRequest = types.ResponsesRequest;
 const ResponsesResponse = types.ResponsesResponse;
 const ResponseStreamEvent = types.ResponseStreamEvent;
 
-/// OpenAI API client. Provides access to chat completions, embeddings,
-/// and model management.
+/// OpenAI API client. Provides access to chat completions, the Responses API,
+/// embeddings, and model management. `initChatGpt` points it at the Codex
+/// backend instead, authenticating with a ChatGPT subscription.
 const Client = @This();
 
 transport: http.Transport,
+/// API key, or the OAuth access token under `chatgpt` auth. Borrowed; see
+/// `setApiKey` to repoint it.
 api_key: []const u8,
 base_url: []const u8,
 organization: ?[]const u8,
 project: ?[]const u8,
+/// ChatGPT-subscription auth (the Codex backend); null for an API key.
+chatgpt: ?ChatGpt = null,
 /// Sent after the auth headers on every request. Borrowed, see
 /// `InitOptions.extra_headers`.
 extra_headers: []const std.http.Header,
@@ -51,6 +56,25 @@ pub const InitOptions = struct {
     http_client: ?*std.http.Client = null,
 };
 
+/// ChatGPT-subscription auth for the Codex backend: the bearer token is the
+/// subscription's OAuth access token, and these headers replace
+/// `OpenAI-Organization`/`OpenAI-Project`.
+pub const ChatGpt = struct {
+    /// ChatGPT account id from the OAuth JWT; sent as `ChatGPT-Account-Id`.
+    /// `initChatGpt` copies it, so it may be freed once that returns (a token
+    /// refresh replaces the buffer it came from).
+    account_id: ?[]const u8 = null,
+    /// Sent as `session-id`; null omits it. Borrowed.
+    session_id: ?[]const u8 = null,
+    /// Client identifier sent as `originator`. Borrowed.
+    originator: []const u8 = "lightpanda",
+    /// Sent as `User-Agent`. Borrowed.
+    user_agent: []const u8 = "lightpanda",
+};
+
+/// Base URL of the Codex backend, for `initChatGpt`.
+pub const codex_base_url = "https://chatgpt.com/backend-api/codex";
+
 /// Create a new OpenAI API client.
 pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
     return .{
@@ -68,10 +92,31 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
     };
 }
 
+/// Create a client for the Codex backend (the endpoint Codex CLI uses), billed
+/// to a ChatGPT plan: `access_token` is the subscription's OAuth token, and
+/// `options.base_url` should be `codex_base_url`. The backend only streams, so
+/// use `createResponseStream`.
+pub fn initChatGpt(io: std.Io, allocator: std.mem.Allocator, access_token: []const u8, options: InitOptions, chatgpt: ChatGpt) std.mem.Allocator.Error!Client {
+    var client = init(io, allocator, access_token, options);
+    client.transport.log_tag = "Codex";
+    client.chatgpt = chatgpt;
+    if (chatgpt.account_id) |a| client.chatgpt.?.account_id = try allocator.dupe(u8, a);
+    return client;
+}
+
 /// Release all resources held by the client, including HTTP connections.
 pub fn deinit(self: *Client) void {
+    if (self.chatgpt) |c| if (c.account_id) |a| self.transport.allocator.free(a);
     self.bearer.deinit(self.transport.allocator);
     self.transport.deinit();
+}
+
+/// Repoint at a refreshed key (e.g. an OAuth access token) without tearing
+/// down connections. The caller keeps ownership of `key` and frees the
+/// previous buffer only after this returns.
+pub fn setApiKey(self: *Client, key: []const u8) void {
+    self.api_key = key;
+    self.bearer.deinit(self.transport.allocator);
 }
 
 pub const Response = http.Response;
@@ -80,11 +125,29 @@ pub const ApiError = error{MissingApiKey} || http.FetchError;
 
 // --- Internal helpers ---
 
-fn authHeaders(self: *Client, buf: *[3]std.http.Header) ![]const std.http.Header {
+const AuthHeaders = [5]std.http.Header;
+
+/// The bearer token plus the auth's own headers, then `extra_headers`; release
+/// with `freeHeaders(buf, ...)`.
+fn authHeaders(self: *Client, buf: *AuthHeaders) ![]const std.http.Header {
     buf[0] = try self.bearer.header(self.transport.allocator, self.api_key);
-    buf[1] = .{ .name = "OpenAI-Organization", .value = self.organization orelse "" };
-    buf[2] = .{ .name = "OpenAI-Project", .value = self.project orelse "" };
-    return self.withExtraHeaders(buf);
+    var n: usize = 3;
+    if (self.chatgpt) |c| {
+        buf[1] = .{ .name = "originator", .value = c.originator };
+        buf[2] = .{ .name = "User-Agent", .value = c.user_agent };
+        if (c.account_id) |a| {
+            buf[n] = .{ .name = "ChatGPT-Account-Id", .value = a };
+            n += 1;
+        }
+        if (c.session_id) |sid| {
+            buf[n] = .{ .name = "session-id", .value = sid };
+            n += 1;
+        }
+    } else {
+        buf[1] = .{ .name = "OpenAI-Organization", .value = self.organization orelse "" };
+        buf[2] = .{ .name = "OpenAI-Project", .value = self.project orelse "" };
+    }
+    return self.withExtraHeaders(buf[0..n]);
 }
 
 /// `base` followed by `extra_headers`: `base` itself when there are none,
@@ -100,14 +163,14 @@ pub fn freeHeaders(self: *Client, base: []const std.http.Header, headers: []cons
 }
 
 fn fetchGet(self: *Client, url: []const u8, comptime T: type) ApiError!Response(T) {
-    var hdr_buf: [3]std.http.Header = undefined;
+    var hdr_buf: AuthHeaders = undefined;
     const headers = try self.authHeaders(&hdr_buf);
     defer self.freeHeaders(&hdr_buf, headers);
     return self.transport.getJson(url, headers, T);
 }
 
 fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) ApiError!Response(T) {
-    var hdr_buf: [3]std.http.Header = undefined;
+    var hdr_buf: AuthHeaders = undefined;
     const headers = try self.authHeaders(&hdr_buf);
     defer self.freeHeaders(&hdr_buf, headers);
     return self.transport.postJson(url, headers, body, T);
@@ -200,7 +263,8 @@ pub fn createResponse(self: *Client, request: ResponsesRequest) ApiError!Respons
 /// Stream a model response via the Responses API (`POST /responses`). The
 /// `callback` fires per SSE event; `request.stream` is forced on. Unlike Chat
 /// Completions, this endpoint supports function tools together with reasoning
-/// on the gpt-5 family, so native OpenAI streams through here.
+/// on the gpt-5 family, so native OpenAI streams through here. The only call
+/// the Codex backend (`initChatGpt`) accepts.
 pub fn createResponseStream(
     self: *Client,
     request: ResponsesRequest,
@@ -215,7 +279,7 @@ pub fn createResponseStream(
     var req_body = request;
     req_body.stream = true;
 
-    var hdr_buf: [3]std.http.Header = undefined;
+    var hdr_buf: AuthHeaders = undefined;
     const headers = try self.authHeaders(&hdr_buf);
     defer self.freeHeaders(&hdr_buf, headers);
     return self.transport.streamSse(url, headers, req_body, ResponseStreamEvent, context, callback);
@@ -261,7 +325,7 @@ pub fn chatCompletionStream(
         .providerOptions = config.providerOptions,
     };
 
-    var hdr_buf: [3]std.http.Header = undefined;
+    var hdr_buf: AuthHeaders = undefined;
     const headers = try self.authHeaders(&hdr_buf);
     defer self.freeHeaders(&hdr_buf, headers);
     return self.transport.streamSse(url, headers, req_body, ChatCompletionResponse, context, callback);
@@ -570,7 +634,7 @@ test "Client init and deinit" {
 }
 
 test "authHeaders appends extra_headers after the auth headers" {
-    var buf: [3]std.http.Header = undefined;
+    var buf: AuthHeaders = undefined;
 
     var plain = Client.init(std.testing.io, std.testing.allocator, "k", .{});
     defer plain.deinit();
@@ -590,6 +654,59 @@ test "authHeaders appends extra_headers after the auth headers" {
     try std.testing.expectEqualStrings("X-HF-Bill-To", headers[3].name);
     try std.testing.expectEqualStrings("my-org", headers[3].value);
     try std.testing.expectEqualStrings("X-Other", headers[4].name);
+}
+
+fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
+    for (headers) |h| if (std.mem.eql(u8, h.name, name)) return h.value;
+    return null;
+}
+
+test "chatgpt authHeaders: bearer, originator, User-Agent, account and session ids, nothing else" {
+    var buf: AuthHeaders = undefined;
+    var account: [6]u8 = "acct-1".*;
+    var client = try Client.initChatGpt(std.testing.io, std.testing.allocator, "tok-abc", .{ .base_url = codex_base_url }, .{
+        .account_id = &account,
+        .session_id = "sess-1",
+    });
+    defer client.deinit();
+    // The account id is copied: the caller's buffer may be freed on refresh.
+    @memset(&account, 'x');
+    const headers = try client.authHeaders(&buf);
+    defer client.freeHeaders(&buf, headers);
+    const expected = [_]std.http.Header{
+        .{ .name = "Authorization", .value = "Bearer tok-abc" },
+        .{ .name = "originator", .value = "lightpanda" },
+        .{ .name = "User-Agent", .value = "lightpanda" },
+        .{ .name = "ChatGPT-Account-Id", .value = "acct-1" },
+        .{ .name = "session-id", .value = "sess-1" },
+    };
+    try std.testing.expectEqual(expected.len, headers.len);
+    for (expected, headers) |e, h| {
+        try std.testing.expectEqualStrings(e.name, h.name);
+        try std.testing.expectEqualStrings(e.value, h.value);
+    }
+}
+
+test "chatgpt authHeaders: account and session ids omitted when null" {
+    var buf: AuthHeaders = undefined;
+    var client = try Client.initChatGpt(std.testing.io, std.testing.allocator, "tok", .{}, .{});
+    defer client.deinit();
+    const headers = try client.authHeaders(&buf);
+    defer client.freeHeaders(&buf, headers);
+    try std.testing.expectEqual(@as(usize, 3), headers.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), headerValue(headers, "ChatGPT-Account-Id"));
+    try std.testing.expectEqual(@as(?[]const u8, null), headerValue(headers, "session-id"));
+    try std.testing.expectEqual(@as(?[]const u8, null), headerValue(headers, "OpenAI-Organization"));
+}
+
+test "setApiKey rebuilds the cached bearer value" {
+    var buf: AuthHeaders = undefined;
+    var client = Client.init(std.testing.io, std.testing.allocator, "tok-old", .{});
+    defer client.deinit();
+    try std.testing.expectEqualStrings("Bearer tok-old", headerValue(try client.authHeaders(&buf), "Authorization").?);
+    client.setApiKey("tok-new");
+    try std.testing.expectEqual(@as(?[]const u8, null), client.bearer.value);
+    try std.testing.expectEqualStrings("Bearer tok-new", headerValue(try client.authHeaders(&buf), "Authorization").?);
 }
 
 test "isChatModel keeps chat families" {

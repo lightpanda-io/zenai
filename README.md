@@ -322,16 +322,15 @@ if (response.value.firstToolCall()) |tc| {
 
 ## ChatGPT subscription (Codex)
 
-`zenai.codex` talks to the backend Codex CLI uses (`chatgpt.com/backend-api/codex`), so requests count against a ChatGPT plan rather than API credits. It speaks the same Responses API as the OpenAI client but authenticates with the subscription's OAuth access token and the ChatGPT account id from that token's JWT.
+The `.codex` provider talks to the backend Codex CLI uses (`chatgpt.com/backend-api/codex`), so requests count against a ChatGPT plan rather than API credits. It is the OpenAI client set up with `initChatGpt`: the same Responses API, authenticated with the subscription's OAuth access token and the ChatGPT account id from that token's JWT.
 
 zenai doesn't run the OAuth login. Get the token yourself (the browser's `lightpanda agent` does it in `src/agent/auth/codex.zig`), then go through the provider abstraction:
 
 ```zig
-var codex_client = try zenai.codex.Client.init(io, allocator, access_token, .{
+const ai = try zenai.provider.Client.init(io, allocator, .codex, access_token, .{
     .account_id = account_id,
 });
-defer codex_client.deinit();
-const ai: zenai.provider.Client = .{ .codex = &codex_client };
+defer ai.deinit(allocator);
 
 var result = try ai.generateContent("gpt-5.5", &.{
     .{ .role = .user, .content = "What is Zig?" },
