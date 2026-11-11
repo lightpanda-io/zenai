@@ -2,6 +2,7 @@ pub const gemini = struct {
     pub const Client = @import("gemini/Client.zig");
     pub const Chat = @import("gemini/Chat.zig");
     pub const types = @import("gemini/types.zig");
+    pub const decisions = @import("gemini/decisions.zig");
 };
 
 pub const openai = struct {
