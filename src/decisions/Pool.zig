@@ -55,6 +55,11 @@ pub const Options = struct {
     /// Worth setting when the caller is waiting on the ask: see
     /// `InitOptions.request_timeout_ms` on either client.
     request_timeout_ms: ?u32 = null,
+    /// Borrowed `std.http.Client` for every client the pool makes, so they
+    /// share one connection pool; see `http.Transport.Options.http_client`,
+    /// including what sharing it across threads asks of its allocator. Null
+    /// gives each client its own.
+    http_client: ?*std.http.Client = null,
     /// A variable naming the provider to use, "gemini" or "typesafe", for when
     /// both have a key. Unset (or null), Gemini is preferred.
     provider_env_var_name: ?[]const u8 = null,
@@ -195,11 +200,13 @@ fn take(self: *Pool) !Pooled {
                 .base_url = url_copy,
                 .retry_policy = self.options.retry_policy,
                 .request_timeout_ms = self.options.request_timeout_ms,
+                .http_client = self.options.http_client,
             }) },
             .typesafe => .{ .typesafe = try self.create(TypesafeClient, key_copy, .{
                 .base_url = url_copy.?,
                 .retry_policy = self.options.retry_policy,
                 .request_timeout_ms = self.options.request_timeout_ms,
+                .http_client = self.options.http_client,
             }) },
         },
     };

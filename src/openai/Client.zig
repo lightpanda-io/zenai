@@ -47,6 +47,9 @@ pub const InitOptions = struct {
     /// established connection to the end of the body (connect excluded);
     /// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
     request_timeout_ms: ?u32 = null,
+    /// Borrowed `std.http.Client` to share a connection pool with other
+    /// clients; see `http.Transport.Options.http_client`. Null owns one.
+    http_client: ?*std.http.Client = null,
 };
 
 /// Create a new OpenAI API client.
@@ -55,6 +58,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
         .transport = .init(io, allocator, .{
             .retry_policy = options.retry_policy,
             .request_timeout_ms = options.request_timeout_ms,
+            .http_client = options.http_client,
             .log_tag = "OpenAI",
         }),
         .api_key = api_key,

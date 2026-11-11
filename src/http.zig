@@ -70,8 +70,16 @@ pub const BearerAuth = struct {
     }
 };
 
+/// A `std.http.Client` set up the way a `Transport` makes its own: DNS
+/// lookups go through `addrConfigIo`. Use it to build a client to share
+/// through `Transport.Options.http_client`. The caller owns it and calls
+/// `deinit` once no transport uses it.
+pub fn newClient(io: std.Io, allocator: std.mem.Allocator) std.http.Client {
+    return .{ .allocator = allocator, .io = addrConfigIo(io) };
+}
+
 /// `io` with DNS lookups that skip IPv6 when this host can't reach the IPv6
-/// internet, as glibc's `AI_ADDRCONFIG` does. Hand it to `std.http.Client`.
+/// internet, as glibc's `AI_ADDRCONFIG` does. `newClient` applies it.
 ///
 /// Zig 0.17's `HostName.connect` starts a connect per resolved address with
 /// `io.async`. On `Io.Threaded.init_single_threaded` (what lightpanda uses)
@@ -254,15 +262,17 @@ const Watchdog = struct {
 };
 
 /// The HTTP plumbing every API client shares: the `std.http.Client` and its
-/// connection pool, the retry and timeout policy, the detail of the last
-/// failed request, and an optional interrupt. Each client embeds one as its
-/// `transport` field and keeps only what is its own: auth headers, URLs and
-/// request shapes.
+/// connection pool (its own, or one borrowed from the caller), the retry and
+/// timeout policy, the detail of the last failed request, and an optional
+/// interrupt. Each client embeds one as its `transport` field and keeps only
+/// what is its own: auth headers, URLs and request shapes.
 pub const Transport = struct {
     allocator: std.mem.Allocator,
-    /// Reach it through `httpClient()`, the one place that assumes the
-    /// transport owns its client.
-    http_client: std.http.Client,
+    /// Reach it through `httpClient()`.
+    http_client: union(enum) {
+        owned: std.http.Client,
+        borrowed: *std.http.Client,
+    },
     /// Retry policy applied to every non-streaming request.
     retry_policy: retry.RetryPolicy,
     /// Per-attempt wall-clock bound on non-streaming requests, from an
@@ -280,27 +290,52 @@ pub const Transport = struct {
         retry_policy: retry.RetryPolicy = .{},
         request_timeout_ms: ?u32 = null,
         log_tag: ?[]const u8 = null,
+        /// A `std.http.Client` to send requests through, borrowed: `deinit`
+        /// leaves it open, and it must outlive the transport. Transports given
+        /// the same one share its connection pool and CA bundle, so a request
+        /// to a host another one already reached skips the TCP and TLS
+        /// handshakes, and the system CA bundle is scanned once. Null (the
+        /// default) makes one the transport owns.
+        ///
+        /// Build it with `newClient`, which resolves hosts the way an owned
+        /// one does (`addrConfigIo`). Connections are made with the shared
+        /// client's `io` and `allocator`; response bodies still come from the
+        /// transport's allocator.
+        ///
+        /// Sharing it across threads is safe when its allocator is:
+        /// `std.http.Client.request` takes the connection pool's mutex and the
+        /// CA bundle's lock, and a request holds its connection alone until
+        /// it is done. Don't reset its `now` to null or change its proxies
+        /// while requests are in flight. A zenai client itself is still for
+        /// one thread at a time.
+        http_client: ?*std.http.Client = null,
     };
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, options: Options) Transport {
         return .{
             .allocator = allocator,
-            .http_client = .{ .allocator = allocator, .io = addrConfigIo(io) },
+            .http_client = if (options.http_client) |c| .{ .borrowed = c } else .{ .owned = newClient(io, allocator) },
             .retry_policy = options.retry_policy,
             .request_timeout_ms = options.request_timeout_ms,
             .log_tag = options.log_tag,
         };
     }
 
-    /// Closes the connections and frees `last_error`.
+    /// Frees `last_error`, and closes the connections of a client it owns.
     pub fn deinit(self: *Transport) void {
         self.last_error.deinit(self.allocator);
-        self.http_client.deinit();
+        switch (self.http_client) {
+            .owned => |*c| c.deinit(),
+            .borrowed => {},
+        }
     }
 
     /// The client requests go through.
     pub fn httpClient(self: *Transport) *std.http.Client {
-        return &self.http_client;
+        return switch (self.http_client) {
+            .owned => |*c| c,
+            .borrowed => |c| c,
+        };
     }
 
     /// Record a non-2xx response (or an unparseable 2xx body) in `last_error`.
@@ -1036,6 +1071,8 @@ const Serve = enum {
     /// Send a head and part of the body, then close with the request still
     /// unread, which makes the kernel reset the connection mid-body.
     reset_mid_body,
+    /// Answer two requests on the one connection, then close.
+    respond_twice,
     /// Answer as a CDN fronting an API does: gzip and chunked when the request
     /// accepts gzip, plain otherwise.
     respond_negotiated,
@@ -1067,6 +1104,15 @@ fn serveOnce(server: *std.Io.net.Server, serve: Serve) void {
             var request = http_server.receiveHead() catch return;
             request.respond("{\"ok\":true}\n", .{ .keep_alive = true }) catch return;
         },
+        .respond_twice => {
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(io, &read_buf);
+            var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
+            for (0..2) |_| {
+                var request = http_server.receiveHead() catch return;
+                request.respond("{\"ok\":true}\n", .{ .keep_alive = true }) catch return;
+            }
+        },
         .respond_negotiated => {
             var read_buf: [4096]u8 = undefined;
             var reader = stream.reader(io, &read_buf);
@@ -1097,6 +1143,36 @@ test "a JSON call leaves its connection in the pool" {
     defer response.deinit();
     try std.testing.expect(response.value.ok);
     try std.testing.expectEqual(1, t.transport.httpClient().connection_pool.free_len);
+}
+
+test "transports borrowing one client share its connection and leave it open" {
+    var t: Loopback = try .init();
+    defer t.deinit();
+
+    // The server accepts one connection only, so the second call succeeds
+    // only on the connection the first one left in the shared pool.
+    const thread = try std.Thread.spawn(.{}, serveOnce, .{ &t.server, Serve.respond_twice });
+    defer thread.join();
+    errdefer if (t.server.socket.address.connect(std.testing.io, .{ .mode = .stream })) |c| c.close(std.testing.io) else |_| {};
+
+    // Closed before the join, so a server still waiting on the pooled
+    // connection for a second request returns.
+    var shared = newClient(std.testing.io, std.testing.allocator);
+    defer shared.deinit();
+
+    const options: Transport.Options = .{ .retry_policy = .disabled, .request_timeout_ms = 2000, .http_client = &shared };
+    t.transport.deinit();
+    t.transport = .init(std.testing.io, std.testing.allocator, options);
+    var other: Transport = .init(std.testing.io, std.testing.allocator, options);
+    defer other.deinit();
+    try std.testing.expectEqual(&shared, other.httpClient());
+
+    var first = try t.transport.getJson(t.url, &.{}, Loopback.Ok);
+    first.deinit();
+    var second = try other.getJson(t.url, &.{}, Loopback.Ok);
+    defer second.deinit();
+    try std.testing.expect(second.value.ok);
+    try std.testing.expectEqual(1, shared.connection_pool.free_len);
 }
 
 test "watchdog turns a stalled response into error.Timeout" {

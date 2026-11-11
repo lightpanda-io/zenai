@@ -511,6 +511,9 @@ pub const Client = union(enum) {
         /// established connection to the end of the body (connect excluded);
         /// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
         request_timeout_ms: ?u32 = null,
+        /// Borrowed `std.http.Client` to share a connection pool with other
+        /// clients; see `http.Transport.Options.http_client`. Null owns one.
+        http_client: ?*std.http.Client = null,
         /// Hugging Face org to bill via `X-HF-Bill-To`. Only applied to the
         /// OpenAI-compatible clients; ignored by gemini/anthropic.
         bill_to: ?[]const u8 = null,
@@ -548,7 +551,11 @@ pub const Client = union(enum) {
                     .openai_compatible => envGet(options.environ, "OPENAI_BASE_URL") orelse return error.MissingBaseUrl,
                     else => info(tag).base_url,
                 };
-                var impl_opts: Impl.InitOptions = .{ .retry_policy = options.retry_policy, .request_timeout_ms = options.request_timeout_ms };
+                var impl_opts: Impl.InitOptions = .{
+                    .retry_policy = options.retry_policy,
+                    .request_timeout_ms = options.request_timeout_ms,
+                    .http_client = options.http_client,
+                };
                 if (base_url) |u| impl_opts.base_url = u;
                 if (@hasField(Impl.InitOptions, "bill_to")) impl_opts.bill_to = options.bill_to;
                 if (@hasField(Impl.InitOptions, "account_id")) impl_opts.account_id = options.account_id;

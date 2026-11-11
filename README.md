@@ -659,6 +659,8 @@ Gemini (`GOOGLE_API_KEY`/`GEMINI_API_KEY`, not on Vertex) is preferred over `TYP
 
 The provider abstraction covers generation, streaming, embeddings and multi-turn chat (`zenai.Chat`) across all of them, and `lastError()` returns the status and message behind a failed request.
 
+Each client opens its own connections unless it is given one to borrow. To share one connection pool and CA bundle across clients (and threads, if its allocator is thread-safe), build a `std.http.Client` with `zenai.http.newClient(io, allocator)` and pass a pointer to it as `http_client` in each client's `InitOptions`, `provider.Client.InitOptions` or `decisions.Pool.Options`. It must outlive them, and you `deinit` it yourself.
+
 Search options beyond the basics:
 
 - **Tavily**: synthesized answers, domain include/exclude, news/general topic, time range

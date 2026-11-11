@@ -39,6 +39,9 @@ pub const InitOptions = struct {
     /// retries and is not bounded by `request_timeout_ms`.
     retry_policy: RetryPolicy = .{},
     request_timeout_ms: ?u32 = null,
+    /// Borrowed `std.http.Client` to share a connection pool with other
+    /// clients; see `http.Transport.Options.http_client`. Null owns one.
+    http_client: ?*std.http.Client = null,
 };
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, access_token: []const u8, options: InitOptions) !Client {
@@ -46,6 +49,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, access_token: []const u8, 
         .transport = .init(io, allocator, .{
             .retry_policy = options.retry_policy,
             .request_timeout_ms = options.request_timeout_ms,
+            .http_client = options.http_client,
             .log_tag = "Codex",
         }),
         .access_token = access_token,
