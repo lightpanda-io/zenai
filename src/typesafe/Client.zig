@@ -19,16 +19,10 @@ const Questions = types.Questions;
 
 const Client = @This();
 
-allocator: std.mem.Allocator,
+transport: http.Transport,
 api_key: []const u8,
 base_url: []const u8,
-http_client: std.http.Client,
-retry_policy: RetryPolicy,
-request_timeout_ms: ?u32,
-last_error: http.ErrorDetail = .{},
 bearer: http.BearerAuth = .{},
-/// Set by the host so a SIGINT can abort an in-flight request mid-read.
-interrupt: ?*http.Interrupt = null,
 
 /// Vercel AI Gateway serves the same protocol at
 /// `https://ai-gateway.vercel.sh/typesafe`, with model `typesafe-ai/jev`.
@@ -61,38 +55,34 @@ pub const InitOptions = struct {
 /// outlive the client.
 pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
     return .{
-        .allocator = allocator,
+        .transport = .init(io, allocator, .{
+            .retry_policy = options.retry_policy,
+            .request_timeout_ms = options.request_timeout_ms,
+            .log_tag = "TypeSafe",
+        }),
         .api_key = api_key,
         .base_url = options.base_url,
-        .http_client = .{ .allocator = allocator, .io = http.addrConfigIo(io) },
-        .retry_policy = options.retry_policy,
-        .request_timeout_ms = options.request_timeout_ms,
     };
 }
 
 pub fn deinit(self: *Client) void {
-    self.http_client.deinit();
-    self.last_error.deinit(self.allocator);
-    self.bearer.deinit(self.allocator);
+    self.bearer.deinit(self.transport.allocator);
+    self.transport.deinit();
 }
 
 pub const Response = http.Response;
 
 pub const ApiError = error{MissingApiKey} || http.FetchError;
 
-pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error.setLogged(self.allocator, status_code, body, "TypeSafe");
-}
-
 fn authHeader(self: *Client) std.mem.Allocator.Error![1]std.http.Header {
-    return .{try self.bearer.header(self.allocator, self.api_key)};
+    return .{try self.bearer.header(self.transport.allocator, self.api_key)};
 }
 
 /// Ask typed questions about `state`; each answer comes back under its
 /// question's id. Read a `choice` through `AskResponse.choice`, which validates it.
 ///
 /// 401 and 422 (malformed question, or state over 32k) surface as
-/// `error.ApiError` with the detail in `last_error`.
+/// `error.ApiError` with the detail in `transport.last_error`.
 ///
 /// Caller owns the returned `Response` and must call `deinit()`; every string
 /// in the answers borrows it.
@@ -104,13 +94,13 @@ pub fn ask(
 ) ApiError!Response(AskResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try self.allocator.print("{s}/v1/systemone", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/v1/systemone", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     const request: AskRequest = .{ .state = state, .model = options.model, .questions = questions };
     const auth = try self.authHeader();
 
-    return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, &auth, request, AskResponse, self);
+    return self.transport.postJson(url, &auth, request, AskResponse);
 }
 
 /// List the model names and aliases this key may send in `AskOptions.model`.
@@ -118,15 +108,11 @@ pub fn ask(
 pub fn listModels(self: *Client) ApiError!Response(ListModelsResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try self.allocator.print("{s}/v1/models", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/v1/models", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     const auth = try self.authHeader();
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
-        .location = .{ .url = url },
-        .method = .GET,
-        .extra_headers = &auth,
-    }, ListModelsResponse, self);
+    return self.transport.getJson(url, &auth, ListModelsResponse);
 }
 
 test "ask and listModels reject an empty api key" {

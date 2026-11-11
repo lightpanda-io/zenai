@@ -153,7 +153,7 @@ pub fn ask(
         .typesafe => |client| {
             const model = options.model orelse Provider.typesafe.defaultModel();
             return client.ask(state, questions, .{ .model = model }) catch |err| {
-                if (err == error.ApiError) failure.* = try client.last_error.dupe(arena);
+                if (err == error.ApiError) failure.* = try client.transport.last_error.dupe(arena);
                 return err;
             };
         },
@@ -161,7 +161,7 @@ pub fn ask(
             const model = options.model orelse Provider.gemini.defaultModel();
             const request = try gemini_adapter.toGemini(arena, state, questions);
             var response = client.createDecision(model, request.input, request.questions) catch |err| {
-                if (err == error.ApiError) failure.* = try client.last_error.dupe(arena);
+                if (err == error.ApiError) failure.* = try client.transport.last_error.dupe(arena);
                 return err;
             };
             defer response.deinit();

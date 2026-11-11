@@ -21,25 +21,15 @@ const ToolConfig = types.ToolConfig;
 /// model management, file uploads, token counting, and cached content.
 const Client = @This();
 
-allocator: std.mem.Allocator,
+transport: http.Transport,
 api_key: []const u8,
 /// Base URL override; null derives the backend default (see `VertexConfig`).
 base_url: ?[]const u8,
 api_version: []const u8,
 /// Vertex AI backend config; null targets the Gemini Developer API.
 vertex: ?VertexConfig,
-http_client: std.http.Client,
-/// Retry policy applied to every non-streaming request.
-retry_policy: RetryPolicy,
-/// Per-attempt wall-clock bound on non-streaming requests, from an
-/// established connection to the end of the body (connect excluded);
-/// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
-request_timeout_ms: ?u32,
 /// Used in Vertex project/location mode.
 bearer: http.BearerAuth = .{},
-last_error: http.ErrorDetail = .{},
-/// Set by the host so a SIGINT can abort an in-flight request mid-read.
-interrupt: ?*http.Interrupt = null,
 
 /// Google Vertex AI backend configuration. When set on `InitOptions`, the
 /// client targets Vertex AI instead of the Gemini Developer API.
@@ -82,23 +72,23 @@ pub const InitOptions = struct {
 /// `MissingApiKey` guard then means "missing access token".
 pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
     return .{
-        .allocator = allocator,
+        .transport = .init(io, allocator, .{
+            .retry_policy = options.retry_policy,
+            .request_timeout_ms = options.request_timeout_ms,
+            .log_tag = "Gemini",
+        }),
         .api_key = api_key,
         .base_url = options.base_url,
         .api_version = options.api_version orelse
             (if (options.vertex != null) "v1beta1" else "v1beta"),
         .vertex = options.vertex,
-        .http_client = .{ .allocator = allocator, .io = http.addrConfigIo(io) },
-        .retry_policy = options.retry_policy,
-        .request_timeout_ms = options.request_timeout_ms,
     };
 }
 
 /// Release all resources held by the client, including HTTP connections.
 pub fn deinit(self: *Client) void {
-    self.last_error.deinit(self.allocator);
-    self.bearer.deinit(self.allocator);
-    self.http_client.deinit();
+    self.bearer.deinit(self.transport.allocator);
+    self.transport.deinit();
 }
 
 /// Per-request options for system instructions, safety, and tools.
@@ -148,17 +138,13 @@ pub const ApiError = error{ MissingApiKey, UnsupportedByBackend } || http.FetchE
 
 // --- Internal helpers ---
 
-pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error.setLogged(self.allocator, status_code, body, "Gemini");
-}
-
 const default_base_url = "https://generativelanguage.googleapis.com";
 
 /// The auth header for this client's backend: `x-goog-api-key` for the
 /// Developer API and Vertex express mode, or `Authorization: Bearer` in
 /// Vertex project/location mode where `api_key` holds an OAuth access token.
 fn authHeader(self: *Client) error{OutOfMemory}!std.http.Header {
-    if (self.vertex) |v| if (v.project != null) return self.bearer.header(self.allocator, self.api_key);
+    if (self.vertex) |v| if (v.project != null) return self.bearer.header(self.transport.allocator, self.api_key);
     return .{ .name = "x-goog-api-key", .value = self.api_key };
 }
 
@@ -202,7 +188,7 @@ const UrlOptions = struct {
 /// "publishers/{org}/models/{name}"); names already prefixed with
 /// "projects/", "models/" or "publishers/" pass through.
 fn modelUrl(self: *const Client, model: []const u8, opts: UrlOptions) error{OutOfMemory}![]u8 {
-    var buf: std.Io.Writer.Allocating = .init(self.allocator);
+    var buf: std.Io.Writer.Allocating = .init(self.transport.allocator);
     errdefer buf.deinit();
     self.writeModelUrl(&buf.writer, model, opts) catch return error.OutOfMemory;
     return buf.toOwnedSlice();
@@ -233,15 +219,12 @@ fn writeModelUrl(self: *const Client, w: *std.Io.Writer, model: []const u8, opts
 
 fn fetchGet(self: *Client, url: []const u8, comptime T: type) ApiError!Response(T) {
     const auth = [1]std.http.Header{try self.authHeader()};
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
-        .location = .{ .url = url },
-        .extra_headers = &auth,
-    }, T, self);
+    return self.transport.getJson(url, &auth, T);
 }
 
 fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) ApiError!Response(T) {
     const auth = [1]std.http.Header{try self.authHeader()};
-    return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, &auth, body, T, self);
+    return self.transport.postJson(url, &auth, body, T);
 }
 
 /// Pagination options for list operations.
@@ -261,7 +244,7 @@ pub fn generateContent(
 ) ApiError!Response(GenerateContentResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
     const url = try self.modelUrl(model, .{ .action = "generateContent" });
-    defer self.allocator.free(url);
+    defer self.transport.allocator.free(url);
 
     var response = try self.fetchPost(url, generateRequest(contents, config, options), GenerateContentResponse);
     if (!options.automatic_continuation) return response;
@@ -321,20 +304,20 @@ pub fn generateContentStream(
     if (self.api_key.len == 0) return error.MissingApiKey;
 
     const url = try self.modelUrl(model, .{ .action = "streamGenerateContent?alt=sse" });
-    defer self.allocator.free(url);
+    defer self.transport.allocator.free(url);
 
     const auth = [1]std.http.Header{try self.authHeader()};
     var request = generateRequest(contents, config, options);
     if (!options.automatic_continuation) {
-        return http.streamSseValue(self.allocator, &self.http_client, url, &auth, request, GenerateContentResponse, self, context, callback);
+        return self.transport.streamSse(url, &auth, request, GenerateContentResponse, context, callback);
     }
 
     const Hops = continuation.Stream(@TypeOf(context), StreamError);
-    var hops: Hops = .init(self.allocator, context, callback);
+    var hops: Hops = .init(self.transport.allocator, context, callback);
     defer hops.deinit();
     while (true) {
         var hop_err: ?StreamError = null;
-        http.streamSseValue(self.allocator, &self.http_client, url, &auth, request, GenerateContentResponse, self, &hops, Hops.onChunk) catch |err| {
+        self.transport.streamSse(url, &auth, request, GenerateContentResponse, &hops, Hops.onChunk) catch |err| {
             if (err == error.OutOfMemory) return err;
             // A rejected request is not retried here.
             if (err == error.ApiError and !hops.receivedChunk()) return err;
@@ -342,7 +325,7 @@ pub fn generateContentStream(
         };
         if (hops.err) |e| return e;
         // An interrupted read ends the body like a clean close; never resume it.
-        if (self.interrupt) |it| if (it.isFired()) return hop_err orelse {};
+        if (self.transport.interrupted()) return hop_err orelse {};
         request.continuationToken = try hops.endHop(hop_err) orelse return;
     }
 }
@@ -440,7 +423,7 @@ pub const StreamAccumulator = struct {
 pub fn getModel(self: *Client, model: []const u8) !Response(types.Model) {
     if (self.api_key.len == 0) return error.MissingApiKey;
     const url = try self.modelUrl(model, .{ .project_scope = false });
-    defer self.allocator.free(url);
+    defer self.transport.allocator.free(url);
     return self.fetchGet(url, types.Model);
 }
 
@@ -469,7 +452,7 @@ pub fn isChatModel(m: types.Model) bool {
 /// project/location mode — express mode can generate but not list.
 pub fn listModels(self: *Client, options: ListOptions) !Response(types.ListModelsResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    var base_buf: std.Io.Writer.Allocating = .init(self.allocator);
+    var base_buf: std.Io.Writer.Allocating = .init(self.transport.allocator);
     defer base_buf.deinit();
     self.writeHost(&base_buf.writer) catch return error.OutOfMemory;
     base_buf.writer.print("/{s}/{s}", .{
@@ -477,8 +460,8 @@ pub fn listModels(self: *Client, options: ListOptions) !Response(types.ListModel
         if (self.vertex != null) "publishers/google/models" else "models",
     }) catch return error.OutOfMemory;
     const base = base_buf.written();
-    const url = try http.appendListParams(self.allocator, base, options);
-    defer self.allocator.free(url);
+    const url = try http.appendListParams(self.transport.allocator, base, options);
+    defer self.transport.allocator.free(url);
     return self.fetchGet(url, types.ListModelsResponse);
 }
 
@@ -494,7 +477,7 @@ pub fn countTokens(
 ) !Response(types.CountTokensResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
     const url = try self.modelUrl(model, .{ .action = "countTokens" });
-    defer self.allocator.free(url);
+    defer self.transport.allocator.free(url);
     return self.fetchPost(url, types.CountTokensRequest{
         .contents = contents,
         .systemInstruction = options.systemInstruction,
@@ -535,8 +518,8 @@ pub fn embedContent(
 ) !Response(types.EmbedContentResponse) {
     try self.requireDeveloperApi();
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/{s}/models/{s}:embedContent", .{ self.devBaseUrl(), self.api_version, model });
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/{s}/models/{s}:embedContent", .{ self.devBaseUrl(), self.api_version, model });
+    defer self.transport.allocator.free(url);
     return self.fetchPost(url, types.EmbedContentRequest{
         .content = content,
         .taskType = config.taskType,
@@ -570,14 +553,14 @@ pub fn createDecision(
 ) !Response(decisions.CreateDecisionResponse) {
     try self.requireDeveloperApi();
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/{s}/decisions", .{ self.devBaseUrl(), self.api_version });
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/{s}/decisions", .{ self.devBaseUrl(), self.api_version });
+    defer self.transport.allocator.free(url);
 
     const full_model = if (std.mem.startsWith(u8, model, "models/"))
-        try self.allocator.dupe(u8, model)
+        try self.transport.allocator.dupe(u8, model)
     else
-        try self.allocator.print("models/{s}", .{model});
-    defer self.allocator.free(full_model);
+        try self.transport.allocator.print("models/{s}", .{model});
+    defer self.transport.allocator.free(full_model);
 
     return self.fetchPost(url, decisions.CreateDecisionRequest{
         .input = input,

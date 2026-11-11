@@ -20,7 +20,7 @@ const SearchResponse = types.SearchResponse;
 
 const Client = @This();
 
-allocator: std.mem.Allocator,
+transport: http.Transport,
 /// `null` selects the keyless public endpoint. A non-null key — even an
 /// empty one, e.g. from a set-but-empty environment variable — selects the
 /// keyed endpoint, so a misconfigured key fails loudly instead of silently
@@ -28,10 +28,6 @@ allocator: std.mem.Allocator,
 api_key: ?[]const u8,
 base_url: []const u8,
 app_title: []const u8,
-http_client: std.http.Client,
-retry_policy: RetryPolicy,
-request_timeout_ms: ?u32,
-last_error: http.ErrorDetail = .{},
 
 /// The environment variable `envApiKey` reads. Unset is fine: `null`
 /// selects the keyless public endpoint.
@@ -58,19 +54,19 @@ pub const InitOptions = struct {
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: ?[]const u8, options: InitOptions) Client {
     return .{
-        .allocator = allocator,
+        .transport = .init(io, allocator, .{
+            .retry_policy = options.retry_policy,
+            .request_timeout_ms = options.request_timeout_ms,
+            .log_tag = "Keenable",
+        }),
         .api_key = api_key,
         .base_url = options.base_url,
         .app_title = options.app_title,
-        .http_client = .{ .allocator = allocator, .io = http.addrConfigIo(io) },
-        .retry_policy = options.retry_policy,
-        .request_timeout_ms = options.request_timeout_ms,
     };
 }
 
 pub fn deinit(self: *Client) void {
-    self.http_client.deinit();
-    self.last_error.deinit(self.allocator);
+    self.transport.deinit();
 }
 
 pub const Response = http.Response;
@@ -78,10 +74,6 @@ pub const Response = http.Response;
 /// No `MissingApiKey` — a `null` key is the supported keyless mode. What is
 /// required instead is the attribution title, checked before any request.
 pub const ApiError = error{MissingAppTitle} || http.FetchError;
-
-pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error.setLogged(self.allocator, status_code, body, "Keenable");
-}
 
 /// `/v1/search` keyed, `/v1/search/public` keyless.
 fn searchPath(api_key: ?[]const u8) []const u8 {
@@ -96,8 +88,8 @@ pub fn search(
 ) ApiError!Response(SearchResponse) {
     if (self.app_title.len == 0) return error.MissingAppTitle;
 
-    const url = try self.allocator.print("{s}{s}", .{ self.base_url, searchPath(self.api_key) });
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}{s}", .{ self.base_url, searchPath(self.api_key) });
+    defer self.transport.allocator.free(url);
 
     var request = options;
     request.query = query;
@@ -107,7 +99,7 @@ pub fn search(
         .{ .name = "X-API-Key", .value = self.api_key orelse "" },
     };
 
-    return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, headers[0..if (self.api_key == null) 1 else 2], request, SearchResponse, self);
+    return self.transport.postJson(url, headers[0..if (self.api_key == null) 1 else 2], request, SearchResponse);
 }
 
 test "null api key routes to the public endpoint" {

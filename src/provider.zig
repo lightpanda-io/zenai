@@ -491,10 +491,15 @@ pub const Client = union(enum) {
 
     pub const Error = gemini_mod.ApiError || openai_mod.ApiError || anthropic_mod.ApiError || codex_mod.ApiError;
 
-    fn clientAllocator(self: Client) std.mem.Allocator {
+    /// The backend client's HTTP plumbing.
+    pub fn transport(self: Client) *http.Transport {
         return switch (self) {
-            inline else => |c| c.allocator,
+            inline else => |c| &c.transport,
         };
+    }
+
+    fn clientAllocator(self: Client) std.mem.Allocator {
+        return self.transport().allocator;
     }
 
     pub const InitOptions = struct {
@@ -569,9 +574,7 @@ pub const Client = union(enum) {
     /// Install a cross-thread interrupt so a SIGINT can abort an in-flight
     /// request mid-read instead of waiting for the model's full response.
     pub fn setInterrupt(self: Client, it: *http.Interrupt) void {
-        switch (self) {
-            inline else => |client| client.interrupt = it,
-        }
+        self.transport().interrupt = it;
     }
 
     /// Repoint a subscription client at a refreshed OAuth access token without
@@ -594,9 +597,8 @@ pub const Client = union(enum) {
     };
 
     pub fn lastError(self: Client) LastError {
-        return switch (self) {
-            inline else => |client| .{ .status = client.last_error.status, .message = client.last_error.message },
-        };
+        const detail = self.transport().last_error;
+        return .{ .status = detail.status, .message = detail.message };
     }
 
     /// Generate content from a list of messages.
@@ -651,12 +653,12 @@ pub const Client = union(enum) {
                 const hook = on_text orelse {
                     var response = try g.generateContent(model, separated.contents, gen_config, opts);
                     defer response.deinit();
-                    return geminiResult(g.allocator, response.value);
+                    return geminiResult(self.clientAllocator(), response.value);
                 };
                 var acc = gemini_mod.StreamAccumulator.init(ra, hook.context, hook.onText);
                 g.generateContentStream(model, separated.contents, gen_config, opts, &acc, gemini_mod.StreamAccumulator.onEvent) catch |err| return streamFailed(err);
                 if (acc.err) |e| return e;
-                return geminiResult(g.allocator, try acc.response());
+                return geminiResult(self.clientAllocator(), try acc.response());
             },
             // OpenAI and xAI speak the Responses API (Chat Completions 400s on
             // function tools + reasoning for gpt-5; xAI treats it as legacy).
@@ -670,7 +672,7 @@ pub const Client = union(enum) {
                     const o = self.openAiClient();
                     var response = try o.createResponse(request);
                     defer response.deinit();
-                    return openAiResponsesResult(o.allocator, response.value, self, model);
+                    return openAiResponsesResult(self.clientAllocator(), response.value, self, model);
                 };
                 var acc = openai_mod.ResponsesStreamAccumulator.init(ra, hook.context, hook.onText);
                 const sent = switch (self) {
@@ -688,12 +690,12 @@ pub const Client = union(enum) {
                 const hook = on_text orelse {
                     var response = try ollama_native.chat(o, model, call.messages, call.tools, call.think, call.format, call.options);
                     defer response.deinit();
-                    return ollamaResult(o.allocator, response.value);
+                    return ollamaResult(self.clientAllocator(), response.value);
                 };
                 var acc = ollama_native.StreamAccumulator.init(ra, hook.context, hook.onText);
                 ollama_native.chatStream(o, model, call.messages, call.tools, call.think, call.format, call.options, &acc, ollama_native.StreamAccumulator.onChunk) catch |err| return streamFailed(err);
                 if (acc.err) |e| return e;
-                return ollamaResult(o.allocator, acc.response());
+                return ollamaResult(self.clientAllocator(), acc.response());
             },
             .huggingface, .llama_cpp, .llmd, .openai_compatible, .vercel, .mistral, .openrouter => |o| {
                 const oai_messages = try messagesToOpenAIMessages(ra, messages);
@@ -702,12 +704,12 @@ pub const Client = union(enum) {
                 const hook = on_text orelse {
                     var response = try o.chatCompletion(model, oai_messages, cfg);
                     defer response.deinit();
-                    return openAiChatResult(o.allocator, response.value);
+                    return openAiChatResult(self.clientAllocator(), response.value);
                 };
                 var acc = openai_mod.StreamAccumulator.init(ra, hook.context, hook.onText);
                 o.chatCompletionStream(model, oai_messages, cfg, &acc, openai_mod.StreamAccumulator.onEvent) catch |err| return streamFailed(err);
                 if (acc.err) |e| return e;
-                return openAiChatResult(o.allocator, try acc.response());
+                return openAiChatResult(self.clientAllocator(), try acc.response());
             },
             .anthropic => |a| {
                 const system_text = try extractSystemText(ra, messages);
@@ -725,12 +727,12 @@ pub const Client = union(enum) {
                 const hook = on_text orelse {
                     var response = try a.createMessage(model, ant_messages, reasoning.max_tokens, opts);
                     defer response.deinit();
-                    return anthropicResult(a.allocator, response.value);
+                    return anthropicResult(self.clientAllocator(), response.value);
                 };
                 var acc = anthropic_mod.StreamAccumulator.init(ra, hook.context, hook.onText);
                 a.createMessageStream(model, ant_messages, reasoning.max_tokens, opts, &acc, anthropic_mod.StreamAccumulator.onEvent) catch |err| return streamFailed(err);
                 if (acc.err) |e| return e;
-                return anthropicResult(a.allocator, try acc.response());
+                return anthropicResult(self.clientAllocator(), try acc.response());
             },
         }
     }
@@ -794,7 +796,7 @@ pub const Client = union(enum) {
             .gemini, .vertex => |g| {
                 var response = try g.embedText(model, text);
                 defer response.deinit();
-                var result = EmbedResult.init(g.allocator);
+                var result = EmbedResult.init(self.clientAllocator());
                 if (response.value.embedding) |e| {
                     if (e.values) |v| {
                         result.values = try result.arena.allocator().dupe(f32, v);
@@ -805,7 +807,7 @@ pub const Client = union(enum) {
             .openai, .ollama, .huggingface, .openai_compatible, .llama_cpp, .llmd, .vercel, .mistral, .openrouter, .xai => |o| {
                 var response = try o.embedText(model, text);
                 defer response.deinit();
-                var result = EmbedResult.init(o.allocator);
+                var result = EmbedResult.init(self.clientAllocator());
                 if (response.value.data) |data| {
                     if (data.len > 0) {
                         if (data[0].embedding) |v| {
@@ -2011,7 +2013,7 @@ const codex_system_role = "developer";
 fn noopOnText(_: *anyopaque, _: []const u8) void {}
 
 /// A backend stream error, collapsed into `Client.Error`; the detail is in
-/// the backend's `last_error`.
+/// the backend's `transport.last_error` (see `lastError`).
 fn streamFailed(err: anyerror) Client.Error {
     return if (err == error.OutOfMemory) error.OutOfMemory else error.ApiError;
 }

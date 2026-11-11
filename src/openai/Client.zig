@@ -16,7 +16,7 @@ const ResponseStreamEvent = types.ResponseStreamEvent;
 /// and model management.
 const Client = @This();
 
-allocator: std.mem.Allocator,
+transport: http.Transport,
 api_key: []const u8,
 base_url: []const u8,
 organization: ?[]const u8,
@@ -24,19 +24,9 @@ project: ?[]const u8,
 /// Hugging Face org to bill via `X-HF-Bill-To`, so the router charges a
 /// Team/Enterprise org instead of the token owner. Ignored by OpenAI/Ollama.
 bill_to: ?[]const u8,
-http_client: std.http.Client,
-/// Retry policy applied to every non-streaming request.
-retry_policy: RetryPolicy,
-/// Per-attempt wall-clock bound on non-streaming requests, from an
-/// established connection to the end of the body (connect excluded);
-/// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
-request_timeout_ms: ?u32,
-last_error: http.ErrorDetail = .{},
-/// Set by the host so a SIGINT can abort an in-flight request mid-read.
-interrupt: ?*http.Interrupt = null,
 bearer: http.BearerAuth = .{},
 /// Per-model cache of the Ollama context window (see `ollama.zig`), so the
-/// `/api/show` lookup runs once per model. `model` is owned by `allocator`;
+/// `/api/show` lookup runs once per model. `model` is owned by the transport's allocator;
 /// `len` is null when the lookup missed (cached so it isn't retried).
 ollama_ctx: ?struct { model: []const u8, len: ?i32 } = null,
 
@@ -62,24 +52,25 @@ pub const InitOptions = struct {
 /// Create a new OpenAI API client.
 pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
     return .{
-        .allocator = allocator,
+        .transport = .init(io, allocator, .{
+            .retry_policy = options.retry_policy,
+            .request_timeout_ms = options.request_timeout_ms,
+            .log_tag = "OpenAI",
+        }),
         .api_key = api_key,
         .base_url = options.base_url,
         .organization = options.organization,
         .project = options.project,
         .bill_to = options.bill_to,
-        .http_client = .{ .allocator = allocator, .io = http.addrConfigIo(io) },
-        .retry_policy = options.retry_policy,
-        .request_timeout_ms = options.request_timeout_ms,
     };
 }
 
 /// Release all resources held by the client, including HTTP connections.
 pub fn deinit(self: *Client) void {
-    self.bearer.deinit(self.allocator);
-    if (self.ollama_ctx) |c| self.allocator.free(c.model);
-    self.last_error.deinit(self.allocator);
-    self.http_client.deinit();
+    const allocator = self.transport.allocator;
+    self.bearer.deinit(allocator);
+    if (self.ollama_ctx) |c| allocator.free(c.model);
+    self.transport.deinit();
 }
 
 pub const Response = http.Response;
@@ -91,7 +82,7 @@ pub const ApiError = error{MissingApiKey} || http.FetchError;
 /// `X-HF-Bill-To` is only emitted when `bill_to` is set, so providers that
 /// don't recognize it never see it.
 fn authHeaders(self: *Client, buf: *[4]std.http.Header) ![]const std.http.Header {
-    buf[0] = try self.bearer.header(self.allocator, self.api_key);
+    buf[0] = try self.bearer.header(self.transport.allocator, self.api_key);
     buf[1] = .{ .name = "OpenAI-Organization", .value = self.organization orelse "" };
     buf[2] = .{ .name = "OpenAI-Project", .value = self.project orelse "" };
     if (self.bill_to) |org| {
@@ -101,23 +92,16 @@ fn authHeaders(self: *Client, buf: *[4]std.http.Header) ![]const std.http.Header
     return buf[0..3];
 }
 
-pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error.setLogged(self.allocator, status_code, body, "OpenAI");
-}
-
 fn fetchGet(self: *Client, url: []const u8, comptime T: type) ApiError!Response(T) {
     var hdr_buf: [4]std.http.Header = undefined;
     const auth = try self.authHeaders(&hdr_buf);
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
-        .location = .{ .url = url },
-        .extra_headers = auth,
-    }, T, self);
+    return self.transport.getJson(url, auth, T);
 }
 
 fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) ApiError!Response(T) {
     var hdr_buf: [4]std.http.Header = undefined;
     const auth = try self.authHeaders(&hdr_buf);
-    return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, auth, body, T, self);
+    return self.transport.postJson(url, auth, body, T);
 }
 
 // --- Chat Completions ---
@@ -158,8 +142,8 @@ pub fn chatCompletion(
     config: ChatCompletionConfig,
 ) ApiError!Response(ChatCompletionResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/chat/completions", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/chat/completions", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     return self.fetchPost(url, ChatCompletionRequest{
         .model = model,
@@ -198,8 +182,8 @@ pub fn chatCompletionFromText(
 /// combined with reasoning on the chat completions endpoint.
 pub fn createResponse(self: *Client, request: ResponsesRequest) ApiError!Response(ResponsesResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/responses", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/responses", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     return self.fetchPost(url, request, ResponsesResponse);
 }
@@ -216,15 +200,15 @@ pub fn createResponseStream(
 ) StreamError!void {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try self.allocator.print("{s}/responses", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/responses", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     var req_body = request;
     req_body.stream = true;
 
     var hdr_buf: [4]std.http.Header = undefined;
     const auth = try self.authHeaders(&hdr_buf);
-    return http.streamSseValue(self.allocator, &self.http_client, url, auth, req_body, ResponseStreamEvent, self, context, callback);
+    return self.transport.streamSse(url, auth, req_body, ResponseStreamEvent, context, callback);
 }
 
 // --- Streaming ---
@@ -243,8 +227,8 @@ pub fn chatCompletionStream(
 ) StreamError!void {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try self.allocator.print("{s}/chat/completions", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/chat/completions", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     const req_body = ChatCompletionRequest{
         .model = model,
@@ -269,7 +253,7 @@ pub fn chatCompletionStream(
 
     var hdr_buf: [4]std.http.Header = undefined;
     const auth = try self.authHeaders(&hdr_buf);
-    return http.streamSseValue(self.allocator, &self.http_client, url, auth, req_body, ChatCompletionResponse, self, context, callback);
+    return self.transport.streamSse(url, auth, req_body, ChatCompletionResponse, context, callback);
 }
 
 /// Convenience: stream a chat completion from a single text prompt.
@@ -499,8 +483,8 @@ pub fn createEmbedding(
     config: EmbedConfig,
 ) ApiError!Response(types.EmbeddingResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/embeddings", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/embeddings", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     return self.fetchPost(url, types.EmbeddingRequest{
         .input = input,
@@ -524,16 +508,16 @@ pub fn embedText(
 /// List available models.
 pub fn listModels(self: *Client) ApiError!Response(types.ListModelsResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/models", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/models", .{self.base_url});
+    defer self.transport.allocator.free(url);
     return self.fetchGet(url, types.ListModelsResponse);
 }
 
 /// Get metadata for a specific model.
 pub fn getModel(self: *Client, model: []const u8) ApiError!Response(types.Model) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/models/{s}", .{ self.base_url, model });
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/models/{s}", .{ self.base_url, model });
+    defer self.transport.allocator.free(url);
     return self.fetchGet(url, types.Model);
 }
 

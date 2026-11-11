@@ -109,8 +109,8 @@ fn modelContextLength(client: *Client, model: []const u8) ?i32 {
     const len = fetchModelContextLength(client, model) catch null;
 
     // Cache even a null miss, keyed by model name.
-    if (client.ollama_ctx) |old| client.allocator.free(old.model);
-    client.ollama_ctx = if (client.allocator.dupe(u8, model)) |owned|
+    if (client.ollama_ctx) |old| client.transport.allocator.free(old.model);
+    client.ollama_ctx = if (client.transport.allocator.dupe(u8, model)) |owned|
         .{ .model = owned, .len = len }
     else |_|
         null;
@@ -118,11 +118,11 @@ fn modelContextLength(client: *Client, model: []const u8) ?i32 {
 }
 
 fn fetchModelContextLength(client: *Client, model: []const u8) !?i32 {
-    const url = try showUrl(client.allocator, client.base_url);
-    defer client.allocator.free(url);
+    const url = try showUrl(client.transport.allocator, client.base_url);
+    defer client.transport.allocator.free(url);
 
     const auth = [_]std.http.Header{.{ .name = "Authorization", .value = client.api_key }};
-    var response = try http.postJsonWithRetry(client.allocator, &client.http_client, client.retry_policy, client.request_timeout_ms, url, &auth, .{ .model = model }, ShowResponse, client);
+    var response = try client.transport.postJson(url, &auth, .{ .model = model }, ShowResponse);
     defer response.deinit();
 
     const info = response.value.model_info orelse return null;
@@ -208,13 +208,13 @@ pub fn chat(
 ) Client.ApiError!http.Response(ChatResponse) {
     if (client.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try chatUrl(client.allocator, client.base_url);
-    defer client.allocator.free(url);
+    const url = try chatUrl(client.transport.allocator, client.base_url);
+    defer client.transport.allocator.free(url);
 
     const req = try buildChatRequest(client, model, messages, tools, think, format, options, false);
     // Local Ollama ignores auth; harmless, and supports an authenticating proxy.
     const auth = [_]std.http.Header{.{ .name = "Authorization", .value = client.api_key }};
-    return http.postJsonWithRetry(client.allocator, &client.http_client, client.retry_policy, client.request_timeout_ms, url, &auth, req, ChatResponse, client);
+    return client.transport.postJson(url, &auth, req, ChatResponse);
 }
 
 /// Streaming counterpart of `chat`: sets `stream: true` and invokes `callback`
@@ -234,12 +234,12 @@ pub fn chatStream(
 ) Client.StreamError!void {
     if (client.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try chatUrl(client.allocator, client.base_url);
-    defer client.allocator.free(url);
+    const url = try chatUrl(client.transport.allocator, client.base_url);
+    defer client.transport.allocator.free(url);
 
     const req = try buildChatRequest(client, model, messages, tools, think, format, options, true);
     const auth = [_]std.http.Header{.{ .name = "Authorization", .value = client.api_key }};
-    return http.streamNdjsonValue(client.allocator, &client.http_client, url, &auth, req, ChatResponse, client, context, callback);
+    return client.transport.streamNdjson(url, &auth, req, ChatResponse, context, callback);
 }
 
 /// Reassembles a streamed `/api/chat` response — forwarding each text delta to

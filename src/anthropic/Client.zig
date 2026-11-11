@@ -15,20 +15,10 @@ const StreamEvent = types.StreamEvent;
 /// streaming, and tool use.
 const Client = @This();
 
-allocator: std.mem.Allocator,
+transport: http.Transport,
 api_key: []const u8,
 base_url: []const u8,
 api_version: []const u8,
-http_client: std.http.Client,
-/// Retry policy applied to every non-streaming request.
-retry_policy: RetryPolicy,
-/// Per-attempt wall-clock bound on non-streaming requests, from an
-/// established connection to the end of the body (connect excluded);
-/// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
-request_timeout_ms: ?u32,
-last_error: http.ErrorDetail = .{},
-/// Set by the host so a SIGINT can abort an in-flight request mid-read.
-interrupt: ?*http.Interrupt = null,
 
 /// Options for customizing the API endpoint.
 pub const InitOptions = struct {
@@ -49,20 +39,20 @@ pub const InitOptions = struct {
 /// Create a new Anthropic API client.
 pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
     return .{
-        .allocator = allocator,
+        .transport = .init(io, allocator, .{
+            .retry_policy = options.retry_policy,
+            .request_timeout_ms = options.request_timeout_ms,
+            .log_tag = "Anthropic",
+        }),
         .api_key = api_key,
         .base_url = options.base_url,
         .api_version = options.api_version,
-        .http_client = .{ .allocator = allocator, .io = http.addrConfigIo(io) },
-        .retry_policy = options.retry_policy,
-        .request_timeout_ms = options.request_timeout_ms,
     };
 }
 
 /// Release all resources held by the client, including HTTP connections.
 pub fn deinit(self: *Client) void {
-    self.last_error.deinit(self.allocator);
-    self.http_client.deinit();
+    self.transport.deinit();
 }
 
 pub const Response = http.Response;
@@ -76,7 +66,7 @@ pub const ApiError = error{MissingApiKey} || http.FetchError;
 fn endpoint(self: *const Client, path: []const u8) std.mem.Allocator.Error![]u8 {
     const base = std.mem.trimEnd(u8, self.base_url, "/");
     const version = if (std.mem.endsWith(u8, base, "/v1")) "" else "/v1";
-    return self.allocator.print("{s}{s}{s}", .{ base, version, path });
+    return self.transport.allocator.print("{s}{s}{s}", .{ base, version, path });
 }
 
 fn authHeaders(self: *const Client) [2]std.http.Header {
@@ -86,22 +76,14 @@ fn authHeaders(self: *const Client) [2]std.http.Header {
     };
 }
 
-pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error.setLogged(self.allocator, status_code, body, "Anthropic");
-}
-
 fn fetchGet(self: *Client, url: []const u8, comptime T: type) ApiError!Response(T) {
     const auth = self.authHeaders();
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
-        .location = .{ .url = url },
-        .method = .GET,
-        .extra_headers = &auth,
-    }, T, self);
+    return self.transport.getJson(url, &auth, T);
 }
 
 fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) ApiError!Response(T) {
     const auth = self.authHeaders();
-    return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, &auth, body, T, self);
+    return self.transport.postJson(url, &auth, body, T);
 }
 
 // --- Message Creation ---
@@ -134,7 +116,7 @@ pub fn createMessage(
 ) ApiError!Response(MessageResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
     const url = try self.endpoint("/messages");
-    defer self.allocator.free(url);
+    defer self.transport.allocator.free(url);
 
     return self.fetchPost(url, MessageRequest{
         .model = model,
@@ -188,7 +170,7 @@ pub fn createMessageStream(
     if (self.api_key.len == 0) return error.MissingApiKey;
 
     const url = try self.endpoint("/messages");
-    defer self.allocator.free(url);
+    defer self.transport.allocator.free(url);
 
     const req_body = MessageRequest{
         .model = model,
@@ -206,7 +188,7 @@ pub fn createMessageStream(
         .cache_control = .{},
     };
     const auth = self.authHeaders();
-    return http.streamSseValue(self.allocator, &self.http_client, url, &auth, req_body, StreamEvent, self, context, callback);
+    return self.transport.streamSse(url, &auth, req_body, StreamEvent, context, callback);
 }
 
 /// Convenience: stream a message from a single text prompt.
@@ -336,7 +318,7 @@ pub const StreamAccumulator = struct {
 pub fn listModels(self: *Client) ApiError!Response(types.ListModelsResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
     const url = try self.endpoint("/models");
-    defer self.allocator.free(url);
+    defer self.transport.allocator.free(url);
     return self.fetchGet(url, types.ListModelsResponse);
 }
 

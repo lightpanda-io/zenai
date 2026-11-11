@@ -574,7 +574,7 @@ Jev ingests the state once and evaluates every question against it in parallel, 
 
 Things to know before relying on it:
 
-- **Limits.** One request carries up to 64k tokens, and the state plus the longest single question must fit in 32k. An overrun comes back as `error.ApiError` with a 422 in `client.last_error`.
+- **Limits.** One request carries up to 64k tokens, and the state plus the longest single question must fit in 32k. An overrun comes back as `error.ApiError` with a 422 in `client.transport.last_error`.
 - **Validate choices.** `typesafe.validateChoice(answer, offered)` rejects an answer whose choice was never offered, whose probabilities don't cover exactly the offered set, or whose choice isn't the argmax. `response.choice(id, questions)` and `choiceEnum` run it for you.
 - **Model versions.** `response.model` is the concrete version that answered, not the alias you asked for, and aliases move without notice. It borrows the response; use `response.dupeModel(allocator)` to keep it. `client.listModels()` lists the versions behind `jev-latest` and `jev-preview`.
 

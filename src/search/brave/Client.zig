@@ -19,13 +19,9 @@ const SearchResponse = types.SearchResponse;
 
 const Client = @This();
 
-allocator: std.mem.Allocator,
+transport: http.Transport,
 api_key: []const u8,
 base_url: []const u8,
-http_client: std.http.Client,
-retry_policy: RetryPolicy,
-request_timeout_ms: ?u32,
-last_error: http.ErrorDetail = .{},
 
 /// The environment variable `envApiKey` reads.
 pub const env_var_name = "BRAVE_API_KEY";
@@ -45,27 +41,23 @@ pub const InitOptions = struct {
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
     return .{
-        .allocator = allocator,
+        .transport = .init(io, allocator, .{
+            .retry_policy = options.retry_policy,
+            .request_timeout_ms = options.request_timeout_ms,
+            .log_tag = "Brave",
+        }),
         .api_key = api_key,
         .base_url = options.base_url,
-        .http_client = .{ .allocator = allocator, .io = http.addrConfigIo(io) },
-        .retry_policy = options.retry_policy,
-        .request_timeout_ms = options.request_timeout_ms,
     };
 }
 
 pub fn deinit(self: *Client) void {
-    self.http_client.deinit();
-    self.last_error.deinit(self.allocator);
+    self.transport.deinit();
 }
 
 pub const Response = http.Response;
 
 pub const ApiError = error{MissingApiKey} || http.FetchError;
-
-pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error.setLogged(self.allocator, status_code, body, "Brave");
-}
 
 /// Run a search. Caller owns the returned `Response` and must call `deinit()`.
 pub fn search(
@@ -75,19 +67,15 @@ pub fn search(
 ) ApiError!Response(SearchResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try buildSearchUrl(self.allocator, self.base_url, query, options);
-    defer self.allocator.free(url);
+    const url = try buildSearchUrl(self.transport.allocator, self.base_url, query, options);
+    defer self.transport.allocator.free(url);
 
     const extra_headers = [_]std.http.Header{
         .{ .name = "X-Subscription-Token", .value = self.api_key },
         .{ .name = "Accept", .value = "application/json" },
     };
 
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
-        .location = .{ .url = url },
-        .method = .GET,
-        .extra_headers = &extra_headers,
-    }, SearchResponse, self);
+    return self.transport.getJson(url, &extra_headers, SearchResponse);
 }
 
 fn buildSearchUrl(

@@ -15,7 +15,7 @@ const ResponseStreamEvent = types.ResponseStreamEvent;
 /// OAuth subscription token plus a ChatGPT account id rather than an API key.
 const Client = @This();
 
-allocator: std.mem.Allocator,
+transport: http.Transport,
 /// OAuth access token (subscription bearer), not an API key.
 access_token: []const u8,
 base_url: []const u8,
@@ -27,9 +27,6 @@ originator: []const u8,
 user_agent: []const u8,
 /// Sent as `session-id`; null omits it.
 session_id: ?[]const u8,
-http_client: std.http.Client,
-last_error: http.ErrorDetail = .{},
-interrupt: ?*http.Interrupt = null,
 bearer: http.BearerAuth = .{},
 
 pub const InitOptions = struct {
@@ -46,22 +43,24 @@ pub const InitOptions = struct {
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, access_token: []const u8, options: InitOptions) !Client {
     return .{
-        .allocator = allocator,
+        .transport = .init(io, allocator, .{
+            .retry_policy = options.retry_policy,
+            .request_timeout_ms = options.request_timeout_ms,
+            .log_tag = "Codex",
+        }),
         .access_token = access_token,
         .base_url = options.base_url,
         .account_id = if (options.account_id) |a| try allocator.dupe(u8, a) else null,
         .session_id = options.session_id,
         .originator = options.originator,
         .user_agent = options.user_agent,
-        .http_client = .{ .allocator = allocator, .io = http.addrConfigIo(io) },
     };
 }
 
 pub fn deinit(self: *Client) void {
-    if (self.account_id) |a| self.allocator.free(a);
-    self.bearer.deinit(self.allocator);
-    self.last_error.deinit(self.allocator);
-    self.http_client.deinit();
+    if (self.account_id) |a| self.transport.allocator.free(a);
+    self.bearer.deinit(self.transport.allocator);
+    self.transport.deinit();
 }
 
 /// Repoint at a refreshed OAuth access token without tearing down connections.
@@ -69,7 +68,7 @@ pub fn deinit(self: *Client) void {
 /// after this returns.
 pub fn setApiKey(self: *Client, token: []const u8) void {
     self.access_token = token;
-    self.bearer.deinit(self.allocator);
+    self.bearer.deinit(self.transport.allocator);
 }
 
 // Same wire protocol and transport as the openai client, so the same failures.
@@ -78,7 +77,7 @@ pub const StreamError = openai_mod.StreamError;
 
 fn authHeaders(self: *Client, buf: *[5]std.http.Header) ![]const std.http.Header {
     var n: usize = 0;
-    buf[n] = try self.bearer.header(self.allocator, self.access_token);
+    buf[n] = try self.bearer.header(self.transport.allocator, self.access_token);
     n += 1;
     buf[n] = .{ .name = "originator", .value = self.originator };
     n += 1;
@@ -95,10 +94,6 @@ fn authHeaders(self: *Client, buf: *[5]std.http.Header) ![]const std.http.Header
     return buf[0..n];
 }
 
-pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error.setLogged(self.allocator, status_code, body, "Codex");
-}
-
 /// Stream a model response via the Responses API; `request.stream` is forced on
 /// (the backend rejects non-streaming requests outright).
 pub fn createResponseStream(
@@ -108,15 +103,15 @@ pub fn createResponseStream(
     callback: *const fn (@TypeOf(context), ResponseStreamEvent) void,
 ) StreamError!void {
     if (self.access_token.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/responses", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/responses", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     var req_body = request;
     req_body.stream = true;
 
     var hdr_buf: [5]std.http.Header = undefined;
     const auth = try self.authHeaders(&hdr_buf);
-    return http.streamSseValue(self.allocator, &self.http_client, url, auth, req_body, ResponseStreamEvent, self, context, callback);
+    return self.transport.streamSse(url, auth, req_body, ResponseStreamEvent, context, callback);
 }
 
 fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
