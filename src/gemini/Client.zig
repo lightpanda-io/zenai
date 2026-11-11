@@ -4,6 +4,7 @@ const http = @import("../http.zig");
 const retry = @import("../retry.zig");
 const json = @import("../json.zig");
 const continuation = @import("continuation.zig");
+pub const decisions = @import("decisions.zig");
 
 pub const RetryPolicy = retry.RetryPolicy;
 
@@ -910,8 +911,39 @@ pub fn deleteCachedContent(self: *Client, name: []const u8) !void {
     }
 }
 
+// --- Decisions ---
+
+/// Evaluate every question in `questions` against the shared `input` in one
+/// call, getting a calibrated answer back under each question id. The input is
+/// ingested once, so batch questions into one request. `model` may be bare
+/// ("gemini-decision-1") or "models/…". Developer API only.
+pub fn createDecision(
+    self: *Client,
+    model: []const u8,
+    input: decisions.Input,
+    questions: decisions.Questions,
+) !Response(decisions.CreateDecisionResponse) {
+    try self.requireDeveloperApi();
+    if (self.api_key.len == 0) return error.MissingApiKey;
+    const url = try self.allocator.print("{s}/{s}/decisions", .{ self.devBaseUrl(), self.api_version });
+    defer self.allocator.free(url);
+
+    const full_model = if (std.mem.startsWith(u8, model, "models/"))
+        try self.allocator.dupe(u8, model)
+    else
+        try self.allocator.print("models/{s}", .{model});
+    defer self.allocator.free(full_model);
+
+    return self.fetchPost(url, decisions.CreateDecisionRequest{
+        .input = input,
+        .model = full_model,
+        .questions = questions,
+    }, decisions.CreateDecisionResponse);
+}
+
 test {
     _ = continuation;
+    _ = decisions;
 }
 
 test "Client init and deinit" {
@@ -1055,6 +1087,7 @@ test "vertex: developer-only methods are unsupported" {
     try std.testing.expectError(error.UnsupportedByBackend, client.getFile("files/abc"));
     try std.testing.expectError(error.UnsupportedByBackend, client.createCachedContent("m", .{}));
     try std.testing.expectError(error.UnsupportedByBackend, client.deleteFile("files/abc"));
+    try std.testing.expectError(error.UnsupportedByBackend, client.createDecision("m", .{ .text = "hi" }, .{}));
 }
 
 test "isChatModel keeps text/chat models" {
@@ -1315,4 +1348,34 @@ test "generateContentStream continues across requests into one accumulated respo
     try std.testing.expectEqualStrings("Hello, world.", resp.text().?);
     try std.testing.expect(resp.candidates.?[0].finishReason.? == .STOP);
     try std.testing.expectEqual(@as(?i32, 26), resp.usageMetadata.?.totalTokenCount);
+}
+
+test "createDecision posts the questions and parses the answers" {
+    const loopback: std.Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var server: ContinuationServer = .{
+        .server = try loopback.listen(std.testing.io, .{}),
+        .content_type = "application/json",
+        .bodies = &.{
+            \\{"answers":{"urgent":{"type":"noul","noul":0.9,"confidence":0.9}},"usage":{"total_tokens":42}}
+            ,
+        },
+    };
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, ContinuationServer.run, .{&server});
+    defer thread.join();
+
+    var client = try continuationClient(&server);
+    defer std.testing.allocator.free(client.base_url.?);
+    defer client.deinit();
+
+    var response = try client.createDecision("gemini-decision-1", .{ .text = "Server is down!" }, .init(&.{
+        .{ .key = "urgent", .value = .noulText("Is this urgent?") },
+    }));
+    defer response.deinit();
+
+    try std.testing.expectEqualStrings(
+        \\{"input":"Server is down!","model":"models/gemini-decision-1","questions":{"urgent":{"type":"noul","instructions":"Is this urgent?"}}}
+    , server.requests[0]);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), response.value.noul("urgent").?, 1e-12);
+    try std.testing.expectEqual(@as(?u32, 42), response.value.usage.?.total_tokens);
 }

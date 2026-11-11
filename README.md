@@ -197,6 +197,33 @@ if (response.value.firstFunctionCall()) |fc| {
 </details>
 
 <details>
+<summary>Decisions</summary>
+
+The Decisions API evaluates one shared `input` against a map of typed questions and returns a calibrated answer per question id: `noul` (a probability), `choice` (a label with per-option probabilities) or `score` (a level on an ordered scale). The input is ingested once, so put every question in the same request.
+
+```zig
+const decisions = zenai.gemini.decisions;
+
+const questions: decisions.Questions = .init(&.{
+    .{ .key = "is_complaint", .value = .noulText("Is the customer complaining?") },
+    .{ .key = "topic", .value = .choiceText(
+        "What is this message about?",
+        decisions.choices(&.{ "billing", "delivery", "other" }),
+    ) },
+    .{ .key = "anger", .value = .scoreText("How angry is the customer?", &.{ "Calm", "Annoyed", "Furious" }) },
+});
+var response = try client.createDecision(decisions.default_model, .{ .text = "The pizza arrived cold." }, questions);
+defer response.deinit(); // the answers borrow it
+
+std.debug.print("complaint: {d:.2}\n", .{response.value.noul("is_complaint").?});
+std.debug.print("topic: {s}\n", .{try response.value.choice("topic", questions)}); // validated against the criteria
+```
+
+The input can also be a list of content blocks (`.{ .parts = &.{ .{ .type = .image, .uri = file_uri, .mime_type = "image/png" } } }`). A blocked input comes back with empty `answers` and `prompt_feedback.block_reason` set.
+
+</details>
+
+<details>
 <summary>Vertex AI</summary>
 
 The same client can target [Vertex AI](https://cloud.google.com/vertex-ai/generative-ai/docs) instead of the Developer API, in one of two modes.
@@ -221,7 +248,7 @@ var client = zenai.vertex.Client.init(io, allocator, token, .{
 defer client.deinit();
 ```
 
-Generation, streaming, `Chat` and `countTokens` work in both modes. Model listing needs project/location mode, because Google's `ListPublisherModels` rejects API keys. Embeddings, file uploads and cached content are Developer-API-only and return `error.UnsupportedByBackend` on Vertex.
+Generation, streaming, `Chat` and `countTokens` work in both modes. Model listing needs project/location mode, because Google's `ListPublisherModels` rejects API keys. Embeddings, file uploads, cached content and decisions are Developer-API-only and return `error.UnsupportedByBackend` on Vertex.
 
 Through the provider abstraction, `.vertex` is picked when `GOOGLE_GENAI_USE_VERTEXAI=1` (or `true`) is set. Express mode reads `GOOGLE_API_KEY`. Project mode reads `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`/`GOOGLE_CLOUD_REGION` (default `"global"`), but you still pass the access token explicitly as the credential.
 
@@ -643,6 +670,7 @@ const verdict = try response.value.choiceEnum("verdict", questions, Verdict);
 | Token counting | ✓ | | |
 | File uploads (resumable) | ✓ | | |
 | Cached content | ✓ | | |
+| Decisions (calibrated judgements) | ✓ | | |
 | Safety settings | ✓ | | |
 | Extended thinking | | | ✓ |
 
