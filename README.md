@@ -12,7 +12,7 @@ Zig client for AI APIs, ported from the official Go SDKs ([go-genai](https://git
   - [Codex](#chatgpt-subscription-codex): OpenAI models billed to your ChatGPT plan instead of API credits
   - [Anthropic](https://docs.anthropic.com/en/docs/about-claude/models)
 - **Search** (`zenai.search`): [Tavily](https://docs.tavily.com/), [Brave Search](https://brave.com/search/api/), [Exa](https://exa.ai/docs/reference/search), [Keenable](https://docs.keenable.ai/), [Parallel](https://docs.parallel.ai/search/search-quickstart)
-- **Judgement** (`zenai.typesafe`): [TypeSafe System One](https://docs.typesafe.ai), whose Jev model answers typed questions about a piece of state (a probability, a labelled choice or a score) instead of generating text
+- **Judgement** (`zenai.typesafe`): [TypeSafe System One](https://docs.typesafe.ai), whose Jev model answers typed questions about a piece of state (a probability, a labelled choice or a score) instead of generating text. `zenai.decisions` asks the same questions of Jev or Gemini's Decisions API, whichever has a key
 
 <img width="1024" height="1024" alt="Meditating panda with incense smoke" src="https://github.com/user-attachments/assets/b9c82960-05ec-4aa1-b171-092ee2126551" />
 
@@ -657,6 +657,24 @@ const verdict = try response.value.choiceEnum("verdict", questions, Verdict);
 ```
 
 </details>
+
+### Either provider: `zenai.decisions`
+
+Gemini's [Decisions API](#gemini) takes the same three question types. `zenai.decisions.Pool` asks whichever provider has a key, using the TypeSafe types above, and converts for Gemini (JSON content is sent as compact JSON text). It reads the environment on every ask, so exporting a key mid-run takes effect without a restart, and it keeps one warm client per concurrent caller:
+
+```zig
+var pool: zenai.decisions.Pool = .init(io, allocator, environFn, .{
+    // Optional: lets MY_DECISION_PROVIDER=typesafe pick Jev when both keys are set.
+    .provider_env_var_name = "MY_DECISION_PROVIDER",
+});
+defer pool.deinit();
+
+var failure: zenai.http.ErrorDetail = .{};
+var response = try pool.ask(arena, .{ .text = "The pizza arrived cold." }, questions, .{}, &failure);
+defer response.deinit();
+```
+
+Gemini (`GOOGLE_API_KEY`/`GEMINI_API_KEY`, not on Vertex) is preferred over `TYPESAFE_API_KEY` when both are set. `GOOGLE_GEMINI_BASE_URL` and `TYPESAFE_BASE_URL` point either one elsewhere. A Gemini input blocked by safety filters fails with `error.InputBlocked`, with the reason in `failure`.
 
 ## Features
 

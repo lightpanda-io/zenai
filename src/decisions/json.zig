@@ -13,7 +13,7 @@
 //!       - `{question, levels}`           — a `score` over 2-10 levels
 
 const std = @import("std");
-const types = @import("types.zig");
+const types = @import("../typesafe/types.zig");
 
 const ChoiceEntry = types.ChoiceCriteria.Entry;
 const Content = types.Content;
