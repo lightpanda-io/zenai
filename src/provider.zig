@@ -504,9 +504,12 @@ pub const Client = union(enum) {
         return self.transport().allocator;
     }
 
+    /// Options every provider takes; what only one provider takes lives in
+    /// its `Backend` variant.
     pub const InitOptions = struct {
-        /// Overrides the provider's default base URL. Ollama falls back to
-        /// `defaultBaseUrl(.ollama)` when null; the others use their own.
+        /// Overrides the provider's default base URL. Required for
+        /// `.openai_compatible`, which has none (`fromEnv` reads it from
+        /// OPENAI_BASE_URL).
         base_url: ?[:0]const u8 = null,
         retry_policy: retry.RetryPolicy = .{},
         /// Per-attempt wall-clock bound on non-streaming requests, from an
@@ -517,58 +520,35 @@ pub const Client = union(enum) {
         /// clients; see `http.Transport.Options.http_client`. Null owns one.
         http_client: ?*std.http.Client = null,
         /// Headers sent on every request, e.g. Hugging Face's `X-HF-Bill-To`.
-        /// Only applied to the OpenAI-family clients (and `.ollama`);
-        /// ignored by gemini/anthropic. Borrowed: the slice and its strings
-        /// must outlive the client.
+        /// Borrowed: see `http.Transport.Options.extra_headers`.
         extra_headers: []const std.http.Header = &.{},
-        /// GCP project for `.vertex` project/location mode (falls back to
-        /// GOOGLE_CLOUD_PROJECT in `environ`). When set, the init `key` must
-        /// be an OAuth access token, not an API key. Ignored by other
-        /// providers.
-        project: ?[]const u8 = null,
-        /// GCP location for `.vertex` (falls back to GOOGLE_CLOUD_LOCATION,
-        /// then GOOGLE_CLOUD_REGION in `environ`, then "global"). Ignored by
-        /// other providers.
-        location: ?[]const u8 = null,
-        /// Environment for the `.vertex` project/location fallbacks above and
-        /// the `.openai_compatible` OPENAI_BASE_URL fallback. The default
-        /// `.empty` disables env detection.
-        environ: std.process.Environ = .empty,
-        /// ChatGPT account id for `.codex` (`ChatGPT-Account-Id` header),
-        /// derived from the OAuth JWT; copied. Ignored by other providers.
-        account_id: ?[]const u8 = null,
-        /// Session id for `.codex` (`session-id` header); borrowed. Ignored by
-        /// others.
-        session_id: ?[]const u8 = null,
     };
 
-    /// Construct the client for `provider`, authenticating with `key`; the
-    /// caller owns it and must release it with `deinit`.
-    pub fn init(io: std.Io, allocator: std.mem.Allocator, provider: Tag, key: [:0]const u8, options: InitOptions) !Client {
-        return switch (provider) {
-            inline else => |tag| blk: {
+    /// Construct the client for `backend`, authenticating with `key`; the
+    /// caller owns it and must release it with `deinit`. Reads no environment
+    /// variables: see `fromEnv` for the conventional ones.
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, backend: Backend, key: [:0]const u8, options: InitOptions) !Client {
+        return switch (backend) {
+            inline else => |settings, tag| blk: {
                 const ClientPtr = @FieldType(Client, @tagName(tag));
                 const Impl = @typeInfo(ClientPtr).pointer.child;
-                const client = try allocator.create(Impl);
-                errdefer allocator.destroy(client);
-                const base_url: ?[:0]const u8 = options.base_url orelse switch (tag) {
-                    // Never fall through to api.openai.com.
-                    .openai_compatible => envGet(options.environ, "OPENAI_BASE_URL") orelse return error.MissingBaseUrl,
-                    else => info(tag).base_url,
-                };
+                // Never fall through to api.openai.com.
+                const base_url: ?[:0]const u8 = options.base_url orelse info(tag).base_url orelse
+                    if (tag == .openai_compatible) return error.MissingBaseUrl else null;
                 var impl_opts: Impl.InitOptions = .{
                     .retry_policy = options.retry_policy,
                     .request_timeout_ms = options.request_timeout_ms,
                     .http_client = options.http_client,
+                    .extra_headers = options.extra_headers,
                 };
                 if (base_url) |u| impl_opts.base_url = u;
-                if (@hasField(Impl.InitOptions, "extra_headers")) impl_opts.extra_headers = options.extra_headers;
-                if (tag == .vertex) impl_opts.vertex = vertexConfigFromEnv(options.environ, options.project, options.location);
-                const impl = if (tag == .codex)
-                    Impl.initChatGpt(io, allocator, key, impl_opts, .{ .account_id = options.account_id, .session_id = options.session_id })
+                if (tag == .vertex) impl_opts.vertex = settings;
+                const client = try allocator.create(Impl);
+                errdefer allocator.destroy(client);
+                client.* = if (tag == .codex)
+                    try Impl.initChatGpt(io, allocator, key, impl_opts, settings)
                 else
                     Impl.init(io, allocator, key, impl_opts);
-                client.* = if (@typeInfo(@TypeOf(impl)) == .error_union) try impl else impl;
                 break :blk @unionInit(Client, @tagName(tag), client);
             },
         };
@@ -1105,6 +1085,65 @@ pub const Client = union(enum) {
 /// Provider tag used in switches and helper APIs.
 pub const Tag = std.meta.Tag(Client);
 
+/// The provider `Client.init` builds, with the settings only that provider
+/// takes. A tag with no settings coerces from its enum literal (`.anthropic`);
+/// `Backend.of` converts a runtime `Tag`.
+pub const Backend = union(Tag) {
+    anthropic,
+    gemini,
+    /// Project/location mode when `project` is set, where the init key must be
+    /// an OAuth access token; express mode (an API key) otherwise.
+    vertex: gemini_mod.VertexConfig,
+    openai,
+    ollama,
+    huggingface,
+    llama_cpp,
+    llmd,
+    openai_compatible,
+    vercel,
+    mistral,
+    openrouter,
+    xai,
+    /// The ChatGPT account and session ids; see `openai.Client.ChatGpt`.
+    codex: openai_mod.ChatGpt,
+
+    /// `tag` with default settings.
+    pub fn of(tag: Tag) Backend {
+        return switch (tag) {
+            inline else => |t| @unionInit(Backend, @tagName(t), if (@FieldType(Backend, @tagName(t)) == void) {} else .{}),
+        };
+    }
+};
+
+/// What the conventional env vars configure for one provider: the pieces of a
+/// `Client.init` call, which itself reads no environment.
+pub const EnvConfig = struct {
+    /// `envApiKey(environ, tag)`; null when none is set.
+    key: ?[:0]const u8,
+    /// `.vertex` takes its project from GOOGLE_CLOUD_PROJECT and its location
+    /// from GOOGLE_CLOUD_LOCATION, then GOOGLE_CLOUD_REGION, then "global";
+    /// every other tag gets `Backend.of(tag)`.
+    backend: Backend,
+    /// For `InitOptions.base_url`: OPENAI_BASE_URL for `.openai_compatible`,
+    /// null for the others, which have their own default.
+    base_url: ?[:0]const u8,
+};
+
+pub fn fromEnv(environ: std.process.Environ, tag: Tag) EnvConfig {
+    return .{
+        .key = envApiKey(environ, tag),
+        .backend = switch (tag) {
+            .vertex => .{ .vertex = .{
+                .project = envGet(environ, "GOOGLE_CLOUD_PROJECT"),
+                .location = envGet(environ, "GOOGLE_CLOUD_LOCATION") orelse
+                    envGet(environ, "GOOGLE_CLOUD_REGION") orelse "global",
+            } },
+            else => .of(tag),
+        },
+        .base_url = if (tag == .openai_compatible) envGet(environ, "OPENAI_BASE_URL") else null,
+    };
+}
+
 /// What differs per provider beyond its wire format, in one place.
 pub const Info = struct {
     /// Default base URL; null when the client has its own default, or (for
@@ -1264,17 +1303,6 @@ pub fn detectKeys(environ: std.process.Environ, buf: []Candidate, candidates: []
     return buf[0..n];
 }
 
-/// Vertex project/location resolution shared by `Client.init` and
-/// `listChatModelIds`: explicit values win, then the conventional
-/// GOOGLE_CLOUD_* env vars, then the "global" location.
-fn vertexConfigFromEnv(environ: std.process.Environ, project: ?[]const u8, location: ?[]const u8) gemini_mod.VertexConfig {
-    return .{
-        .project = project orelse envGet(environ, "GOOGLE_CLOUD_PROJECT"),
-        .location = location orelse envGet(environ, "GOOGLE_CLOUD_LOCATION") orelse
-            envGet(environ, "GOOGLE_CLOUD_REGION") orelse "global",
-    };
-}
-
 /// True when `url`'s host is a loopback address, where a refused connection is
 /// instant and definitive rather than a transient error worth retrying. Returns
 /// false on an unparseable or host-less URL, defaulting callers to retry.
@@ -1293,90 +1321,39 @@ fn isLoopbackUrl(url: []const u8) bool {
         std.mem.startsWith(u8, host, "127.");
 }
 
-/// Append every model ID served by an OpenAI-compatible endpoint at `base_url`
-/// to `ids`. No `isChatModel` filtering — local/HF catalogs don't follow the
-/// OpenAI naming convention it expects.
-fn listOpenAICompatibleModelIds(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    arena: std.mem.Allocator,
-    ids: *std.ArrayList([]const u8),
-    api_key: [:0]const u8,
-    base_url: [:0]const u8,
-    retry_policy: retry.RetryPolicy,
-) !void {
-    var client = openai_mod.init(io, allocator, api_key, .{ .base_url = base_url, .retry_policy = retry_policy });
-    defer client.deinit();
-    var resp = try client.listModels();
-    defer resp.deinit();
-    for (resp.value.data orelse &.{}) |m| {
-        if (m.id) |id| try ids.append(arena, try arena.dupe(u8, id));
-    }
-}
-
-/// Options for `listChatModelIds`. Only some providers consume each field;
-/// the rest ignore them.
-pub const ListModelsOptions = struct {
-    /// Overrides the provider's default base URL. Honored for `openai` and
-    /// every preset (OpenAI-compatible) provider.
-    base_url: ?[:0]const u8 = null,
-    /// Environment for the `.vertex` project/location fallbacks. The default
-    /// `.empty` disables env detection.
-    environ: std.process.Environ = .empty,
-};
-
-/// Fetch chat-capable model IDs for `tag`, allocated in `arena`. Ordering
-/// is provider-defined — sort at the call site if needed.
+/// Fetch chat-capable model IDs for `backend`, sorted and allocated in
+/// `arena`. Builds a `Client` with `options` for the request; a local server
+/// on loopback isn't retried, since a refused connection there is definitive.
 pub fn listChatModelIds(
     io: std.Io,
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
-    tag: Tag,
+    backend: Backend,
     api_key: [:0]const u8,
-    options: ListModelsOptions,
+    options: Client.InitOptions,
 ) ![][]const u8 {
     var ids: std.ArrayList([]const u8) = .empty;
-
-    // Preset catalogs don't follow isChatModel's naming, so none filters. A
-    // not-running loopback server refuses instantly — disable retry there.
-    const i = info(tag);
+    const tag = std.meta.activeTag(backend);
     // Codex has no listable models endpoint under OAuth; callers fall back to
     // the models.dev catalog.
     if (tag == .codex) return ids.toOwnedSlice(arena);
-    if (i.base_url) |preset_url| {
-        const url = options.base_url orelse preset_url;
-        const policy: retry.RetryPolicy = if (i.local and isLoopbackUrl(url)) .disabled else .{};
-        try listOpenAICompatibleModelIds(io, allocator, arena, &ids, api_key, url, policy);
-    } else switch (tag) {
-        .openai_compatible => {
-            const url = options.base_url orelse
-                envGet(options.environ, "OPENAI_BASE_URL") orelse return error.MissingBaseUrl;
-            try listOpenAICompatibleModelIds(io, allocator, arena, &ids, api_key, url, .{});
-        },
-        .anthropic => {
-            var client = anthropic_mod.init(io, allocator, api_key, .{});
-            defer client.deinit();
-            var resp = try client.listModels();
+
+    var opts = options;
+    if (info(tag).local and isLoopbackUrl(options.base_url orelse info(tag).base_url.?)) opts.retry_policy = .disabled;
+    const client = try Client.init(io, allocator, backend, api_key, opts);
+    defer client.deinit(allocator);
+
+    switch (client) {
+        .anthropic => |c| {
+            var resp = try c.listModels();
             defer resp.deinit();
             for (resp.value.data orelse &.{}) |m| {
                 if (!anthropic_mod.isChatModel(m)) continue;
                 if (m.id) |id| try ids.append(arena, try arena.dupe(u8, id));
             }
         },
-        .openai => {
-            var client = openai_mod.init(io, allocator, api_key, if (options.base_url) |u| .{ .base_url = u } else .{});
-            defer client.deinit();
-            var resp = try client.listModels();
-            defer resp.deinit();
-            for (resp.value.data orelse &.{}) |m| {
-                if (!openai_mod.isChatModel(m)) continue;
-                if (m.id) |id| try ids.append(arena, try arena.dupe(u8, id));
-            }
-        },
-        .gemini => {
-            var client = gemini_mod.init(io, allocator, api_key, .{});
-            defer client.deinit();
-            var resp = try client.listModels(.{});
+        .gemini => |c| {
+            var resp = try c.listModels(.{});
             defer resp.deinit();
             for (resp.value.models orelse &.{}) |m| {
                 if (!gemini_mod.isChatModel(m)) continue;
@@ -1387,12 +1364,8 @@ pub fn listChatModelIds(
                 try ids.append(arena, try arena.dupe(u8, stripped));
             }
         },
-        .vertex => {
-            var client = gemini_mod.init(io, allocator, api_key, .{
-                .vertex = vertexConfigFromEnv(options.environ, null, null),
-            });
-            defer client.deinit();
-            var resp = try client.listModels(.{});
+        .vertex => |c| {
+            var resp = try c.listModels(.{});
             defer resp.deinit();
             // Vertex publisher models carry no supportedGenerationMethods,
             // so the isChatModel filter can't apply; strip the resource
@@ -1404,7 +1377,17 @@ pub fn listChatModelIds(
                 try ids.append(arena, try arena.dupe(u8, stripped));
             }
         },
-        else => unreachable,
+        .codex => unreachable,
+        inline else => |c, t| {
+            const openai: *openai_mod = if (t == .ollama) &c.openai else c;
+            var resp = try openai.listModels();
+            defer resp.deinit();
+            // Only OpenAI's own catalog follows isChatModel's naming.
+            for (resp.value.data orelse &.{}) |m| {
+                if (t == .openai and !openai_mod.isChatModel(m)) continue;
+                if (m.id) |id| try ids.append(arena, try arena.dupe(u8, id));
+            }
+        },
     }
 
     const result = try ids.toOwnedSlice(arena);
@@ -1503,6 +1486,56 @@ test "openai/openai_compatible: OPENAI_BASE_URL splits key detection" {
         } } };
         try std.testing.expectEqualStrings("sk-test", envApiKey(without_url, .openai).?);
         try std.testing.expect(envApiKey(without_url, .openai_compatible) == null);
+    }
+}
+
+test "Client.init: each backend's settings reach its client, shared options reach every one" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const extra = [_]std.http.Header{.{ .name = "X-Extra", .value = "v" }};
+
+    try std.testing.expectError(error.MissingBaseUrl, Client.init(io, a, .openai_compatible, "k", .{}));
+
+    const vertex = try Client.init(io, a, .{ .vertex = .{ .project = "p", .location = "europe-west4" } }, "tok", .{ .extra_headers = &extra });
+    defer vertex.deinit(a);
+    try std.testing.expectEqualStrings("p", vertex.vertex.vertex.?.project.?);
+    try std.testing.expectEqualStrings("europe-west4", vertex.vertex.vertex.?.location);
+    try std.testing.expectEqualSlices(std.http.Header, &extra, vertex.transport().extra_headers);
+
+    const codex = try Client.init(io, a, .{ .codex = .{ .account_id = "acct" } }, "tok", .{});
+    defer codex.deinit(a);
+    try std.testing.expectEqualStrings("acct", codex.codex.chatgpt.?.account_id.?);
+    try std.testing.expectEqualStrings(openai_mod.codex_base_url, codex.codex.base_url);
+
+    const claude = try Client.init(io, a, .anthropic, "k", .{ .extra_headers = &extra });
+    defer claude.deinit(a);
+    try std.testing.expectEqualSlices(std.http.Header, &extra, claude.transport().extra_headers);
+
+    const gemini = try Client.init(io, a, Backend.of(.gemini), "k", .{});
+    defer gemini.deinit(a);
+    try std.testing.expect(gemini.gemini.vertex == null);
+}
+
+test "fromEnv: key, vertex settings and the openai_compatible base URL" {
+    try std.testing.expectEqual(Backend.of(.anthropic), fromEnv(.empty, .anthropic).backend);
+    try std.testing.expectEqualStrings("global", fromEnv(.empty, .vertex).backend.vertex.location);
+    try std.testing.expect(fromEnv(.empty, .openai_compatible).base_url == null);
+    try std.testing.expectEqualStrings("ollama", fromEnv(.empty, .ollama).key.?);
+    // See the OPENAI_BASE_URL test above for why this is POSIX-only.
+    if (comptime builtin.os.tag != .windows) {
+        const environ: std.process.Environ = .{ .block = .{ .slice = &[_:null]?[*:0]const u8{
+            "OPENAI_BASE_URL=http://localhost:8000/v1",
+            "OPENAI_API_KEY=sk-test",
+            "GOOGLE_CLOUD_PROJECT=proj",
+            "GOOGLE_CLOUD_REGION=us-east5",
+        } } };
+        const compat = fromEnv(environ, .openai_compatible);
+        try std.testing.expectEqualStrings("sk-test", compat.key.?);
+        try std.testing.expectEqualStrings("http://localhost:8000/v1", compat.base_url.?);
+        try std.testing.expect(fromEnv(environ, .openai).base_url == null);
+        const vertex = fromEnv(environ, .vertex).backend.vertex;
+        try std.testing.expectEqualStrings("proj", vertex.project.?);
+        try std.testing.expectEqualStrings("us-east5", vertex.location);
     }
 }
 

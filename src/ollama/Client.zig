@@ -169,10 +169,8 @@ fn fetchModelContextLength(self: *Client, model: []const u8) !?i32 {
     const url = try showUrl(self.openai.transport.allocator, self.openai.base_url);
     defer self.openai.transport.allocator.free(url);
 
-    const auth = [_]std.http.Header{self.authHeader()};
-    const headers = try self.openai.withExtraHeaders(&auth);
-    defer self.openai.freeHeaders(&auth, headers);
-    var response = try self.openai.transport.postJson(url, headers, .{ .model = model }, ShowResponse);
+    const headers = [_]std.http.Header{self.authHeader()};
+    var response = try self.openai.transport.postJson(url, &headers, .{ .model = model }, ShowResponse);
     defer response.deinit();
 
     const info = response.value.model_info orelse return null;
@@ -267,10 +265,8 @@ pub fn chat(
     defer self.openai.transport.allocator.free(url);
 
     const req = try self.buildChatRequest(model, messages, tools, think, format, options, false);
-    const auth = [_]std.http.Header{self.authHeader()};
-    const headers = try self.openai.withExtraHeaders(&auth);
-    defer self.openai.freeHeaders(&auth, headers);
-    return self.openai.transport.postJson(url, headers, req, ChatResponse);
+    const headers = [_]std.http.Header{self.authHeader()};
+    return self.openai.transport.postJson(url, &headers, req, ChatResponse);
 }
 
 /// Streaming counterpart of `chat`: sets `stream: true` and invokes `callback`
@@ -294,10 +290,8 @@ pub fn chatStream(
     defer self.openai.transport.allocator.free(url);
 
     const req = try self.buildChatRequest(model, messages, tools, think, format, options, true);
-    const auth = [_]std.http.Header{self.authHeader()};
-    const headers = try self.openai.withExtraHeaders(&auth);
-    defer self.openai.freeHeaders(&auth, headers);
-    return self.openai.transport.streamNdjson(url, headers, req, ChatResponse, context, callback);
+    const headers = [_]std.http.Header{self.authHeader()};
+    return self.openai.transport.streamNdjson(url, &headers, req, ChatResponse, context, callback);
 }
 
 /// Reassembles a streamed `/api/chat` response — forwarding each text delta to

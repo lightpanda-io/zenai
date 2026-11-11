@@ -348,6 +348,8 @@ pub const Transport = struct {
     request_timeout_ms: ?u32,
     /// Names the provider when a failed request is logged; null logs nothing.
     log_tag: ?[]const u8,
+    /// Sent on every request after the client's own headers. Borrowed.
+    extra_headers: []const std.http.Header,
     /// Status and message of the most recent failed request.
     last_error: ErrorDetail = .{},
     /// Set by the host so a SIGINT can abort an in-flight request mid-read.
@@ -360,6 +362,11 @@ pub const Transport = struct {
         retry_policy: retry.RetryPolicy = .{},
         request_timeout_ms: ?u32 = null,
         log_tag: ?[]const u8 = null,
+        /// Headers sent on every request after the client's own (auth)
+        /// headers, for what a backend or gateway reads beyond the API, e.g.
+        /// Hugging Face's `X-HF-Bill-To`. Borrowed: the slice and its strings
+        /// must outlive the transport.
+        extra_headers: []const std.http.Header = &.{},
         /// A `std.http.Client` to send requests through, borrowed: `deinit`
         /// leaves it open, and it must outlive the transport. Transports given
         /// the same one share its connection pool and CA bundle, so a request
@@ -388,6 +395,7 @@ pub const Transport = struct {
             .retry_policy = options.retry_policy,
             .request_timeout_ms = options.request_timeout_ms,
             .log_tag = options.log_tag,
+            .extra_headers = options.extra_headers,
         };
     }
 
@@ -418,7 +426,10 @@ pub const Transport = struct {
     /// Fetch + retry + JSON parse. On a non-retryable HTTP error response,
     /// records it in `last_error` and returns `error.ApiError`. Each attempt is
     /// bounded by `request_timeout_ms` (see `Watchdog`).
-    pub fn fetchJson(self: *Transport, options: std.http.Client.FetchOptions, comptime T: type) FetchError!Response(T) {
+    pub fn fetchJson(self: *Transport, request: std.http.Client.FetchOptions, comptime T: type) FetchError!Response(T) {
+        var options = request;
+        options.extra_headers = try self.withExtraHeaders(request.extra_headers);
+        defer self.freeHeaders(request.extra_headers, options.extra_headers);
         const client = self.httpClient();
         const policy = self.retry_policy;
         const deadline: ?Deadline = if (self.request_timeout_ms) |ms| .{
@@ -552,9 +563,23 @@ pub const Transport = struct {
         callback: *const fn (@TypeOf(context), EventT) void,
         comptime frame: fn ([]const u8) LineFrame,
     ) SseError!void {
+        const all = try self.withExtraHeaders(headers);
+        defer self.freeHeaders(headers, all);
         return reconnectOnStale(SseError!void, self.interrupt, streamLinesOnce, .{
-            self, url, headers, payload, EventT, context, callback, frame,
+            self, url, all, payload, EventT, context, callback, frame,
         });
+    }
+
+    /// `base` followed by `extra_headers`: `base` itself when there are none,
+    /// else a copy to release with `freeHeaders`.
+    fn withExtraHeaders(self: *Transport, base: []const std.http.Header) std.mem.Allocator.Error![]const std.http.Header {
+        if (self.extra_headers.len == 0) return base;
+        return std.mem.concat(self.allocator, std.http.Header, &.{ base, self.extra_headers });
+    }
+
+    /// Release what `withExtraHeaders(base)` returned.
+    fn freeHeaders(self: *Transport, base: []const std.http.Header, headers: []const std.http.Header) void {
+        if (headers.ptr != base.ptr) self.allocator.free(headers);
     }
 };
 
@@ -1162,6 +1187,8 @@ const Serve = enum {
     /// Answer as a CDN fronting an API does: gzip and chunked when the request
     /// accepts gzip, plain otherwise.
     respond_negotiated,
+    /// Answer one request with 200 if it carries `X-Extra: v`, else 400.
+    respond_if_extra_header,
 };
 
 /// `{"ok":true}\n`, gzipped.
@@ -1226,7 +1253,32 @@ fn serveOnce(server: *std.Io.net.Server, serve: Serve) void {
             // Hold the socket open until the client has read the response.
             io.sleep(.fromMilliseconds(50), .awake) catch {};
         },
+        .respond_if_extra_header => {
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(io, &read_buf);
+            var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
+            var request = http_server.receiveHead() catch return;
+            var found = false;
+            var headers = request.iterateHeaders();
+            while (headers.next()) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "x-extra") and std.mem.eql(u8, h.value, "v")) found = true;
+            }
+            request.respond("{\"ok\":true}\n", .{ .status = if (found) .ok else .bad_request }) catch return;
+        },
     }
+}
+
+test "extra_headers reach the server on JSON calls and streams" {
+    var t: Loopback = try .init();
+    defer t.deinit();
+    t.transport.extra_headers = &.{.{ .name = "X-Extra", .value = "v" }};
+
+    var response = try t.served(.respond_if_extra_header, Loopback.postOk, .{&t});
+    response.deinit();
+    try std.testing.expectEqual(1, try t.stream(.respond_if_extra_header));
+
+    t.transport.extra_headers = &.{};
+    try std.testing.expectError(error.ApiError, t.served(.respond_if_extra_header, Loopback.postOk, .{&t}));
 }
 
 test "a JSON call leaves its connection in the pool" {

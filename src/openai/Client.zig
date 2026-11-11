@@ -26,9 +26,6 @@ organization: ?[]const u8,
 project: ?[]const u8,
 /// ChatGPT-subscription auth (the Codex backend); null for an API key.
 chatgpt: ?ChatGpt = null,
-/// Sent after the auth headers on every request. Borrowed, see
-/// `InitOptions.extra_headers`.
-extra_headers: []const std.http.Header,
 bearer: http.BearerAuth = .{},
 
 /// Options for customizing the API endpoint.
@@ -82,13 +79,13 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
             .retry_policy = options.retry_policy,
             .request_timeout_ms = options.request_timeout_ms,
             .http_client = options.http_client,
+            .extra_headers = options.extra_headers,
             .log_tag = "OpenAI",
         }),
         .api_key = api_key,
         .base_url = options.base_url,
         .organization = options.organization,
         .project = options.project,
-        .extra_headers = options.extra_headers,
     };
 }
 
@@ -127,8 +124,7 @@ pub const ApiError = error{MissingApiKey} || http.FetchError;
 
 const AuthHeaders = [5]std.http.Header;
 
-/// The bearer token plus the auth's own headers, then `extra_headers`; release
-/// with `freeHeaders(buf, ...)`.
+/// The bearer token plus the auth's own headers, in `buf`.
 fn authHeaders(self: *Client, buf: *AuthHeaders) ![]const std.http.Header {
     buf[0] = try self.bearer.header(self.transport.allocator, self.api_key);
     var n: usize = 3;
@@ -147,32 +143,18 @@ fn authHeaders(self: *Client, buf: *AuthHeaders) ![]const std.http.Header {
         buf[1] = .{ .name = "OpenAI-Organization", .value = self.organization orelse "" };
         buf[2] = .{ .name = "OpenAI-Project", .value = self.project orelse "" };
     }
-    return self.withExtraHeaders(buf[0..n]);
-}
-
-/// `base` followed by `extra_headers`: `base` itself when there are none,
-/// else a copy to release with `freeHeaders`.
-pub fn withExtraHeaders(self: *Client, base: []const std.http.Header) std.mem.Allocator.Error![]const std.http.Header {
-    if (self.extra_headers.len == 0) return base;
-    return std.mem.concat(self.transport.allocator, std.http.Header, &.{ base, self.extra_headers });
-}
-
-/// Release what `withExtraHeaders(base)` returned.
-pub fn freeHeaders(self: *Client, base: []const std.http.Header, headers: []const std.http.Header) void {
-    if (headers.ptr != base.ptr) self.transport.allocator.free(headers);
+    return buf[0..n];
 }
 
 fn fetchGet(self: *Client, url: []const u8, comptime T: type) ApiError!Response(T) {
     var hdr_buf: AuthHeaders = undefined;
     const headers = try self.authHeaders(&hdr_buf);
-    defer self.freeHeaders(&hdr_buf, headers);
     return self.transport.getJson(url, headers, T);
 }
 
 fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) ApiError!Response(T) {
     var hdr_buf: AuthHeaders = undefined;
     const headers = try self.authHeaders(&hdr_buf);
-    defer self.freeHeaders(&hdr_buf, headers);
     return self.transport.postJson(url, headers, body, T);
 }
 
@@ -281,7 +263,6 @@ pub fn createResponseStream(
 
     var hdr_buf: AuthHeaders = undefined;
     const headers = try self.authHeaders(&hdr_buf);
-    defer self.freeHeaders(&hdr_buf, headers);
     return self.transport.streamSse(url, headers, req_body, ResponseStreamEvent, context, callback);
 }
 
@@ -327,7 +308,6 @@ pub fn chatCompletionStream(
 
     var hdr_buf: AuthHeaders = undefined;
     const headers = try self.authHeaders(&hdr_buf);
-    defer self.freeHeaders(&hdr_buf, headers);
     return self.transport.streamSse(url, headers, req_body, ChatCompletionResponse, context, callback);
 }
 
@@ -633,27 +613,13 @@ test "Client init and deinit" {
     try std.testing.expectEqualStrings("https://api.openai.com/v1", client.base_url);
 }
 
-test "authHeaders appends extra_headers after the auth headers" {
+test "extra_headers go to the transport, not the auth headers" {
     var buf: AuthHeaders = undefined;
-
-    var plain = Client.init(std.testing.io, std.testing.allocator, "k", .{});
-    defer plain.deinit();
-    const auth = try plain.authHeaders(&buf);
-    defer plain.freeHeaders(&buf, auth);
-    try std.testing.expectEqual(@as(usize, 3), auth.len);
-    try std.testing.expectEqual(@as([*]const std.http.Header, &buf), auth.ptr);
-
-    var billed = Client.init(std.testing.io, std.testing.allocator, "k", .{
-        .extra_headers = &.{ .{ .name = "X-HF-Bill-To", .value = "my-org" }, .{ .name = "X-Other", .value = "v" } },
-    });
+    const extra = [_]std.http.Header{.{ .name = "X-HF-Bill-To", .value = "my-org" }};
+    var billed = Client.init(std.testing.io, std.testing.allocator, "k", .{ .extra_headers = &extra });
     defer billed.deinit();
-    const headers = try billed.authHeaders(&buf);
-    defer billed.freeHeaders(&buf, headers);
-    try std.testing.expectEqual(@as(usize, 5), headers.len);
-    try std.testing.expectEqualStrings("Bearer k", headers[0].value);
-    try std.testing.expectEqualStrings("X-HF-Bill-To", headers[3].name);
-    try std.testing.expectEqualStrings("my-org", headers[3].value);
-    try std.testing.expectEqualStrings("X-Other", headers[4].name);
+    try std.testing.expectEqual(@as(usize, 3), (try billed.authHeaders(&buf)).len);
+    try std.testing.expectEqualSlices(std.http.Header, &extra, billed.transport.extra_headers);
 }
 
 fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
@@ -672,7 +638,6 @@ test "chatgpt authHeaders: bearer, originator, User-Agent, account and session i
     // The account id is copied: the caller's buffer may be freed on refresh.
     @memset(&account, 'x');
     const headers = try client.authHeaders(&buf);
-    defer client.freeHeaders(&buf, headers);
     const expected = [_]std.http.Header{
         .{ .name = "Authorization", .value = "Bearer tok-abc" },
         .{ .name = "originator", .value = "lightpanda" },
@@ -692,7 +657,6 @@ test "chatgpt authHeaders: account and session ids omitted when null" {
     var client = try Client.initChatGpt(std.testing.io, std.testing.allocator, "tok", .{}, .{});
     defer client.deinit();
     const headers = try client.authHeaders(&buf);
-    defer client.freeHeaders(&buf, headers);
     try std.testing.expectEqual(@as(usize, 3), headers.len);
     try std.testing.expectEqual(@as(?[]const u8, null), headerValue(headers, "ChatGPT-Account-Id"));
     try std.testing.expectEqual(@as(?[]const u8, null), headerValue(headers, "session-id"));

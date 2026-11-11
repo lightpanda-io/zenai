@@ -88,9 +88,21 @@ const ai = try zenai.provider.Client.init(io, allocator, .llama_cpp, "llama.cpp"
 defer ai.deinit(allocator);
 ```
 
+The first argument after the allocator is a `provider.Backend`: a tag, plus the settings only that provider takes (`.{ .vertex = .{ .project = "p" } }`, `.{ .codex = .{ .account_id = id } }`). The options struct holds what every provider takes: `base_url`, `retry_policy`, `request_timeout_ms`, `http_client` and `extra_headers` (sent on every request, e.g. Hugging Face's `X-HF-Bill-To`).
+
+`init` reads no environment variables. `zenai.provider.fromEnv(environ, tag)` returns what the conventional ones configure for a tag: its key, its backend settings and, for `.openai_compatible`, the base URL:
+
+```zig
+const cfg = zenai.provider.fromEnv(environ, .openai_compatible);
+const ai = try zenai.provider.Client.init(io, allocator, cfg.backend, cfg.key orelse return error.MissingApiKey, .{
+    .base_url = cfg.base_url,
+});
+defer ai.deinit(allocator);
+```
+
 `zenai.provider.info(tag)` gives each tag's default base URL, key variable, default model and whether it is a local server.
 
-Gateway model ids are provider-prefixed (`"anthropic/claude-sonnet-5"`). For Hugging Face, pass `.base_url` to target a dedicated Inference Endpoint instead of the serverless router. `provider.Client.init` picks `.openai_compatible` on its own when `OPENAI_BASE_URL` is set, which covers vLLM, LiteLLM, Together, Groq and the like.
+Gateway model ids are provider-prefixed (`"anthropic/claude-sonnet-5"`). For Hugging Face, pass `.base_url` to target a dedicated Inference Endpoint instead of the serverless router. `provider.detectKeys` picks `.openai_compatible` instead of `.openai` when `OPENAI_BASE_URL` is set, which covers vLLM, LiteLLM, Together, Groq and the like.
 
 When you need something the abstraction doesn't expose, switch on the tag and use the provider client directly:
 
@@ -250,7 +262,7 @@ defer client.deinit();
 
 Generation, streaming, `Chat` and `countTokens` work in both modes. Model listing needs project/location mode, because Google's `ListPublisherModels` rejects API keys. Embeddings and decisions are Developer-API-only and return `error.UnsupportedByBackend` on Vertex.
 
-Through the provider abstraction, `.vertex` is picked when `GOOGLE_GENAI_USE_VERTEXAI=1` (or `true`) is set. Express mode reads `GOOGLE_API_KEY`. Project mode reads `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`/`GOOGLE_CLOUD_REGION` (default `"global"`), but you still pass the access token explicitly as the credential.
+Through the provider abstraction, the backend is `.{ .vertex = .{ .project = "my-project", .location = "global" } }`, or plain `.vertex` for express mode. `provider.detectKeys` picks `.vertex` when `GOOGLE_GENAI_USE_VERTEXAI=1` (or `true`) is set, and express mode reads `GOOGLE_API_KEY`. `provider.fromEnv(environ, .vertex)` fills project mode from `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`/`GOOGLE_CLOUD_REGION` (default `"global"`), but you still pass the access token explicitly as the credential.
 
 </details>
 
@@ -327,9 +339,7 @@ The `.codex` provider talks to the backend Codex CLI uses (`chatgpt.com/backend-
 zenai doesn't run the OAuth login. Get the token yourself (the browser's `lightpanda agent` does it in `src/agent/auth/codex.zig`), then go through the provider abstraction:
 
 ```zig
-const ai = try zenai.provider.Client.init(io, allocator, .codex, access_token, .{
-    .account_id = account_id,
-});
+const ai = try zenai.provider.Client.init(io, allocator, .{ .codex = .{ .account_id = account_id } }, access_token, .{});
 defer ai.deinit(allocator);
 
 var result = try ai.generateContent("gpt-5.5", &.{
