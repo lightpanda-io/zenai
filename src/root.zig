@@ -88,11 +88,6 @@ pub const search = struct {
 pub const typesafe = struct {
     pub const Client = @import("typesafe/Client.zig");
     pub const types = @import("typesafe/types.zig");
-    /// Questions from JSON and answers back as JSON, for a caller driven by
-    /// configuration rather than comptime.
-    pub const json = @import("typesafe/json.zig");
-    pub const Pool = @import("typesafe/Pool.zig");
-
     /// Shorthands for building questions.
     pub const Question = types.Question;
     pub const Questions = types.Questions;
@@ -105,6 +100,37 @@ pub const typesafe = struct {
     pub const envApiKey = Client.envApiKey;
     pub const base_url_env_var_name = Client.base_url_env_var_name;
     pub const envBaseUrl = Client.envBaseUrl;
+};
+
+/// Decision models, from whichever provider has a key: TypeSafe System One
+/// (Jev) or Gemini's Decisions API. Both answer typed questions (`noul`,
+/// `choice`, `score`) about one input with calibrated probabilities rather
+/// than generating text. Each answer is a judgment; the calling code makes
+/// the decision. The question and answer types are TypeSafe's, which can
+/// hold everything Gemini's can; `Pool` converts for Gemini.
+pub const decisions = struct {
+    pub const Pool = @import("decisions/Pool.zig");
+    /// Questions from JSON and answers back as JSON, for a caller driven by
+    /// configuration rather than comptime.
+    pub const json = @import("decisions/json.zig");
+    pub const gemini = @import("decisions/gemini.zig");
+    pub const types = typesafe.types;
+
+    pub const Provider = Pool.Provider;
+    pub const AskOptions = Pool.AskOptions;
+    pub const Response = http.Response(types.AskResponse);
+    pub const envCredentials = Pool.envCredentials;
+    pub const envProvider = Pool.envProvider;
+    pub const env_hint = Pool.env_hint;
+    pub const gemini_base_url_env_var_name = Pool.gemini_base_url_env_var_name;
+
+    /// Shorthands for building questions.
+    pub const Content = types.Content;
+    pub const Question = types.Question;
+    pub const Questions = types.Questions;
+    pub const QuestionEntry = types.QuestionEntry;
+    pub const ChoiceEntry = types.ChoiceCriteria.Entry;
+    pub const enumChoices = types.enumChoices;
 };
 
 pub const provider = @import("provider.zig");
