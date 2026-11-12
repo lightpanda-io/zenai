@@ -17,13 +17,9 @@ const SearchResponse = types.SearchResponse;
 
 const Client = @This();
 
-allocator: std.mem.Allocator,
+transport: http.Transport,
 api_key: []const u8,
 base_url: []const u8,
-http_client: std.http.Client,
-retry_policy: RetryPolicy,
-request_timeout_ms: ?u32,
-last_error: http.ErrorDetail = .{},
 
 /// The environment variable `envApiKey` reads.
 pub const env_var_name = "PARALLEL_API_KEY";
@@ -39,31 +35,31 @@ pub const InitOptions = struct {
     /// established connection to the end of the body (connect excluded);
     /// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
     request_timeout_ms: ?u32 = null,
+    /// Borrowed `std.http.Client` to share a connection pool with other
+    /// clients; see `http.Transport.Options.http_client`. Null owns one.
+    http_client: ?*std.http.Client = null,
 };
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
     return .{
-        .allocator = allocator,
+        .transport = .init(io, allocator, .{
+            .retry_policy = options.retry_policy,
+            .request_timeout_ms = options.request_timeout_ms,
+            .http_client = options.http_client,
+            .log_tag = "Parallel",
+        }),
         .api_key = api_key,
         .base_url = options.base_url,
-        .http_client = .{ .allocator = allocator, .io = http.addrConfigIo(io) },
-        .retry_policy = options.retry_policy,
-        .request_timeout_ms = options.request_timeout_ms,
     };
 }
 
 pub fn deinit(self: *Client) void {
-    self.http_client.deinit();
-    self.last_error.deinit(self.allocator);
+    self.transport.deinit();
 }
 
 pub const Response = http.Response;
 
 pub const ApiError = error{MissingApiKey} || http.FetchError;
-
-pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error.setLogged(self.allocator, status_code, body, "Parallel");
-}
 
 /// Run a search. `query` becomes the single keyword query unless
 /// `options.search_queries` is set, in which case those are sent instead.
@@ -75,8 +71,8 @@ pub fn search(
 ) ApiError!Response(SearchResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try self.allocator.print("{s}/v1/search", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/v1/search", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     const queries = [_][]const u8{query};
     var request = options;
@@ -86,7 +82,7 @@ pub fn search(
         .{ .name = "x-api-key", .value = self.api_key },
     };
 
-    return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, &extra_headers, request, SearchResponse, self);
+    return self.transport.postJson(url, &extra_headers, request, SearchResponse);
 }
 
 test "search rejects empty api key" {

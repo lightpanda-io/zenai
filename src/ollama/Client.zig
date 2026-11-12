@@ -1,18 +1,66 @@
-//! Native Ollama `/api/chat`. Unlike the OpenAI-compatible `/v1` shim it
-//! honors `options.num_ctx`, so we can size the context window to the request;
-//! the shim's small default (4096) silently truncates prompts that exceed it,
-//! dropping tool calls. Only chat routes here — listing/embeddings use `/v1`.
+//! Ollama client. Chat goes to the native `/api/chat`: unlike the
+//! OpenAI-compatible `/v1` shim it honors `options.num_ctx`, so we can size the
+//! context window to the request; the shim's small default (4096) silently
+//! truncates prompts that exceed it, dropping tool calls. Listing and
+//! embeddings use `/v1` through the embedded `openai` client.
 
 const std = @import("std");
 const http = @import("../http.zig");
 const json = @import("../json.zig");
-const openai_types = @import("types.zig");
-const Client = @import("Client.zig");
+const retry = @import("../retry.zig");
+const openai_types = @import("../openai/types.zig");
+const OpenAIClient = @import("../openai/Client.zig");
 
-/// Ollama delivers arguments as a JSON object both ways, mapping to `Value`.
+const Client = @This();
+
+/// The `/v1` client: model listing, embeddings, and the transport and headers
+/// the native calls share.
+openai: OpenAIClient,
+/// The last model's context window from `/api/show`, so the lookup runs once
+/// per model. `model` is owned by the transport's allocator; `len` is null
+/// when the lookup missed (cached so it isn't retried).
+ctx_cache: ?struct { model: []const u8, len: ?i32 } = null,
+
+pub const InitOptions = struct {
+    /// The OpenAI-compatible base URL; the native `/api/*` endpoints hang off
+    /// its origin.
+    base_url: []const u8 = "http://localhost:11434/v1",
+    /// Sent on every request; borrowed, see `openai.Client.InitOptions`.
+    extra_headers: []const std.http.Header = &.{},
+    retry_policy: retry.RetryPolicy = .{},
+    /// See `openai.Client.InitOptions.request_timeout_ms`.
+    request_timeout_ms: ?u32 = null,
+    /// Borrowed `std.http.Client` to share a connection pool with other
+    /// clients; see `http.Transport.Options.http_client`. Null owns one.
+    http_client: ?*std.http.Client = null,
+};
+
+/// Local Ollama ignores `api_key`; it is sent for an authenticating proxy.
+pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
+    var openai: OpenAIClient = .init(io, allocator, api_key, .{
+        .base_url = options.base_url,
+        .extra_headers = options.extra_headers,
+        .retry_policy = options.retry_policy,
+        .request_timeout_ms = options.request_timeout_ms,
+        .http_client = options.http_client,
+    });
+    openai.transport.log_tag = "Ollama";
+    return .{ .openai = openai };
+}
+
+pub fn deinit(self: *Client) void {
+    if (self.ctx_cache) |c| self.openai.transport.allocator.free(c.model);
+    self.openai.deinit();
+}
+
+pub const ApiError = OpenAIClient.ApiError;
+pub const StreamError = OpenAIClient.StreamError;
+
+/// Ollama delivers arguments as a JSON object both ways. Parsed responses
+/// hold `.value`.
 pub const FunctionCall = struct {
     name: ?[]const u8 = null,
-    arguments: ?std.json.Value = null,
+    arguments: ?json.ValueOrText = null,
 };
 
 /// `id`/`type` are echoed when present; Ollama matches tool results by name.
@@ -101,28 +149,29 @@ pub fn computeNumCtx(prompt_bytes: usize, output_budget: i32, model_max: ?i32) i
 
 /// Model's context window via `/api/show`, cached on the client (once per
 /// model), or null if the lookup fails or the field is absent.
-fn modelContextLength(client: *Client, model: []const u8) ?i32 {
-    if (client.ollama_ctx) |cached| {
+fn modelContextLength(self: *Client, model: []const u8) ?i32 {
+    if (self.ctx_cache) |cached| {
         if (std.mem.eql(u8, cached.model, model)) return cached.len;
     }
 
-    const len = fetchModelContextLength(client, model) catch null;
+    const len = self.fetchModelContextLength(model) catch null;
 
     // Cache even a null miss, keyed by model name.
-    if (client.ollama_ctx) |old| client.allocator.free(old.model);
-    client.ollama_ctx = if (client.allocator.dupe(u8, model)) |owned|
+    const allocator = self.openai.transport.allocator;
+    if (self.ctx_cache) |old| allocator.free(old.model);
+    self.ctx_cache = if (allocator.dupe(u8, model)) |owned|
         .{ .model = owned, .len = len }
     else |_|
         null;
     return len;
 }
 
-fn fetchModelContextLength(client: *Client, model: []const u8) !?i32 {
-    const url = try showUrl(client.allocator, client.base_url);
-    defer client.allocator.free(url);
+fn fetchModelContextLength(self: *Client, model: []const u8) !?i32 {
+    const url = try showUrl(self.openai.transport.allocator, self.openai.base_url);
+    defer self.openai.transport.allocator.free(url);
 
-    const auth = [_]std.http.Header{.{ .name = "Authorization", .value = client.api_key }};
-    var response = try http.postJsonWithRetry(client.allocator, &client.http_client, client.retry_policy, client.request_timeout_ms, url, &auth, .{ .model = model }, ShowResponse, client);
+    const headers = [_]std.http.Header{self.authHeader()};
+    var response = try self.openai.transport.postJson(url, &headers, .{ .model = model }, ShowResponse);
     defer response.deinit();
 
     const info = response.value.model_info orelse return null;
@@ -139,6 +188,11 @@ fn fetchModelContextLength(client: *Client, model: []const u8) !?i32 {
         // scanning in case another key carries a usable value.
     }
     return null;
+}
+
+/// Local Ollama ignores auth; harmless, and supports an authenticating proxy.
+fn authHeader(self: *const Client) std.http.Header {
+    return .{ .name = "Authorization", .value = self.openai.api_key };
 }
 
 fn showUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
@@ -165,7 +219,7 @@ fn chatUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
 /// request (capped at the model's limit). Shared by the buffered and streaming
 /// paths so both get the same context-window fitting.
 fn buildChatRequest(
-    client: *Client,
+    self: *Client,
     model: []const u8,
     messages: []const Message,
     tools: ?[]const openai_types.Tool,
@@ -189,32 +243,31 @@ fn buildChatRequest(
         var buf: [256]u8 = undefined;
         var measure: std.Io.Writer.Discarding = .init(&buf);
         std.json.Stringify.value(req, .{ .emit_null_optional_fields = false }, &measure.writer) catch unreachable;
-        const model_max = modelContextLength(client, model);
+        const model_max = self.modelContextLength(model);
         req.options.num_ctx = computeNumCtx(@intCast(measure.fullCount()), req.options.num_predict orelse 4096, model_max);
     }
     return req;
 }
 
-/// Non-streaming chat via the native endpoint, reusing `client`'s HTTP client,
-/// retry policy, and interrupt. A null `options.num_ctx` is sized to the request.
+/// Non-streaming chat via the native endpoint. A null `options.num_ctx` is
+/// sized to the request.
 pub fn chat(
-    client: *Client,
+    self: *Client,
     model: []const u8,
     messages: []const Message,
     tools: ?[]const openai_types.Tool,
     think: ?bool,
     format: ?[]const u8,
     options: Options,
-) Client.ApiError!http.Response(ChatResponse) {
-    if (client.api_key.len == 0) return error.MissingApiKey;
+) ApiError!http.Response(ChatResponse) {
+    if (self.openai.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try chatUrl(client.allocator, client.base_url);
-    defer client.allocator.free(url);
+    const url = try chatUrl(self.openai.transport.allocator, self.openai.base_url);
+    defer self.openai.transport.allocator.free(url);
 
-    const req = try buildChatRequest(client, model, messages, tools, think, format, options, false);
-    // Local Ollama ignores auth; harmless, and supports an authenticating proxy.
-    const auth = [_]std.http.Header{.{ .name = "Authorization", .value = client.api_key }};
-    return http.postJsonWithRetry(client.allocator, &client.http_client, client.retry_policy, client.request_timeout_ms, url, &auth, req, ChatResponse, client);
+    const req = try self.buildChatRequest(model, messages, tools, think, format, options, false);
+    const headers = [_]std.http.Header{self.authHeader()};
+    return self.openai.transport.postJson(url, &headers, req, ChatResponse);
 }
 
 /// Streaming counterpart of `chat`: sets `stream: true` and invokes `callback`
@@ -222,7 +275,7 @@ pub fn chat(
 /// `message.content` delta). No retry — a mid-stream failure can't be replayed
 /// without re-emitting already-delivered deltas.
 pub fn chatStream(
-    client: *Client,
+    self: *Client,
     model: []const u8,
     messages: []const Message,
     tools: ?[]const openai_types.Tool,
@@ -231,15 +284,15 @@ pub fn chatStream(
     options: Options,
     context: anytype,
     callback: *const fn (@TypeOf(context), ChatResponse) void,
-) Client.StreamError!void {
-    if (client.api_key.len == 0) return error.MissingApiKey;
+) StreamError!void {
+    if (self.openai.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try chatUrl(client.allocator, client.base_url);
-    defer client.allocator.free(url);
+    const url = try chatUrl(self.openai.transport.allocator, self.openai.base_url);
+    defer self.openai.transport.allocator.free(url);
 
-    const req = try buildChatRequest(client, model, messages, tools, think, format, options, true);
-    const auth = [_]std.http.Header{.{ .name = "Authorization", .value = client.api_key }};
-    return http.streamNdjsonValue(client.allocator, &client.http_client, url, &auth, req, ChatResponse, client, context, callback);
+    const req = try self.buildChatRequest(model, messages, tools, think, format, options, true);
+    const headers = [_]std.http.Header{self.authHeader()};
+    return self.openai.transport.streamNdjson(url, &headers, req, ChatResponse, context, callback);
 }
 
 /// Reassembles a streamed `/api/chat` response — forwarding each text delta to
@@ -284,7 +337,7 @@ pub const StreamAccumulator = struct {
                     .id = if (call.id) |id| try self.arena.dupe(u8, id) else null,
                     .function = .{
                         .name = if (f.name) |n| try self.arena.dupe(u8, n) else null,
-                        .arguments = if (f.arguments) |v| try json.dupeValue(self.arena, v) else null,
+                        .arguments = if (f.arguments) |v| try v.dupe(self.arena) else null,
                     },
                 });
             };
@@ -333,6 +386,13 @@ test "chatUrl derives native endpoint from the v1 base" {
     }
 }
 
+test "the context-window cache answers a repeat lookup and is freed on deinit" {
+    var client = Client.init(std.testing.io, std.testing.allocator, "ollama", .{});
+    defer client.deinit();
+    client.ctx_cache = .{ .model = try std.testing.allocator.dupe(u8, "qwen3.5"), .len = 32768 };
+    try std.testing.expectEqual(@as(?i32, 32768), client.modelContextLength("qwen3.5"));
+}
+
 test "computeNumCtx floors, rounds, and caps at the model limit" {
     // Small prompt floors at min_num_ctx.
     try std.testing.expectEqual(@as(i32, @intCast(min_num_ctx)), computeNumCtx(100, 256, null));
@@ -355,7 +415,7 @@ test "ChatResponse parses tool calls with object arguments" {
     const msg = parsed.value.message.?;
     const call = msg.tool_calls.?[0];
     try std.testing.expectEqualStrings("goto", call.function.?.name.?);
-    try std.testing.expectEqualStrings("https://news.ycombinator.com/", call.function.?.arguments.?.object.get("url").?.string);
+    try std.testing.expectEqualStrings("https://news.ycombinator.com/", call.function.?.arguments.?.value.object.get("url").?.string);
     try std.testing.expectEqual(@as(i32, 71), parsed.value.eval_count.?);
 }
 
@@ -404,7 +464,7 @@ test "StreamAccumulator dupes a tool call so it survives chunk free" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"url\":\"https://x.test/\"}", .{});
     acc.onChunk(.{ .message = .{ .role = "assistant", .content = "", .tool_calls = &.{.{
         .id = "call_1",
-        .function = .{ .name = "goto", .arguments = parsed.value },
+        .function = .{ .name = "goto", .arguments = .{ .value = parsed.value } },
     }} }, .done = false });
     parsed.deinit();
     acc.onChunk(.{ .done = true, .done_reason = "stop" });
@@ -413,5 +473,5 @@ test "StreamAccumulator dupes a tool call so it survives chunk free" {
     const calls = acc.response().message.?.tool_calls.?;
     try std.testing.expectEqual(@as(usize, 1), calls.len);
     try std.testing.expectEqualStrings("goto", calls[0].function.?.name.?);
-    try std.testing.expectEqualStrings("https://x.test/", calls[0].function.?.arguments.?.object.get("url").?.string);
+    try std.testing.expectEqualStrings("https://x.test/", calls[0].function.?.arguments.?.value.object.get("url").?.string);
 }

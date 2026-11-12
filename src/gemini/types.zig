@@ -245,8 +245,9 @@ pub const FunctionCall = struct {
     id: ?[]const u8 = null,
     /// The name of the function to call. Matches `FunctionDeclaration.name`.
     name: ?[]const u8 = null,
-    /// The function parameters and values in JSON object format.
-    args: ?std.json.Value = null,
+    /// The function parameters and values in JSON object format. Parsed
+    /// responses hold `.value`.
+    args: ?jsonutil.ValueOrText = null,
 };
 
 /// The result of a function call, to be sent back to the model.

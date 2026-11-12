@@ -12,33 +12,21 @@ const ResponsesRequest = types.ResponsesRequest;
 const ResponsesResponse = types.ResponsesResponse;
 const ResponseStreamEvent = types.ResponseStreamEvent;
 
-/// OpenAI API client. Provides access to chat completions, embeddings,
-/// and model management.
+/// OpenAI API client. Provides access to chat completions, the Responses API,
+/// embeddings, and model management. `initChatGpt` points it at the Codex
+/// backend instead, authenticating with a ChatGPT subscription.
 const Client = @This();
 
-allocator: std.mem.Allocator,
+transport: http.Transport,
+/// API key, or the OAuth access token under `chatgpt` auth. Borrowed; see
+/// `setApiKey` to repoint it.
 api_key: []const u8,
 base_url: []const u8,
 organization: ?[]const u8,
 project: ?[]const u8,
-/// Hugging Face org to bill via `X-HF-Bill-To`, so the router charges a
-/// Team/Enterprise org instead of the token owner. Ignored by OpenAI/Ollama.
-bill_to: ?[]const u8,
-http_client: std.http.Client,
-/// Retry policy applied to every non-streaming request.
-retry_policy: RetryPolicy,
-/// Per-attempt wall-clock bound on non-streaming requests, from an
-/// established connection to the end of the body (connect excluded);
-/// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
-request_timeout_ms: ?u32,
-last_error: http.ErrorDetail = .{},
-/// Set by the host so a SIGINT can abort an in-flight request mid-read.
-interrupt: ?*http.Interrupt = null,
+/// ChatGPT-subscription auth (the Codex backend); null for an API key.
+chatgpt: ?ChatGpt = null,
 bearer: http.BearerAuth = .{},
-/// Per-model cache of the Ollama context window (see `ollama.zig`), so the
-/// `/api/show` lookup runs once per model. `model` is owned by `allocator`;
-/// `len` is null when the lookup missed (cached so it isn't retried).
-ollama_ctx: ?struct { model: []const u8, len: ?i32 } = null,
 
 /// Options for customizing the API endpoint.
 pub const InitOptions = struct {
@@ -48,8 +36,11 @@ pub const InitOptions = struct {
     organization: ?[]const u8 = null,
     /// Project ID for API requests.
     project: ?[]const u8 = null,
-    /// Hugging Face org to bill via the `X-HF-Bill-To` header (see field docs).
-    bill_to: ?[]const u8 = null,
+    /// Headers sent on every request after the auth headers, for what a
+    /// backend reads beyond the OpenAI API (e.g. Hugging Face's
+    /// `X-HF-Bill-To`). Borrowed: the slice and its strings must outlive the
+    /// client.
+    extra_headers: []const std.http.Header = &.{},
     /// Retry policy for transient HTTP failures (5xx, 429, and known
     /// flaky network errors). Pass `RetryPolicy.disabled` to opt out.
     retry_policy: RetryPolicy = .{},
@@ -57,29 +48,72 @@ pub const InitOptions = struct {
     /// established connection to the end of the body (connect excluded);
     /// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
     request_timeout_ms: ?u32 = null,
+    /// Borrowed `std.http.Client` to share a connection pool with other
+    /// clients; see `http.Transport.Options.http_client`. Null owns one.
+    http_client: ?*std.http.Client = null,
 };
+
+/// ChatGPT-subscription auth for the Codex backend: the bearer token is the
+/// subscription's OAuth access token, and these headers replace
+/// `OpenAI-Organization`/`OpenAI-Project`.
+pub const ChatGpt = struct {
+    /// ChatGPT account id from the OAuth JWT; sent as `ChatGPT-Account-Id`.
+    /// `initChatGpt` copies it, so it may be freed once that returns (a token
+    /// refresh replaces the buffer it came from).
+    account_id: ?[]const u8 = null,
+    /// Sent as `session-id`; null omits it. Borrowed.
+    session_id: ?[]const u8 = null,
+    /// Client identifier sent as `originator`. Borrowed.
+    originator: []const u8 = "lightpanda",
+    /// Sent as `User-Agent`. Borrowed.
+    user_agent: []const u8 = "lightpanda",
+};
+
+/// Base URL of the Codex backend, for `initChatGpt`.
+pub const codex_base_url = "https://chatgpt.com/backend-api/codex";
 
 /// Create a new OpenAI API client.
 pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, options: InitOptions) Client {
     return .{
-        .allocator = allocator,
+        .transport = .init(io, allocator, .{
+            .retry_policy = options.retry_policy,
+            .request_timeout_ms = options.request_timeout_ms,
+            .http_client = options.http_client,
+            .extra_headers = options.extra_headers,
+            .log_tag = "OpenAI",
+        }),
         .api_key = api_key,
         .base_url = options.base_url,
         .organization = options.organization,
         .project = options.project,
-        .bill_to = options.bill_to,
-        .http_client = .{ .allocator = allocator, .io = http.addrConfigIo(io) },
-        .retry_policy = options.retry_policy,
-        .request_timeout_ms = options.request_timeout_ms,
     };
+}
+
+/// Create a client for the Codex backend (the endpoint Codex CLI uses), billed
+/// to a ChatGPT plan: `access_token` is the subscription's OAuth token, and
+/// `options.base_url` should be `codex_base_url`. The backend only streams, so
+/// use `createResponseStream`.
+pub fn initChatGpt(io: std.Io, allocator: std.mem.Allocator, access_token: []const u8, options: InitOptions, chatgpt: ChatGpt) std.mem.Allocator.Error!Client {
+    var client = init(io, allocator, access_token, options);
+    client.transport.log_tag = "Codex";
+    client.chatgpt = chatgpt;
+    if (chatgpt.account_id) |a| client.chatgpt.?.account_id = try allocator.dupe(u8, a);
+    return client;
 }
 
 /// Release all resources held by the client, including HTTP connections.
 pub fn deinit(self: *Client) void {
-    self.bearer.deinit(self.allocator);
-    if (self.ollama_ctx) |c| self.allocator.free(c.model);
-    self.last_error.deinit(self.allocator);
-    self.http_client.deinit();
+    if (self.chatgpt) |c| if (c.account_id) |a| self.transport.allocator.free(a);
+    self.bearer.deinit(self.transport.allocator);
+    self.transport.deinit();
+}
+
+/// Repoint at a refreshed key (e.g. an OAuth access token) without tearing
+/// down connections. The caller keeps ownership of `key` and frees the
+/// previous buffer only after this returns.
+pub fn setApiKey(self: *Client, key: []const u8) void {
+    self.api_key = key;
+    self.bearer.deinit(self.transport.allocator);
 }
 
 pub const Response = http.Response;
@@ -88,36 +122,40 @@ pub const ApiError = error{MissingApiKey} || http.FetchError;
 
 // --- Internal helpers ---
 
-/// `X-HF-Bill-To` is only emitted when `bill_to` is set, so providers that
-/// don't recognize it never see it.
-fn authHeaders(self: *Client, buf: *[4]std.http.Header) ![]const std.http.Header {
-    buf[0] = try self.bearer.header(self.allocator, self.api_key);
-    buf[1] = .{ .name = "OpenAI-Organization", .value = self.organization orelse "" };
-    buf[2] = .{ .name = "OpenAI-Project", .value = self.project orelse "" };
-    if (self.bill_to) |org| {
-        buf[3] = .{ .name = "X-HF-Bill-To", .value = org };
-        return buf[0..4];
-    }
-    return buf[0..3];
-}
+const AuthHeaders = [5]std.http.Header;
 
-pub fn setErrorDetail(self: *Client, status_code: u10, body: []const u8) void {
-    self.last_error.setLogged(self.allocator, status_code, body, "OpenAI");
+/// The bearer token plus the auth's own headers, in `buf`.
+fn authHeaders(self: *Client, buf: *AuthHeaders) ![]const std.http.Header {
+    buf[0] = try self.bearer.header(self.transport.allocator, self.api_key);
+    var n: usize = 3;
+    if (self.chatgpt) |c| {
+        buf[1] = .{ .name = "originator", .value = c.originator };
+        buf[2] = .{ .name = "User-Agent", .value = c.user_agent };
+        if (c.account_id) |a| {
+            buf[n] = .{ .name = "ChatGPT-Account-Id", .value = a };
+            n += 1;
+        }
+        if (c.session_id) |sid| {
+            buf[n] = .{ .name = "session-id", .value = sid };
+            n += 1;
+        }
+    } else {
+        buf[1] = .{ .name = "OpenAI-Organization", .value = self.organization orelse "" };
+        buf[2] = .{ .name = "OpenAI-Project", .value = self.project orelse "" };
+    }
+    return buf[0..n];
 }
 
 fn fetchGet(self: *Client, url: []const u8, comptime T: type) ApiError!Response(T) {
-    var hdr_buf: [4]std.http.Header = undefined;
-    const auth = try self.authHeaders(&hdr_buf);
-    return http.fetchJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, .{
-        .location = .{ .url = url },
-        .extra_headers = auth,
-    }, T, self);
+    var hdr_buf: AuthHeaders = undefined;
+    const headers = try self.authHeaders(&hdr_buf);
+    return self.transport.getJson(url, headers, T);
 }
 
 fn fetchPost(self: *Client, url: []const u8, body: anytype, comptime T: type) ApiError!Response(T) {
-    var hdr_buf: [4]std.http.Header = undefined;
-    const auth = try self.authHeaders(&hdr_buf);
-    return http.postJsonWithRetry(self.allocator, &self.http_client, self.retry_policy, self.request_timeout_ms, url, auth, body, T, self);
+    var hdr_buf: AuthHeaders = undefined;
+    const headers = try self.authHeaders(&hdr_buf);
+    return self.transport.postJson(url, headers, body, T);
 }
 
 // --- Chat Completions ---
@@ -158,8 +196,8 @@ pub fn chatCompletion(
     config: ChatCompletionConfig,
 ) ApiError!Response(ChatCompletionResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/chat/completions", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/chat/completions", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     return self.fetchPost(url, ChatCompletionRequest{
         .model = model,
@@ -198,8 +236,8 @@ pub fn chatCompletionFromText(
 /// combined with reasoning on the chat completions endpoint.
 pub fn createResponse(self: *Client, request: ResponsesRequest) ApiError!Response(ResponsesResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/responses", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/responses", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     return self.fetchPost(url, request, ResponsesResponse);
 }
@@ -207,7 +245,8 @@ pub fn createResponse(self: *Client, request: ResponsesRequest) ApiError!Respons
 /// Stream a model response via the Responses API (`POST /responses`). The
 /// `callback` fires per SSE event; `request.stream` is forced on. Unlike Chat
 /// Completions, this endpoint supports function tools together with reasoning
-/// on the gpt-5 family, so native OpenAI streams through here.
+/// on the gpt-5 family, so native OpenAI streams through here. The only call
+/// the Codex backend (`initChatGpt`) accepts.
 pub fn createResponseStream(
     self: *Client,
     request: ResponsesRequest,
@@ -216,15 +255,15 @@ pub fn createResponseStream(
 ) StreamError!void {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try self.allocator.print("{s}/responses", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/responses", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     var req_body = request;
     req_body.stream = true;
 
-    var hdr_buf: [4]std.http.Header = undefined;
-    const auth = try self.authHeaders(&hdr_buf);
-    return http.streamSseValue(self.allocator, &self.http_client, url, auth, req_body, ResponseStreamEvent, self, context, callback);
+    var hdr_buf: AuthHeaders = undefined;
+    const headers = try self.authHeaders(&hdr_buf);
+    return self.transport.streamSse(url, headers, req_body, ResponseStreamEvent, context, callback);
 }
 
 // --- Streaming ---
@@ -243,8 +282,8 @@ pub fn chatCompletionStream(
 ) StreamError!void {
     if (self.api_key.len == 0) return error.MissingApiKey;
 
-    const url = try self.allocator.print("{s}/chat/completions", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/chat/completions", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     const req_body = ChatCompletionRequest{
         .model = model,
@@ -267,9 +306,9 @@ pub fn chatCompletionStream(
         .providerOptions = config.providerOptions,
     };
 
-    var hdr_buf: [4]std.http.Header = undefined;
-    const auth = try self.authHeaders(&hdr_buf);
-    return http.streamSseValue(self.allocator, &self.http_client, url, auth, req_body, ChatCompletionResponse, self, context, callback);
+    var hdr_buf: AuthHeaders = undefined;
+    const headers = try self.authHeaders(&hdr_buf);
+    return self.transport.streamSse(url, headers, req_body, ChatCompletionResponse, context, callback);
 }
 
 /// Convenience: stream a chat completion from a single text prompt.
@@ -499,8 +538,8 @@ pub fn createEmbedding(
     config: EmbedConfig,
 ) ApiError!Response(types.EmbeddingResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/embeddings", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/embeddings", .{self.base_url});
+    defer self.transport.allocator.free(url);
 
     return self.fetchPost(url, types.EmbeddingRequest{
         .input = input,
@@ -524,16 +563,16 @@ pub fn embedText(
 /// List available models.
 pub fn listModels(self: *Client) ApiError!Response(types.ListModelsResponse) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/models", .{self.base_url});
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/models", .{self.base_url});
+    defer self.transport.allocator.free(url);
     return self.fetchGet(url, types.ListModelsResponse);
 }
 
 /// Get metadata for a specific model.
 pub fn getModel(self: *Client, model: []const u8) ApiError!Response(types.Model) {
     if (self.api_key.len == 0) return error.MissingApiKey;
-    const url = try self.allocator.print("{s}/models/{s}", .{ self.base_url, model });
-    defer self.allocator.free(url);
+    const url = try self.transport.allocator.print("{s}/models/{s}", .{ self.base_url, model });
+    defer self.transport.allocator.free(url);
     return self.fetchGet(url, types.Model);
 }
 
@@ -574,19 +613,64 @@ test "Client init and deinit" {
     try std.testing.expectEqualStrings("https://api.openai.com/v1", client.base_url);
 }
 
-test "authHeaders emits X-HF-Bill-To only when bill_to is set" {
-    var buf: [4]std.http.Header = undefined;
-
-    var plain = Client.init(std.testing.io, std.testing.allocator, "k", .{});
-    defer plain.deinit();
-    try std.testing.expectEqual(@as(usize, 3), (try plain.authHeaders(&buf)).len);
-
-    var billed = Client.init(std.testing.io, std.testing.allocator, "k", .{ .bill_to = "my-org" });
+test "extra_headers go to the transport, not the auth headers" {
+    var buf: AuthHeaders = undefined;
+    const extra = [_]std.http.Header{.{ .name = "X-HF-Bill-To", .value = "my-org" }};
+    var billed = Client.init(std.testing.io, std.testing.allocator, "k", .{ .extra_headers = &extra });
     defer billed.deinit();
-    const headers = try billed.authHeaders(&buf);
-    try std.testing.expectEqual(@as(usize, 4), headers.len);
-    try std.testing.expectEqualStrings("X-HF-Bill-To", headers[3].name);
-    try std.testing.expectEqualStrings("my-org", headers[3].value);
+    try std.testing.expectEqual(@as(usize, 3), (try billed.authHeaders(&buf)).len);
+    try std.testing.expectEqualSlices(std.http.Header, &extra, billed.transport.extra_headers);
+}
+
+fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
+    for (headers) |h| if (std.mem.eql(u8, h.name, name)) return h.value;
+    return null;
+}
+
+test "chatgpt authHeaders: bearer, originator, User-Agent, account and session ids, nothing else" {
+    var buf: AuthHeaders = undefined;
+    var account: [6]u8 = "acct-1".*;
+    var client = try Client.initChatGpt(std.testing.io, std.testing.allocator, "tok-abc", .{ .base_url = codex_base_url }, .{
+        .account_id = &account,
+        .session_id = "sess-1",
+    });
+    defer client.deinit();
+    // The account id is copied: the caller's buffer may be freed on refresh.
+    @memset(&account, 'x');
+    const headers = try client.authHeaders(&buf);
+    const expected = [_]std.http.Header{
+        .{ .name = "Authorization", .value = "Bearer tok-abc" },
+        .{ .name = "originator", .value = "lightpanda" },
+        .{ .name = "User-Agent", .value = "lightpanda" },
+        .{ .name = "ChatGPT-Account-Id", .value = "acct-1" },
+        .{ .name = "session-id", .value = "sess-1" },
+    };
+    try std.testing.expectEqual(expected.len, headers.len);
+    for (expected, headers) |e, h| {
+        try std.testing.expectEqualStrings(e.name, h.name);
+        try std.testing.expectEqualStrings(e.value, h.value);
+    }
+}
+
+test "chatgpt authHeaders: account and session ids omitted when null" {
+    var buf: AuthHeaders = undefined;
+    var client = try Client.initChatGpt(std.testing.io, std.testing.allocator, "tok", .{}, .{});
+    defer client.deinit();
+    const headers = try client.authHeaders(&buf);
+    try std.testing.expectEqual(@as(usize, 3), headers.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), headerValue(headers, "ChatGPT-Account-Id"));
+    try std.testing.expectEqual(@as(?[]const u8, null), headerValue(headers, "session-id"));
+    try std.testing.expectEqual(@as(?[]const u8, null), headerValue(headers, "OpenAI-Organization"));
+}
+
+test "setApiKey rebuilds the cached bearer value" {
+    var buf: AuthHeaders = undefined;
+    var client = Client.init(std.testing.io, std.testing.allocator, "tok-old", .{});
+    defer client.deinit();
+    try std.testing.expectEqualStrings("Bearer tok-old", headerValue(try client.authHeaders(&buf), "Authorization").?);
+    client.setApiKey("tok-new");
+    try std.testing.expectEqual(@as(?[]const u8, null), client.bearer.value);
+    try std.testing.expectEqualStrings("Bearer tok-new", headerValue(try client.authHeaders(&buf), "Authorization").?);
 }
 
 test "isChatModel keeps chat families" {

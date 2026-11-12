@@ -9,13 +9,15 @@
 //! matches.
 
 const std = @import("std");
-const types = @import("../typesafe/types.zig");
+const types = @import("types.zig");
 const http = @import("../http.zig");
 const retry = @import("../retry.zig");
 const provider = @import("../provider.zig");
 const TypesafeClient = @import("../typesafe/Client.zig");
+const typesafe_types = @import("../typesafe/types.zig");
 const GeminiClient = @import("../gemini/Client.zig");
 const gemini_decisions = @import("../gemini/decisions.zig");
+const typesafe_adapter = @import("typesafe.zig");
 const gemini_adapter = @import("gemini.zig");
 
 const Pool = @This();
@@ -38,7 +40,7 @@ pub const Provider = enum {
     pub fn defaultModel(self: Provider) []const u8 {
         return switch (self) {
             .gemini => gemini_decisions.default_model,
-            .typesafe => types.default_model,
+            .typesafe => typesafe_types.default_model,
         };
     }
 };
@@ -55,6 +57,11 @@ pub const Options = struct {
     /// Worth setting when the caller is waiting on the ask: see
     /// `InitOptions.request_timeout_ms` on either client.
     request_timeout_ms: ?u32 = null,
+    /// Borrowed `std.http.Client` for every client the pool makes, so they
+    /// share one connection pool; see `http.Transport.Options.http_client`,
+    /// including what sharing it across threads asks of its allocator. Null
+    /// gives each client its own.
+    http_client: ?*std.http.Client = null,
     /// A variable naming the provider to use, "gemini" or "typesafe", for when
     /// both have a key. Unset (or null), Gemini is preferred.
     provider_env_var_name: ?[]const u8 = null,
@@ -104,10 +111,11 @@ pub fn envCredentials(environ: std.process.Environ, provider_env_var_name: ?[]co
     } else null;
 
     if (forced != .typesafe) {
-        if (provider.envApiKey(environ, .gemini)) |key| return .{
+        const gemini = provider.fromEnv(environ, .gemini);
+        if (gemini.key) |key| return .{
             .provider = .gemini,
             .api_key = key,
-            .base_url = provider.envGet(environ, gemini_base_url_env_var_name),
+            .base_url = gemini.base_url orelse provider.envGet(environ, gemini_base_url_env_var_name),
         };
         if (forced == .gemini) return error.MissingApiKey;
     }
@@ -145,27 +153,30 @@ pub fn ask(
     questions: types.Questions,
     options: AskOptions,
     failure: *http.ErrorDetail,
-) !http.Response(types.AskResponse) {
+) !types.Response {
     const pooled = try self.take();
     defer self.put(pooled);
 
     switch (pooled.client) {
         .typesafe => |client| {
             const model = options.model orelse Provider.typesafe.defaultModel();
-            return client.ask(state, questions, .{ .model = model }) catch |err| {
-                if (err == error.ApiError) failure.* = try client.last_error.dupe(arena);
+            const request = try typesafe_adapter.toTypesafe(arena, state, questions);
+            var response = client.ask(request.state, request.questions, .{ .model = model }) catch |err| {
+                if (err == error.ApiError) failure.* = try client.transport.last_error.dupe(arena);
                 return err;
             };
+            errdefer response.deinit();
+            return typesafe_adapter.fromTypesafe(&response);
         },
         .gemini => |client| {
             const model = options.model orelse Provider.gemini.defaultModel();
             const request = try gemini_adapter.toGemini(arena, state, questions);
             var response = client.createDecision(model, request.input, request.questions) catch |err| {
-                if (err == error.ApiError) failure.* = try client.last_error.dupe(arena);
+                if (err == error.ApiError) failure.* = try client.transport.last_error.dupe(arena);
                 return err;
             };
-            defer response.deinit();
-            return gemini_adapter.fromGemini(self.allocator, arena, response.value, model, failure);
+            errdefer response.deinit();
+            return gemini_adapter.fromGemini(arena, &response, model, failure);
         },
     }
 }
@@ -195,11 +206,13 @@ fn take(self: *Pool) !Pooled {
                 .base_url = url_copy,
                 .retry_policy = self.options.retry_policy,
                 .request_timeout_ms = self.options.request_timeout_ms,
+                .http_client = self.options.http_client,
             }) },
             .typesafe => .{ .typesafe = try self.create(TypesafeClient, key_copy, .{
                 .base_url = url_copy.?,
                 .retry_policy = self.options.retry_policy,
                 .request_timeout_ms = self.options.request_timeout_ms,
+                .http_client = self.options.http_client,
             }) },
         },
     };

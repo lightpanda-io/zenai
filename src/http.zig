@@ -5,7 +5,7 @@ const retry = @import("retry.zig");
 
 const log = std.log.scoped(.zenai);
 
-/// Error set returned by `fetchJsonWithRetry`. Each provider's `ApiError`
+/// Error set returned by `Transport.fetchJson`. Each provider's `ApiError`
 /// is a superset, adding its own preflight errors (`MissingApiKey` for the
 /// keyed providers; keenable, which supports keyless calls, adds
 /// `MissingAppTitle` instead).
@@ -14,7 +14,7 @@ pub const FetchError = error{
     EmptyResponse,
 } || std.http.Client.FetchError || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error || std.Uri.ParseError;
 
-/// Non-2xx detail captured via a client's `setErrorDetail` for later
+/// Non-2xx detail captured by `Transport.setErrorDetail` for later
 /// inspection. `message` is the one-line message of a provider JSON error
 /// (see `extractErrorMessage`), otherwise the raw body; null when the body
 /// was empty.
@@ -70,8 +70,16 @@ pub const BearerAuth = struct {
     }
 };
 
+/// A `std.http.Client` set up the way a `Transport` makes its own: DNS
+/// lookups go through `addrConfigIo`. Use it to build a client to share
+/// through `Transport.Options.http_client`. The caller owns it and calls
+/// `deinit` once no transport uses it.
+pub fn newClient(io: std.Io, allocator: std.mem.Allocator) std.http.Client {
+    return .{ .allocator = allocator, .io = addrConfigIo(io) };
+}
+
 /// `io` with DNS lookups that skip IPv6 when this host can't reach the IPv6
-/// internet, as glibc's `AI_ADDRCONFIG` does. Hand it to `std.http.Client`.
+/// internet, as glibc's `AI_ADDRCONFIG` does. `newClient` applies it.
 ///
 /// Zig 0.17's `HostName.connect` starts a connect per resolved address with
 /// `io.async`. On `Io.Threaded.init_single_threaded` (what lightpanda uses)
@@ -210,116 +218,370 @@ pub fn armInterrupt(interrupt: ?*Interrupt, req: *std.http.Client.Request) Inter
     return .{ .interrupt = interrupt, .req = req };
 }
 
-/// Bounds one request's wall-clock time from an established connection to
-/// the end of the response body. A private `Interrupt` shuts the socket
-/// down at the deadline, exactly as a Ctrl-C would, so the blocking read
-/// fails instead of waiting on the server. The connect phase is out of
-/// reach: std's `ConnectTcpOptions.timeout` is declared but unimplemented.
+/// Bounds a request's wall-clock time from an established connection to the
+/// end of the response body. A `Transport` makes one on its first timed
+/// request and keeps it until `deinit`: a thread that sleeps until the armed
+/// deadline, then shuts the connection's socket down through a private
+/// `Interrupt`, exactly as a Ctrl-C would, so the blocking read fails instead
+/// of waiting on the server. The connect phase is out of reach: std's
+/// `ConnectTcpOptions.timeout` is declared but unimplemented.
 ///
-/// A raw `std.Thread` rather than `io.concurrent`: consumers run a
-/// single-threaded `Io.Threaded`, where `concurrent` is unavailable and
-/// cancellation is a no-op. One fixed deadline for the whole exchange, so
-/// not suitable for long-lived streams without a resettable deadline.
+/// A thread because std 0.17 has no portable deadline on a stream read:
+/// `Stream.Reader` reads through `io.operate` with no timeout; `SO_RCVTIMEO`
+/// makes the read fail with `EAGAIN`, which `Io.Threaded` treats as a bug
+/// (a panic in debug builds); `operateTimeout` on Windows returns without
+/// cancelling the pending receive; and consumers run a single-threaded
+/// `Io.Threaded`, where `io.concurrent` is unavailable and cancellation is a
+/// no-op. One slot, since a transport runs one request at a time, and one
+/// fixed deadline per attempt, so not suitable for long-lived streams.
 const Watchdog = struct {
+    io: std.Io,
+    thread: std.Thread,
+    /// Guards `deadline` and `stopping`, and firing `interrupt`: once
+    /// `disarm` holds it, the thread can no longer touch the socket.
+    mutex: std.Io.Mutex = .init,
+    /// Bumped under `mutex` on every change; the thread futex-waits on it.
+    epoch: std.atomic.Value(u32) = .init(0),
+    deadline: ?std.Io.Clock.Timestamp = null,
+    stopping: bool = false,
     interrupt: Interrupt = .{},
-    done: std.Io.Event = .unset,
-    thread: ?std.Thread = null,
 
-    fn start(self: *Watchdog, io: std.Io, req: *std.http.Client.Request, timeout_ms: u32) error{SystemResources}!void {
-        _ = armInterrupt(&self.interrupt, req);
-        const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
+    fn create(io: std.Io, allocator: std.mem.Allocator) error{ OutOfMemory, SystemResources }!*Watchdog {
+        const self = try allocator.create(Watchdog);
+        errdefer allocator.destroy(self);
+        self.* = .{ .io = io, .thread = undefined };
         // Default stack: under libc it also holds the host's static TLS, which
         // can outgrow a small fixed size and fail the spawn.
-        self.thread = std.Thread.spawn(.{}, run, .{ self, io, deadline }) catch return error.SystemResources;
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch return error.SystemResources;
+        return self;
     }
 
-    fn run(self: *Watchdog, io: std.Io, deadline: std.Io.Clock.Timestamp) void {
-        // Spurious wakeups (e.g. EINTR) also report Timeout; only the deadline counts.
-        while (true) {
-            if (self.done.waitTimeout(io, .{ .deadline = deadline })) |_| return else |_| {}
-            if (deadline.compare(.lte, .now(io, .awake))) break;
+    fn destroy(self: *Watchdog, allocator: std.mem.Allocator) void {
+        self.mutex.lockUncancelable(self.io);
+        self.stopping = true;
+        self.unlockChanged();
+        self.thread.join();
+        allocator.destroy(self);
+    }
+
+    fn run(self: *Watchdog) void {
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        while (!self.stopping) {
+            const epoch = self.epoch.load(.monotonic);
+            var timeout: std.Io.Timeout = .none;
+            if (self.deadline) |d| {
+                if (d.compare(.lte, .now(io, .awake))) {
+                    self.interrupt.fire();
+                    self.deadline = null;
+                    continue;
+                }
+                timeout = .{ .deadline = d };
+            }
+            self.mutex.unlock(io);
+            // Wakes on a change, the deadline, or spuriously; the loop rechecks.
+            io.futexWaitTimeout(u32, &self.epoch.raw, epoch, timeout) catch {};
+            self.mutex.lockUncancelable(io);
         }
-        self.interrupt.fire();
     }
 
-    /// Must run before `req.deinit`: joins the thread so a late `fire` can't
-    /// hit a recycled socket, and poisons a connection the deadline shut down
-    /// just after the body had already completed.
-    fn stop(self: *Watchdog, io: std.Io, guard: InterruptGuard) void {
-        const thread = self.thread orelse return;
-        self.done.set(io);
-        thread.join();
-        if (self.interrupt.isFired()) guard.poison();
+    /// Shut `req`'s connection down `timeout_ms` from now unless `disarm`
+    /// comes first.
+    fn arm(self: *Watchdog, req: *std.http.Client.Request, timeout_ms: u32) void {
+        self.mutex.lockUncancelable(self.io);
+        self.interrupt.reset();
+        if (req.connection) |conn| self.interrupt.arm(&conn.stream_reader);
+        self.deadline = .fromNow(self.io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
+        self.unlockChanged();
+    }
+
+    /// Must run before `req.deinit`, so the thread can't shut down a socket
+    /// the pool has recycled. Returns whether the deadline fired, possibly
+    /// just after the body had already completed: the caller poisons the
+    /// connection either way.
+    fn disarm(self: *Watchdog) bool {
+        self.mutex.lockUncancelable(self.io);
+        self.deadline = null;
+        self.interrupt.disarm();
+        const fired = self.interrupt.isFired();
+        self.unlockChanged();
+        return fired;
+    }
+
+    fn isFired(self: *const Watchdog) bool {
+        return self.interrupt.isFired();
+    }
+
+    fn unlockChanged(self: *Watchdog) void {
+        _ = self.epoch.fetchAdd(1, .monotonic);
+        self.mutex.unlock(self.io);
+        self.io.futexWake(u32, &self.epoch.raw, 1);
     }
 };
 
-/// Common HTTP fetch + retry + JSON parse pipeline shared by all provider
-/// clients. On a non-retryable HTTP error response, calls
-/// `error_handler.setErrorDetail(status, body)` so the caller can record
-/// provider-specific error detail before this function returns
-/// `error.ApiError`. `timeout_ms` bounds each attempt from an established
-/// connection to the end of the body (see `Watchdog`); null waits
-/// indefinitely.
-pub fn fetchJsonWithRetry(
+/// A per-attempt time bound: the transport's watchdog and the limit.
+const Deadline = struct {
+    watchdog: *Watchdog,
+    timeout_ms: u32,
+};
+
+/// The HTTP plumbing every API client shares: the `std.http.Client` and its
+/// connection pool (its own, or one borrowed from the caller), the retry and
+/// timeout policy, the detail of the last failed request, and an optional
+/// interrupt. Each client embeds one as its `transport` field and keeps only
+/// what is its own: auth headers, URLs and request shapes.
+pub const Transport = struct {
     allocator: std.mem.Allocator,
-    http_client: *std.http.Client,
-    policy: retry.RetryPolicy,
-    timeout_ms: ?u32,
-    options: std.http.Client.FetchOptions,
-    comptime T: type,
-    error_handler: anytype,
-) FetchError!Response(T) {
-    // Provider clients carry an optional `interrupt` so a SIGINT can abort an
-    // in-flight read; clients without the field (e.g. tavily) opt out at comptime.
-    const interrupt: ?*Interrupt = if (@hasField(@TypeOf(error_handler.*), "interrupt"))
-        error_handler.interrupt
-    else
-        null;
-    var attempt: u8 = 0;
-    while (true) : (attempt += 1) {
-        var response_buf: std.Io.Writer.Allocating = .init(allocator);
-        var keep_buf = false;
-        defer if (!keep_buf) response_buf.deinit();
+    /// Reach it through `httpClient()`.
+    http_client: union(enum) {
+        owned: std.http.Client,
+        borrowed: *std.http.Client,
+    },
+    /// Retry policy applied to every non-streaming request.
+    retry_policy: retry.RetryPolicy,
+    /// Per-attempt wall-clock bound on non-streaming requests, from an
+    /// established connection to the end of the body (connect excluded);
+    /// exceeding it fails with `error.Timeout`. `null` waits indefinitely.
+    /// The first timed request starts one thread that serves every later one
+    /// (see `Watchdog`); `deinit` stops it.
+    request_timeout_ms: ?u32,
+    /// Names the provider when a failed request is logged; null logs nothing.
+    log_tag: ?[]const u8,
+    /// Sent on every request after the client's own headers. Borrowed.
+    extra_headers: []const std.http.Header,
+    /// Status and message of the most recent failed request.
+    last_error: ErrorDetail = .{},
+    /// Set by the host so a SIGINT can abort an in-flight request mid-read.
+    interrupt: ?*Interrupt = null,
+    /// Enforces `request_timeout_ms`; started on the first timed request.
+    /// Heap-allocated so the transport can still be moved.
+    watchdog: ?*Watchdog = null,
 
-        var retry_after_ms: ?u32 = null;
-        const status = fetchCapturingRetryAfter(allocator, http_client, options, &response_buf.writer, interrupt, timeout_ms, &retry_after_ms) catch |err| {
-            // Don't retry a request the user cancelled.
-            if (interrupt) |it| if (it.isFired()) return err;
-            if (retry.isRetryableFetchError(err) and attempt + 1 < policy.max_attempts) {
-                retry.sleepBackoff(http_client.io, attempt, policy);
-                continue;
-            }
-            return err;
+    pub const Options = struct {
+        retry_policy: retry.RetryPolicy = .{},
+        request_timeout_ms: ?u32 = null,
+        log_tag: ?[]const u8 = null,
+        /// Headers sent on every request after the client's own (auth)
+        /// headers, for what a backend or gateway reads beyond the API, e.g.
+        /// Hugging Face's `X-HF-Bill-To`. Borrowed: the slice and its strings
+        /// must outlive the transport.
+        extra_headers: []const std.http.Header = &.{},
+        /// A `std.http.Client` to send requests through, borrowed: `deinit`
+        /// leaves it open, and it must outlive the transport. Transports given
+        /// the same one share its connection pool and CA bundle, so a request
+        /// to a host another one already reached skips the TCP and TLS
+        /// handshakes, and the system CA bundle is scanned once. Null (the
+        /// default) makes one the transport owns.
+        ///
+        /// Build it with `newClient`, which resolves hosts the way an owned
+        /// one does (`addrConfigIo`). Connections are made with the shared
+        /// client's `io` and `allocator`; response bodies still come from the
+        /// transport's allocator.
+        ///
+        /// Sharing it across threads is safe when its allocator is:
+        /// `std.http.Client.request` takes the connection pool's mutex and the
+        /// CA bundle's lock, and a request holds its connection alone until
+        /// it is done. Don't reset its `now` to null or change its proxies
+        /// while requests are in flight. A zenai client itself is still for
+        /// one thread at a time.
+        http_client: ?*std.http.Client = null,
+    };
+
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, options: Options) Transport {
+        return .{
+            .allocator = allocator,
+            .http_client = if (options.http_client) |c| .{ .borrowed = c } else .{ .owned = newClient(io, allocator) },
+            .retry_policy = options.retry_policy,
+            .request_timeout_ms = options.request_timeout_ms,
+            .log_tag = options.log_tag,
+            .extra_headers = options.extra_headers,
         };
+    }
 
-        const body = response_buf.written();
-        const status_code: u10 = @backingInt(status);
-        if (status_code >= 200 and status_code < 300) {
-            if (body.len == 0) return error.EmptyResponse;
-            const parsed = std.json.parseFromSlice(T, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| {
-                setUnparsedDetail(error_handler, status_code, err, body);
+    /// Frees `last_error`, stops the timeout thread, and closes the
+    /// connections of a client it owns.
+    pub fn deinit(self: *Transport) void {
+        self.last_error.deinit(self.allocator);
+        if (self.watchdog) |w| w.destroy(self.allocator);
+        switch (self.http_client) {
+            .owned => |*c| c.deinit(),
+            .borrowed => {},
+        }
+    }
+
+    /// The client requests go through.
+    pub fn httpClient(self: *Transport) *std.http.Client {
+        return switch (self.http_client) {
+            .owned => |*c| c,
+            .borrowed => |c| c,
+        };
+    }
+
+    /// Record a non-2xx response (or an unparseable 2xx body) in `last_error`.
+    pub fn setErrorDetail(self: *Transport, status: u10, body: []const u8) void {
+        self.last_error.setLogged(self.allocator, status, body, self.log_tag);
+    }
+
+    /// Fetch + retry + JSON parse. On a non-retryable HTTP error response,
+    /// records it in `last_error` and returns `error.ApiError`. Each attempt is
+    /// bounded by `request_timeout_ms` (see `Watchdog`).
+    pub fn fetchJson(self: *Transport, request: std.http.Client.FetchOptions, comptime T: type) FetchError!Response(T) {
+        var options = request;
+        options.extra_headers = try self.withExtraHeaders(request.extra_headers);
+        defer self.freeHeaders(request.extra_headers, options.extra_headers);
+        const client = self.httpClient();
+        const policy = self.retry_policy;
+        const deadline: ?Deadline = if (self.request_timeout_ms) |ms| .{
+            .watchdog = self.watchdog orelse w: {
+                self.watchdog = try Watchdog.create(client.io, self.allocator);
+                break :w self.watchdog.?;
+            },
+            .timeout_ms = ms,
+        } else null;
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            var response_buf: std.Io.Writer.Allocating = .init(self.allocator);
+            var keep_buf = false;
+            defer if (!keep_buf) response_buf.deinit();
+
+            var retry_after_ms: ?u32 = null;
+            const status = fetchCapturingRetryAfter(self.allocator, client, options, &response_buf.writer, self.interrupt, deadline, &retry_after_ms) catch |err| {
+                // Don't retry a request the user cancelled.
+                if (self.interrupted()) return err;
+                if (retry.isRetryableFetchError(err) and attempt + 1 < policy.max_attempts) {
+                    retry.sleepBackoff(client.io, attempt, policy);
+                    continue;
+                }
                 return err;
             };
-            keep_buf = true;
-            return .{ .value = parsed.value, .json_buf = response_buf, .parsed = parsed };
-        }
 
-        if (retry.isRetryableStatus(status_code) and attempt + 1 < policy.max_attempts) {
-            retry.sleepBackoffHinted(http_client.io, attempt, policy, retry_after_ms);
-            continue;
+            const body = response_buf.written();
+            const status_code: u10 = @backingInt(status);
+            if (status_code >= 200 and status_code < 300) {
+                if (body.len == 0) return error.EmptyResponse;
+                const parsed = std.json.parseFromSlice(T, self.allocator, body, .{ .ignore_unknown_fields = true }) catch |err| {
+                    self.setUnparsedDetail(status_code, err, body);
+                    return err;
+                };
+                keep_buf = true;
+                return .{ .value = parsed.value, .json_buf = response_buf, .parsed = parsed };
+            }
+
+            if (retry.isRetryableStatus(status_code) and attempt + 1 < policy.max_attempts) {
+                retry.sleepBackoffHinted(client.io, attempt, policy, retry_after_ms);
+                continue;
+            }
+            self.setErrorDetail(status_code, body);
+            return error.ApiError;
         }
-        error_handler.setErrorDetail(status_code, body);
-        return error.ApiError;
     }
-}
 
-/// Record the head of a 2xx body that failed to parse.
-fn setUnparsedDetail(error_handler: anytype, status: u10, err: anyerror, body: []const u8) void {
-    var buf: [320]u8 = undefined;
-    const head = body[0..@min(body.len, 256)];
-    const message = std.mem.print(&buf, "unexpected response ({s}): {s}", .{ @errorName(err), head }) catch head;
-    error_handler.setErrorDetail(status, message);
-}
+    /// `fetchJson` for a GET.
+    pub fn getJson(self: *Transport, url: []const u8, headers: []const std.http.Header, comptime T: type) FetchError!Response(T) {
+        return self.fetchJson(.{
+            .location = .{ .url = url },
+            .method = .GET,
+            .extra_headers = headers,
+        }, T);
+    }
+
+    /// `fetchJson` for a JSON POST: encodes `body` with `encodeBody` and sets
+    /// the content type.
+    pub fn postJson(self: *Transport, url: []const u8, headers: []const std.http.Header, body: anytype, comptime T: type) FetchError!Response(T) {
+        const payload = try encodeBody(self.allocator, body);
+        defer self.allocator.free(payload);
+
+        return self.fetchJson(.{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = payload,
+            .extra_headers = headers,
+            .headers = .{ .content_type = .{ .override = "application/json" } },
+        }, T);
+    }
+
+    /// POST `body` and stream the Server-Sent Events response, invoking
+    /// `callback` with each parsed `data:` event of type `EventT` until the
+    /// stream ends (EOF or OpenAI's `[DONE]` sentinel). Never retried.
+    pub fn streamSse(
+        self: *Transport,
+        url: []const u8,
+        headers: []const std.http.Header,
+        body: anytype,
+        comptime EventT: type,
+        context: anytype,
+        callback: *const fn (@TypeOf(context), EventT) void,
+    ) SseError!void {
+        const payload = try encodeBody(self.allocator, body);
+        defer self.allocator.free(payload);
+        return self.streamLines(url, headers, payload, EventT, context, callback, frameSse);
+    }
+
+    /// POST `body` and stream a newline-delimited JSON (NDJSON) response — one
+    /// JSON object per line, no `data:` framing or `[DONE]` sentinel, as
+    /// Ollama's native `/api/chat` emits — invoking `callback` with each
+    /// parsed line. Never retried.
+    pub fn streamNdjson(
+        self: *Transport,
+        url: []const u8,
+        headers: []const std.http.Header,
+        body: anytype,
+        comptime EventT: type,
+        context: anytype,
+        callback: *const fn (@TypeOf(context), EventT) void,
+    ) SseError!void {
+        const payload = try encodeBody(self.allocator, body);
+        defer self.allocator.free(payload);
+        return self.streamLines(url, headers, payload, EventT, context, callback, frameNdjson);
+    }
+
+    /// Whether the host fired the interrupt, i.e. the user cancelled.
+    pub fn interrupted(self: *const Transport) bool {
+        const it = self.interrupt orelse return false;
+        return it.isFired();
+    }
+
+    /// Record the head of a 2xx body that failed to parse.
+    fn setUnparsedDetail(self: *Transport, status: u10, err: anyerror, body: []const u8) void {
+        var buf: [320]u8 = undefined;
+        const head = body[0..@min(body.len, 256)];
+        const message = std.mem.print(&buf, "unexpected response ({s}): {s}", .{ @errorName(err), head }) catch head;
+        self.setErrorDetail(status, message);
+    }
+
+    /// Shared body of `streamSse`/`streamNdjson`, which differ only in
+    /// `frame`. A stale socket fails before the head, so no event has reached
+    /// `callback` yet and the stream can start over.
+    fn streamLines(
+        self: *Transport,
+        url: []const u8,
+        headers: []const std.http.Header,
+        payload: []const u8,
+        comptime EventT: type,
+        context: anytype,
+        callback: *const fn (@TypeOf(context), EventT) void,
+        comptime frame: fn ([]const u8) LineFrame,
+    ) SseError!void {
+        const all = try self.withExtraHeaders(headers);
+        defer self.freeHeaders(headers, all);
+        return reconnectOnStale(SseError!void, self.interrupt, streamLinesOnce, .{
+            self, url, all, payload, EventT, context, callback, frame,
+        });
+    }
+
+    /// `base` followed by `extra_headers`: `base` itself when there are none,
+    /// else a copy to release with `freeHeaders`.
+    fn withExtraHeaders(self: *Transport, base: []const std.http.Header) std.mem.Allocator.Error![]const std.http.Header {
+        if (self.extra_headers.len == 0) return base;
+        return std.mem.concat(self.allocator, std.http.Header, &.{ base, self.extra_headers });
+    }
+
+    /// Release what `withExtraHeaders(base)` returned.
+    fn freeHeaders(self: *Transport, base: []const std.http.Header, headers: []const std.http.Header) void {
+        if (headers.ptr != base.ptr) self.allocator.free(headers);
+    }
+};
 
 /// A single HTTP round-trip into `response_writer`, mirroring
 /// `std.http.Client.fetch` (redirects, content-encoding) but arming
@@ -342,31 +604,6 @@ fn encodeBody(allocator: std.mem.Allocator, body: anytype) std.mem.Allocator.Err
     return json.stringifyAlloc(allocator, body, .{ .emit_null_optional_fields = false });
 }
 
-/// `fetchJsonWithRetry` for a JSON POST: encodes `body` with `encodeBody`
-/// and sets the content type.
-pub fn postJsonWithRetry(
-    allocator: std.mem.Allocator,
-    http_client: *std.http.Client,
-    policy: retry.RetryPolicy,
-    timeout_ms: ?u32,
-    url: []const u8,
-    extra_headers: []const std.http.Header,
-    body: anytype,
-    comptime T: type,
-    error_handler: anytype,
-) FetchError!Response(T) {
-    const payload = try encodeBody(allocator, body);
-    defer allocator.free(payload);
-
-    return fetchJsonWithRetry(allocator, http_client, policy, timeout_ms, .{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = payload,
-        .extra_headers = extra_headers,
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-    }, T, error_handler);
-}
-
 /// Server-provided retry hint from a response head: `Retry-After-Ms`
 /// (milliseconds, Anthropic) wins over the standard `Retry-After` (seconds).
 /// Parsed and clamped by `retry.parseRetryAfter`; null when absent or
@@ -386,8 +623,8 @@ fn retryAfterFromHead(head: std.http.Client.Response.Head) ?u32 {
 
 /// `fetchInterruptible` plus capture of the response's Retry-After hint into
 /// `retry_after_ms` (read from the head before the body is streamed, while
-/// the header bytes are still valid) so `fetchJsonWithRetry` can honor it,
-/// and an optional `timeout_ms` after which the exchange fails with
+/// the header bytes are still valid) so `Transport.fetchJson` can honor it,
+/// and an optional `deadline` after which the exchange fails with
 /// `error.Timeout` (see `Watchdog`).
 fn fetchCapturingRetryAfter(
     allocator: std.mem.Allocator,
@@ -395,10 +632,10 @@ fn fetchCapturingRetryAfter(
     options: std.http.Client.FetchOptions,
     response_writer: *std.Io.Writer,
     interrupt: ?*Interrupt,
-    timeout_ms: ?u32,
+    deadline: ?Deadline,
     retry_after_ms: *?u32,
 ) std.http.Client.FetchError!std.http.Status {
-    return reconnectOnStale(std.http.Client.FetchError!std.http.Status, interrupt, fetchOnce, .{ allocator, client, options, response_writer, interrupt, timeout_ms, retry_after_ms });
+    return reconnectOnStale(std.http.Client.FetchError!std.http.Status, interrupt, fetchOnce, .{ allocator, client, options, response_writer, interrupt, deadline, retry_after_ms });
 }
 
 fn fetchOnce(
@@ -407,7 +644,7 @@ fn fetchOnce(
     options: std.http.Client.FetchOptions,
     response_writer: *std.Io.Writer,
     interrupt: ?*Interrupt,
-    timeout_ms: ?u32,
+    deadline: ?Deadline,
     retry_after_ms: *?u32,
 ) std.http.Client.FetchError!std.http.Status {
     const uri = switch (options.location) {
@@ -446,14 +683,18 @@ fn fetchOnce(
     defer guard.deinit();
     errdefer guard.poison();
 
-    var watchdog: Watchdog = .{};
-    if (timeout_ms) |ms| try watchdog.start(client.io, &req, ms);
-    defer watchdog.stop(client.io, guard);
+    if (deadline) |d| d.watchdog.arm(&req, d.timeout_ms);
+    defer if (deadline) |d| if (d.watchdog.disarm()) guard.poison();
 
-    return exchange(allocator, &req, redirect_behavior, options, response_writer, retry_after_ms) catch |err| {
-        if (watchdog.interrupt.isFired()) return error.Timeout;
+    const status = exchange(allocator, &req, redirect_behavior, options, response_writer, retry_after_ms) catch |err| {
+        if (deadline) |d| if (d.watchdog.isFired()) return error.Timeout;
         return err;
     };
+    // A shutdown mid-body can also end it "cleanly": std's Content-Length
+    // reader takes the EOF that follows as the end of the body, which would
+    // then be returned truncated.
+    if (deadline) |d| if (d.watchdog.isFired()) return error.Timeout;
+    return status;
 }
 
 /// The send/receive half of `fetchOnce`, split out so its
@@ -615,56 +856,29 @@ fn frameNdjson(line: []const u8) LineFrame {
     return .{ .parse = line };
 }
 
-/// Shared transport for line-delimited streaming POST responses: opens the
-/// request, arms the interrupt around the blocking read, checks status, then
-/// runs each `\n`-delimited, `\r`-trimmed line through `frame` — skipping,
-/// stopping, or parsing it as `EventT` and handing the value to `callback` —
-/// until the body ends. `streamSse`/`streamNdjson` differ only in `frame`.
+/// One attempt of `Transport.streamLines`: opens the request, arms the
+/// interrupt around the blocking read, checks status, then runs each
+/// `\n`-delimited, `\r`-trimmed line through `frame` — skipping, stopping, or
+/// parsing it as `EventT` and handing the value to `callback` — until the body
+/// ends. A non-2xx status or an in-band error event is recorded in
+/// `transport.last_error` before returning `error.ApiError`, as in
+/// `Transport.fetchJson`.
 ///
 /// Requests `identity` encoding: the line reader does not decompress, so a
-/// gzip'd body would arrive as unparseable bytes. `error_handler` is the
-/// provider client; its `interrupt` field (if present) is armed around the
-/// blocking read so a cross-thread `Interrupt.fire` can abort it, and
-/// `setErrorDetail(status, "")` records a non-2xx status before returning
-/// `error.ApiError` — mirroring `fetchJsonWithRetry`.
-fn streamLines(
-    allocator: std.mem.Allocator,
-    http_client: *std.http.Client,
-    url: []const u8,
-    extra_headers: []const std.http.Header,
-    payload: []const u8,
-    comptime EventT: type,
-    error_handler: anytype,
-    context: anytype,
-    callback: *const fn (@TypeOf(context), EventT) void,
-    comptime frame: fn ([]const u8) LineFrame,
-) SseError!void {
-    const interrupt: ?*Interrupt = if (@hasField(@TypeOf(error_handler.*), "interrupt"))
-        error_handler.interrupt
-    else
-        null;
-    // A stale socket fails before the head, so no event has reached
-    // `callback` yet and the stream can start over.
-    return reconnectOnStale(SseError!void, interrupt, streamLinesOnce, .{
-        allocator, http_client, url, extra_headers, payload, EventT, interrupt, error_handler, context, callback, frame,
-    });
-}
-
+/// gzip'd body would arrive as unparseable bytes.
 fn streamLinesOnce(
-    allocator: std.mem.Allocator,
-    http_client: *std.http.Client,
+    transport: *Transport,
     url: []const u8,
     extra_headers: []const std.http.Header,
     payload: []const u8,
     comptime EventT: type,
-    interrupt: ?*Interrupt,
-    error_handler: anytype,
     context: anytype,
     callback: *const fn (@TypeOf(context), EventT) void,
     comptime frame: fn ([]const u8) LineFrame,
 ) SseError!void {
+    const allocator = transport.allocator;
     const uri = try std.Uri.parse(url);
-    var req = try http_client.request(.POST, uri, .{
+    var req = try transport.httpClient().request(.POST, uri, .{
         .extra_headers = extra_headers,
         .headers = .{
             .content_type = .{ .override = "application/json" },
@@ -676,7 +890,7 @@ fn streamLinesOnce(
 
     // Let a SIGINT abort the blocking read; poison the connection on any
     // failed/aborted exchange so it isn't pooled with unknown framing.
-    var guard = armInterrupt(interrupt, &req);
+    var guard = armInterrupt(transport.interrupt, &req);
     defer guard.deinit();
     errdefer guard.poison();
 
@@ -693,7 +907,7 @@ fn streamLinesOnce(
         var body: std.Io.Writer.Allocating = .init(allocator);
         defer body.deinit();
         _ = reader.streamRemaining(&body.writer) catch {};
-        error_handler.setErrorDetail(status_code, body.written());
+        transport.setErrorDetail(status_code, body.written());
         return error.ApiError;
     }
 
@@ -719,13 +933,13 @@ fn streamLinesOnce(
         };
 
         if (isStreamError(allocator, json_data)) {
-            error_handler.setErrorDetail(status_code, json_data);
+            transport.setErrorDetail(status_code, json_data);
             return error.ApiError;
         }
 
         const event = std.json.parseFromSliceLeaky(EventT, event_arena.allocator(), json_data, .{ .ignore_unknown_fields = true }) catch |err| {
             log.err("stream: failed to parse chunk: {}", .{err});
-            setUnparsedDetail(error_handler, status_code, err, json_data);
+            transport.setUnparsedDetail(status_code, err, json_data);
             return error.InvalidSseData;
         };
         callback(context, event);
@@ -742,74 +956,6 @@ fn isStreamError(allocator: std.mem.Allocator, data: []const u8) bool {
     if (parsed.value != .object) return false;
     const err = parsed.value.object.get("error") orelse return false;
     return err == .object or err == .string;
-}
-
-/// POST `payload` and stream the Server-Sent Events response, invoking
-/// `callback` with each parsed `data:` event of type `EventT` until the stream
-/// ends (an `event:` line or `[DONE]` sentinel).
-pub fn streamSse(
-    allocator: std.mem.Allocator,
-    http_client: *std.http.Client,
-    url: []const u8,
-    extra_headers: []const std.http.Header,
-    payload: []const u8,
-    comptime EventT: type,
-    error_handler: anytype,
-    context: anytype,
-    callback: *const fn (@TypeOf(context), EventT) void,
-) SseError!void {
-    return streamLines(allocator, http_client, url, extra_headers, payload, EventT, error_handler, context, callback, frameSse);
-}
-
-/// POST `payload` and stream a newline-delimited JSON (NDJSON) response — one
-/// JSON object per line, no `data:` framing or `[DONE]` sentinel, as Ollama's
-/// native `/api/chat` emits — invoking `callback` with each parsed line.
-pub fn streamNdjson(
-    allocator: std.mem.Allocator,
-    http_client: *std.http.Client,
-    url: []const u8,
-    extra_headers: []const std.http.Header,
-    payload: []const u8,
-    comptime EventT: type,
-    error_handler: anytype,
-    context: anytype,
-    callback: *const fn (@TypeOf(context), EventT) void,
-) SseError!void {
-    return streamLines(allocator, http_client, url, extra_headers, payload, EventT, error_handler, context, callback, frameNdjson);
-}
-
-/// `streamSse` with `body` JSON-encoded by `encodeBody`.
-pub fn streamSseValue(
-    allocator: std.mem.Allocator,
-    http_client: *std.http.Client,
-    url: []const u8,
-    extra_headers: []const std.http.Header,
-    body: anytype,
-    comptime EventT: type,
-    error_handler: anytype,
-    context: anytype,
-    callback: *const fn (@TypeOf(context), EventT) void,
-) SseError!void {
-    const payload = try encodeBody(allocator, body);
-    defer allocator.free(payload);
-    return streamSse(allocator, http_client, url, extra_headers, payload, EventT, error_handler, context, callback);
-}
-
-/// `streamNdjson` with `body` JSON-encoded by `encodeBody`.
-pub fn streamNdjsonValue(
-    allocator: std.mem.Allocator,
-    http_client: *std.http.Client,
-    url: []const u8,
-    extra_headers: []const std.http.Header,
-    body: anytype,
-    comptime EventT: type,
-    error_handler: anytype,
-    context: anytype,
-    callback: *const fn (@TypeOf(context), EventT) void,
-) SseError!void {
-    const payload = try encodeBody(allocator, body);
-    defer allocator.free(payload);
-    return streamNdjson(allocator, http_client, url, extra_headers, payload, EventT, error_handler, context, callback);
 }
 
 /// An owned copy of the message in a JSON error body: `error.message` (OpenAI,
@@ -893,18 +1039,12 @@ test "ErrorDetail.dupe outlives the original" {
 }
 
 test "setUnparsedDetail records the error and the head of the body" {
-    const Recorder = struct {
-        detail: ErrorDetail = .{},
-        fn setErrorDetail(self: *@This(), status: u10, body: []const u8) void {
-            self.detail.set(std.testing.allocator, status, body);
-        }
-    };
-    var rec: Recorder = .{};
-    defer rec.detail.deinit(std.testing.allocator);
+    var transport: Transport = .init(std.testing.io, std.testing.allocator, .{});
+    defer transport.deinit();
     const body: [400]u8 = @splat('x');
-    setUnparsedDetail(&rec, 200, error.UnexpectedToken, &body);
-    try std.testing.expectEqual(200, rec.detail.status);
-    const message = rec.detail.message.?;
+    transport.setUnparsedDetail(200, error.UnexpectedToken, &body);
+    try std.testing.expectEqual(200, transport.last_error.status);
+    const message = transport.last_error.message.?;
     try std.testing.expect(std.mem.startsWith(u8, message, "unexpected response (UnexpectedToken): xxx"));
     try std.testing.expectEqual("unexpected response (UnexpectedToken): ".len + 256, message.len);
 }
@@ -962,11 +1102,13 @@ pub fn appendListParams(allocator: std.mem.Allocator, base_url: []const u8, opti
     return allocator.dupe(u8, base_url);
 }
 
-/// A loopback HTTP server socket, its URL, and a client to reach it.
+/// A loopback HTTP server socket, its URL, and a transport to reach it.
 const Loopback = struct {
     server: std.Io.net.Server,
     url: []u8,
-    client: std.http.Client,
+    /// Retries disabled. The timeout turns a reconnect that wrongly waits on
+    /// a connection nobody accepts into an error instead of a hang.
+    transport: Transport,
 
     fn init() !Loopback {
         const loopback: std.Io.net.IpAddress = try .parse("127.0.0.1", 0);
@@ -975,20 +1117,17 @@ const Loopback = struct {
         return .{
             .server = server,
             .url = try std.testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.getPort()}),
-            .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .transport = .init(std.testing.io, std.testing.allocator, .{ .retry_policy = .disabled, .request_timeout_ms = 2000 }),
         };
     }
 
     fn deinit(self: *Loopback) void {
-        self.client.deinit();
+        self.transport.deinit();
         std.testing.allocator.free(self.url);
         self.server.deinit(std.testing.io);
     }
 
     const Ok = struct { ok: bool };
-    const NoDetail = struct {
-        fn setErrorDetail(_: *NoDetail, _: u10, _: []const u8) void {}
-    };
 
     /// Serve one connection with `serveOnce(serve)` on a thread while `run`
     /// makes one call. A failed call may never have reached `accept`, so on
@@ -1000,18 +1139,13 @@ const Loopback = struct {
         return @call(.auto, run, args);
     }
 
-    /// One JSON fetch with retries disabled. The timeout turns a reconnect
-    /// that wrongly waits on a connection nobody accepts into an error instead
-    /// of a hang.
+    /// One JSON fetch.
     fn fetch(self: *Loopback, serve: Serve) FetchError!Response(Ok) {
         return self.served(serve, fetchOk, .{self});
     }
 
     fn fetchOk(self: *Loopback) FetchError!Response(Ok) {
-        var detail: NoDetail = .{};
-        return fetchJsonWithRetry(std.testing.allocator, &self.client, .disabled, 2000, .{
-            .location = .{ .url = self.url },
-        }, Ok, &detail);
+        return self.transport.fetchJson(.{ .location = .{ .url = self.url } }, Ok);
     }
 
     /// One NDJSON stream; returns how many events reached the callback.
@@ -1020,9 +1154,8 @@ const Loopback = struct {
     }
 
     fn streamOk(self: *Loopback) SseError!u32 {
-        var detail: NoDetail = .{};
         var events: u32 = 0;
-        try streamNdjson(std.testing.allocator, &self.client, self.url, &.{}, "{}", Ok, &detail, &events, countEvent);
+        try self.transport.streamNdjson(self.url, &.{}, .{}, Ok, &events, countEvent);
         return events;
     }
 
@@ -1032,12 +1165,7 @@ const Loopback = struct {
 
     /// One JSON POST, like every provider call.
     fn postOk(self: *Loopback) FetchError!Response(Ok) {
-        var detail: NoDetail = .{};
-        return fetchJsonWithRetry(std.testing.allocator, &self.client, .disabled, 2000, .{
-            .location = .{ .url = self.url },
-            .method = .POST,
-            .payload = "{}",
-        }, Ok, &detail);
+        return self.transport.postJson(self.url, &.{}, .{}, Ok);
     }
 };
 
@@ -1051,9 +1179,16 @@ const Serve = enum {
     /// Send a head and part of the body, then close with the request still
     /// unread, which makes the kernel reset the connection mid-body.
     reset_mid_body,
+    /// Send a head and part of the body, then hold the socket open, silent,
+    /// until the client gives up.
+    stall_mid_body,
+    /// Answer two requests on the one connection, then close.
+    respond_twice,
     /// Answer as a CDN fronting an API does: gzip and chunked when the request
     /// accepts gzip, plain otherwise.
     respond_negotiated,
+    /// Answer one request with 200 if it carries `X-Extra: v`, else 400.
+    respond_if_extra_header,
 };
 
 /// `{"ok":true}\n`, gzipped.
@@ -1075,12 +1210,29 @@ fn serveOnce(server: *std.Io.net.Server, serve: Serve) void {
             // Let the client take the head before the reset discards it.
             io.sleep(.fromMilliseconds(50), .awake) catch {};
         },
+        .stall_mid_body => {
+            writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{") catch return;
+            writer.interface.flush() catch return;
+            // Returns once the client shuts its end down.
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(io, &read_buf);
+            _ = reader.interface.discardRemaining() catch {};
+        },
         .respond => {
             var read_buf: [4096]u8 = undefined;
             var reader = stream.reader(io, &read_buf);
             var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
             var request = http_server.receiveHead() catch return;
             request.respond("{\"ok\":true}\n", .{ .keep_alive = true }) catch return;
+        },
+        .respond_twice => {
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(io, &read_buf);
+            var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
+            for (0..2) |_| {
+                var request = http_server.receiveHead() catch return;
+                request.respond("{\"ok\":true}\n", .{ .keep_alive = true }) catch return;
+            }
         },
         .respond_negotiated => {
             var read_buf: [4096]u8 = undefined;
@@ -1101,7 +1253,32 @@ fn serveOnce(server: *std.Io.net.Server, serve: Serve) void {
             // Hold the socket open until the client has read the response.
             io.sleep(.fromMilliseconds(50), .awake) catch {};
         },
+        .respond_if_extra_header => {
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(io, &read_buf);
+            var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
+            var request = http_server.receiveHead() catch return;
+            var found = false;
+            var headers = request.iterateHeaders();
+            while (headers.next()) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "x-extra") and std.mem.eql(u8, h.value, "v")) found = true;
+            }
+            request.respond("{\"ok\":true}\n", .{ .status = if (found) .ok else .bad_request }) catch return;
+        },
     }
+}
+
+test "extra_headers reach the server on JSON calls and streams" {
+    var t: Loopback = try .init();
+    defer t.deinit();
+    t.transport.extra_headers = &.{.{ .name = "X-Extra", .value = "v" }};
+
+    var response = try t.served(.respond_if_extra_header, Loopback.postOk, .{&t});
+    response.deinit();
+    try std.testing.expectEqual(1, try t.stream(.respond_if_extra_header));
+
+    t.transport.extra_headers = &.{};
+    try std.testing.expectError(error.ApiError, t.served(.respond_if_extra_header, Loopback.postOk, .{&t}));
 }
 
 test "a JSON call leaves its connection in the pool" {
@@ -1111,7 +1288,37 @@ test "a JSON call leaves its connection in the pool" {
     var response = try t.served(.respond_negotiated, Loopback.postOk, .{&t});
     defer response.deinit();
     try std.testing.expect(response.value.ok);
-    try std.testing.expectEqual(1, t.client.connection_pool.free_len);
+    try std.testing.expectEqual(1, t.transport.httpClient().connection_pool.free_len);
+}
+
+test "transports borrowing one client share its connection and leave it open" {
+    var t: Loopback = try .init();
+    defer t.deinit();
+
+    // The server accepts one connection only, so the second call succeeds
+    // only on the connection the first one left in the shared pool.
+    const thread = try std.Thread.spawn(.{}, serveOnce, .{ &t.server, Serve.respond_twice });
+    defer thread.join();
+    errdefer if (t.server.socket.address.connect(std.testing.io, .{ .mode = .stream })) |c| c.close(std.testing.io) else |_| {};
+
+    // Closed before the join, so a server still waiting on the pooled
+    // connection for a second request returns.
+    var shared = newClient(std.testing.io, std.testing.allocator);
+    defer shared.deinit();
+
+    const options: Transport.Options = .{ .retry_policy = .disabled, .request_timeout_ms = 2000, .http_client = &shared };
+    t.transport.deinit();
+    t.transport = .init(std.testing.io, std.testing.allocator, options);
+    var other: Transport = .init(std.testing.io, std.testing.allocator, options);
+    defer other.deinit();
+    try std.testing.expectEqual(&shared, other.httpClient());
+
+    var first = try t.transport.getJson(t.url, &.{}, Loopback.Ok);
+    first.deinit();
+    var second = try other.getJson(t.url, &.{}, Loopback.Ok);
+    defer second.deinit();
+    try std.testing.expect(second.value.ok);
+    try std.testing.expectEqual(1, shared.connection_pool.free_len);
 }
 
 test "watchdog turns a stalled response into error.Timeout" {
@@ -1121,14 +1328,34 @@ test "watchdog turns a stalled response into error.Timeout" {
     // Never accept: the kernel completes the handshake into the backlog and
     // buffers the request, so the client blocks in receiveHead until the
     // watchdog shuts the socket down.
+    t.transport.request_timeout_ms = 50;
+    try std.testing.expectError(error.Timeout, t.fetchOk());
+    try std.testing.expectEqual(0, t.transport.httpClient().connection_pool.free_len);
+}
 
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    var retry_after_ms: ?u32 = null;
-    try std.testing.expectError(
-        error.Timeout,
-        fetchCapturingRetryAfter(std.testing.allocator, &t.client, .{ .location = .{ .url = t.url } }, &out.writer, null, 50, &retry_after_ms),
-    );
+test "watchdog times out a body that stalls midway, and its thread serves the next call" {
+    var t: Loopback = try .init();
+    defer t.deinit();
+
+    // Head and part of the body, then the server holds the socket open past
+    // the deadline: only the watchdog can end the body read.
+    // Not through `served`: its unblocking connect after a failed call would
+    // be accepted by the next call's server instead of that call's request.
+    t.transport.request_timeout_ms = 100;
+    const thread = try std.Thread.spawn(.{}, serveOnce, .{ &t.server, Serve.stall_mid_body });
+    const stalled = t.fetchOk();
+    thread.join();
+    try std.testing.expectError(error.Timeout, stalled);
+    try std.testing.expectEqual(0, t.transport.httpClient().connection_pool.free_len);
+    const watchdog = t.transport.watchdog.?;
+
+    // The same thread bounds the next call, which a fired deadline must not
+    // carry over into, and which pools its connection.
+    var response = try t.fetch(.respond_negotiated);
+    defer response.deinit();
+    try std.testing.expect(response.value.ok);
+    try std.testing.expectEqual(watchdog, t.transport.watchdog.?);
+    try std.testing.expectEqual(1, t.transport.httpClient().connection_pool.free_len);
 }
 
 test "a pooled socket the server closed while idle is reconnected despite RetryPolicy.disabled" {
@@ -1183,4 +1410,24 @@ test "a connection reset mid-body fails the call instead of panicking, and is no
 
     // A reconnect would wait on a connection nobody accepts until the timeout.
     try std.testing.expectError(error.ReadFailed, t.fetch(.reset_mid_body));
+}
+
+test "a fired interrupt aborts a call instead of retrying it" {
+    var t: Loopback = try .init();
+    defer t.deinit();
+
+    // Never accept, as in the watchdog test: only the interrupt (or, if it
+    // fails, the 2 s watchdog) can end the wait. Retries enabled, to show a
+    // cancelled call is not retried.
+    var interrupt: Interrupt = .{};
+    interrupt.fire();
+    t.transport.interrupt = &interrupt;
+    t.transport.retry_policy = .{};
+
+    if (t.fetchOk()) |r| {
+        var response = r;
+        response.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expect(err != error.Timeout);
+    try std.testing.expect(t.transport.interrupted());
 }

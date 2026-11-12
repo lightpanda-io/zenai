@@ -88,9 +88,21 @@ const ai = try zenai.provider.Client.init(io, allocator, .llama_cpp, "llama.cpp"
 defer ai.deinit(allocator);
 ```
 
+The first argument after the allocator is a `provider.Backend`: a tag, plus the settings only that provider takes (`.{ .vertex = .{ .project = "p" } }`, `.{ .codex = .{ .account_id = id } }`). The options struct holds what every provider takes: `base_url`, `retry_policy`, `request_timeout_ms`, `http_client` and `extra_headers` (sent on every request, e.g. Hugging Face's `X-HF-Bill-To`).
+
+`init` reads no environment variables. `zenai.provider.fromEnv(environ, tag)` returns what the conventional ones configure for a tag: its key, its backend settings and, for `.openai_compatible`, the base URL:
+
+```zig
+const cfg = zenai.provider.fromEnv(environ, .openai_compatible);
+const ai = try zenai.provider.Client.init(io, allocator, cfg.backend, cfg.key orelse return error.MissingApiKey, .{
+    .base_url = cfg.base_url,
+});
+defer ai.deinit(allocator);
+```
+
 `zenai.provider.info(tag)` gives each tag's default base URL, key variable, default model and whether it is a local server.
 
-Gateway model ids are provider-prefixed (`"anthropic/claude-sonnet-5"`). For Hugging Face, pass `.base_url` to target a dedicated Inference Endpoint instead of the serverless router. `provider.Client.init` picks `.openai_compatible` on its own when `OPENAI_BASE_URL` is set, which covers vLLM, LiteLLM, Together, Groq and the like.
+Gateway model ids are provider-prefixed (`"anthropic/claude-sonnet-5"`). For Hugging Face, pass `.base_url` to target a dedicated Inference Endpoint instead of the serverless router. `provider.detectKeys` picks `.openai_compatible` instead of `.openai` when `OPENAI_BASE_URL` is set, which covers vLLM, LiteLLM, Together, Groq and the like.
 
 When you need something the abstraction doesn't expose, switch on the tag and use the provider client directly:
 
@@ -250,7 +262,7 @@ defer client.deinit();
 
 Generation, streaming, `Chat` and `countTokens` work in both modes. Model listing needs project/location mode, because Google's `ListPublisherModels` rejects API keys. Embeddings and decisions are Developer-API-only and return `error.UnsupportedByBackend` on Vertex.
 
-Through the provider abstraction, `.vertex` is picked when `GOOGLE_GENAI_USE_VERTEXAI=1` (or `true`) is set. Express mode reads `GOOGLE_API_KEY`. Project mode reads `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`/`GOOGLE_CLOUD_REGION` (default `"global"`), but you still pass the access token explicitly as the credential.
+Through the provider abstraction, the backend is `.{ .vertex = .{ .project = "my-project", .location = "global" } }`, or plain `.vertex` for express mode. `provider.detectKeys` picks `.vertex` when `GOOGLE_GENAI_USE_VERTEXAI=1` (or `true`) is set, and express mode reads `GOOGLE_API_KEY`. `provider.fromEnv(environ, .vertex)` fills project mode from `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`/`GOOGLE_CLOUD_REGION` (default `"global"`), but you still pass the access token explicitly as the credential.
 
 </details>
 
@@ -322,16 +334,13 @@ if (response.value.firstToolCall()) |tc| {
 
 ## ChatGPT subscription (Codex)
 
-`zenai.codex` talks to the backend Codex CLI uses (`chatgpt.com/backend-api/codex`), so requests count against a ChatGPT plan rather than API credits. It speaks the same Responses API as the OpenAI client but authenticates with the subscription's OAuth access token and the ChatGPT account id from that token's JWT.
+The `.codex` provider talks to the backend Codex CLI uses (`chatgpt.com/backend-api/codex`), so requests count against a ChatGPT plan rather than API credits. It is the OpenAI client set up with `initChatGpt`: the same Responses API, authenticated with the subscription's OAuth access token and the ChatGPT account id from that token's JWT.
 
 zenai doesn't run the OAuth login. Get the token yourself (the browser's `lightpanda agent` does it in `src/agent/auth/codex.zig`), then go through the provider abstraction:
 
 ```zig
-var codex_client = try zenai.codex.Client.init(io, allocator, access_token, .{
-    .account_id = account_id,
-});
-defer codex_client.deinit();
-const ai: zenai.provider.Client = .{ .codex = &codex_client };
+const ai = try zenai.provider.Client.init(io, allocator, .{ .codex = .{ .account_id = account_id } }, access_token, .{});
+defer ai.deinit(allocator);
 
 var result = try ai.generateContent("gpt-5.5", &.{
     .{ .role = .user, .content = "What is Zig?" },
@@ -574,7 +583,7 @@ Jev ingests the state once and evaluates every question against it in parallel, 
 
 Things to know before relying on it:
 
-- **Limits.** One request carries up to 64k tokens, and the state plus the longest single question must fit in 32k. An overrun comes back as `error.ApiError` with a 422 in `client.last_error`.
+- **Limits.** One request carries up to 64k tokens, and the state plus the longest single question must fit in 32k. An overrun comes back as `error.ApiError` with a 422 in `client.transport.last_error`.
 - **Validate choices.** `typesafe.validateChoice(answer, offered)` rejects an answer whose choice was never offered, whose probabilities don't cover exactly the offered set, or whose choice isn't the argmax. `response.choice(id, questions)` and `choiceEnum` run it for you.
 - **Model versions.** `response.model` is the concrete version that answered, not the alias you asked for, and aliases move without notice. It borrows the response; use `response.dupeModel(allocator)` to keep it. `client.listModels()` lists the versions behind `jev-latest` and `jev-preview`.
 
@@ -628,7 +637,7 @@ const verdict = try response.value.choiceEnum("verdict", questions, Verdict);
 
 ### Either provider: `zenai.decisions`
 
-Gemini's [Decisions API](#gemini) takes the same three question types. `zenai.decisions.Pool` asks whichever provider has a key, using the TypeSafe types above, and converts for Gemini (JSON content is sent as compact JSON text). It reads the environment on every ask, so exporting a key mid-run takes effect without a restart, and it keeps one warm client per concurrent caller:
+Gemini's [Decisions API](#gemini) takes the same three question types. `zenai.decisions.Pool` asks whichever provider has a key. Its questions and answers are its own provider-neutral types in `zenai.decisions.types`, shaped like the TypeSafe ones above (with the same `choices`, `levels`, `enumChoices`, `choice` and `choiceEnum` helpers), and `decisions.typesafe` and `decisions.gemini` convert them to and from each wire schema (Gemini gets JSON content as compact JSON text). It reads the environment on every ask, so exporting a key mid-run takes effect without a restart, and it keeps one warm client per concurrent caller:
 
 ```zig
 var pool: zenai.decisions.Pool = .init(io, allocator, environFn, .{
@@ -637,6 +646,9 @@ var pool: zenai.decisions.Pool = .init(io, allocator, environFn, .{
 });
 defer pool.deinit();
 
+const questions: zenai.decisions.Questions = .init(&.{
+    .{ .key = "is_complaint", .value = .noulText("Is the customer complaining?") },
+});
 var failure: zenai.http.ErrorDetail = .{};
 var response = try pool.ask(arena, .{ .text = "The pizza arrived cold." }, questions, .{}, &failure);
 defer response.deinit();
@@ -658,6 +670,8 @@ Gemini (`GOOGLE_API_KEY`/`GEMINI_API_KEY`, not on Vertex) is preferred over `TYP
 | Extended thinking | | | ✓ |
 
 The provider abstraction covers generation, streaming, embeddings and multi-turn chat (`zenai.Chat`) across all of them, and `lastError()` returns the status and message behind a failed request.
+
+Each client opens its own connections unless it is given one to borrow. To share one connection pool and CA bundle across clients (and threads, if its allocator is thread-safe), build a `std.http.Client` with `zenai.http.newClient(io, allocator)` and pass a pointer to it as `http_client` in each client's `InitOptions`, `provider.Client.InitOptions` or `decisions.Pool.Options`. It must outlive them, and you `deinit` it yourself.
 
 Search options beyond the basics:
 

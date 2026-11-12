@@ -7,19 +7,17 @@ pub const gemini = struct {
 pub const openai = struct {
     pub const Client = @import("openai/Client.zig");
     pub const types = @import("openai/types.zig");
-    /// Native Ollama `/api/chat` (so `num_ctx` can be set).
-    pub const ollama = @import("openai/ollama.zig");
+};
+
+/// Ollama: native `/api/chat` (so `num_ctx` can be set), `/v1` for the rest.
+/// Reuses the openai types; see `ollama/Client.zig`.
+pub const ollama = struct {
+    pub const Client = @import("ollama/Client.zig");
 };
 
 pub const anthropic = struct {
     pub const Client = @import("anthropic/Client.zig");
     pub const types = @import("anthropic/types.zig");
-};
-
-/// OpenAI Codex — the ChatGPT-subscription backend. Reuses the openai Responses
-/// types; see `codex/Client.zig`.
-pub const codex = struct {
-    pub const Client = @import("codex/Client.zig");
 };
 
 /// Search providers — separate namespace from the LLM clients above.
@@ -60,19 +58,20 @@ pub const typesafe = struct {
 /// (Jev) or Gemini's Decisions API. Both answer typed questions (`noul`,
 /// `choice`, `score`) about one input with calibrated probabilities rather
 /// than generating text. Each answer is a judgment; the calling code makes
-/// the decision. The question and answer types are TypeSafe's, which can
-/// hold everything Gemini's can; `Pool` converts for Gemini.
+/// the decision. The question and answer types are its own; `typesafe` and
+/// `gemini` convert them to and from each provider's wire schema.
 pub const decisions = struct {
     pub const Pool = @import("decisions/Pool.zig");
     /// Questions from JSON and answers back as JSON, for a caller driven by
     /// configuration rather than comptime.
     pub const json = @import("decisions/json.zig");
+    pub const types = @import("decisions/types.zig");
+    pub const typesafe = @import("decisions/typesafe.zig");
     pub const gemini = @import("decisions/gemini.zig");
-    pub const types = typesafe.types;
 
     pub const Provider = Pool.Provider;
     pub const AskOptions = Pool.AskOptions;
-    pub const Response = http.Response(types.AskResponse);
+    pub const Response = types.Response;
     pub const envCredentials = Pool.envCredentials;
     pub const envProvider = Pool.envProvider;
     pub const env_hint = Pool.env_hint;
