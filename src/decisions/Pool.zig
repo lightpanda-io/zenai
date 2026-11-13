@@ -3,10 +3,12 @@
 //! warm.
 //!
 //! Which provider answers is read from the environment on every ask, and so
-//! are its credentials: a client borrows its API key and base URL rather than
-//! copying them, and the environment they came from can change under it, so
-//! the pool keeps its own copies and retires any client that no longer
-//! matches.
+//! are its credentials. TypeSafe answers unless the provider variable names
+//! Gemini: a Google key is set for many other reasons, so it is no consent to
+//! send content to a decision model. A client borrows its API key and base
+//! URL rather than copying them, and the environment they came from can
+//! change under it, so the pool keeps its own copies and retires any client
+//! that no longer matches.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -49,8 +51,10 @@ pub const Provider = enum {
 /// the google-genai SDKs name it.
 pub const gemini_base_url_env_var_name = "GOOGLE_GEMINI_BASE_URL";
 
-/// Every key the pool reads, for a message telling someone to set one.
-pub const env_hint = provider.envVarName(.gemini) ++ " or " ++ TypesafeClient.env_var_name;
+/// What to set for an ask to work, for a message telling someone to set it.
+pub fn envHint(comptime provider_env_var_name: []const u8) []const u8 {
+    return TypesafeClient.env_var_name ++ ", or " ++ provider.envVarName(.gemini) ++ " with " ++ provider_env_var_name ++ "=gemini";
+}
 
 pub const Options = struct {
     retry_policy: retry.RetryPolicy = .{},
@@ -62,8 +66,8 @@ pub const Options = struct {
     /// including what sharing it across threads asks of its allocator. Null
     /// gives each client its own.
     http_client: ?*std.http.Client = null,
-    /// A variable naming the provider to use, "gemini" or "typesafe", for when
-    /// both have a key. Unset (or null), Gemini is preferred.
+    /// A variable naming the provider to use, "gemini" or "typesafe". Unset
+    /// (or null), TypeSafe answers: Gemini is only ever asked when named here.
     provider_env_var_name: ?[]const u8 = null,
 };
 
@@ -110,14 +114,14 @@ pub fn envCredentials(environ: std.process.Environ, provider_env_var_name: ?[]co
         break :blk std.meta.stringToEnum(Provider, value) orelse return error.UnknownProvider;
     } else null;
 
-    if (forced != .typesafe) {
+    if (forced == .gemini) {
         const gemini = provider.fromEnv(environ, .gemini);
-        if (gemini.key) |key| return .{
+        const key = gemini.key orelse return error.MissingApiKey;
+        return .{
             .provider = .gemini,
             .api_key = key,
             .base_url = gemini.base_url orelse provider.envGet(environ, gemini_base_url_env_var_name),
         };
-        if (forced == .gemini) return error.MissingApiKey;
     }
     const key = TypesafeClient.envApiKey(environ) orelse return error.MissingApiKey;
     return .{ .provider = .typesafe, .api_key = key, .base_url = TypesafeClient.envBaseUrl(environ) };
@@ -267,8 +271,12 @@ fn bothKeys() std.process.Environ {
     return fakeEnviron(&[_:null]?[*:0]const u8{ "TYPESAFE_API_KEY=ts-key", "GEMINI_API_KEY=gemini-key" });
 }
 
-fn bothKeysTypesafeForced() std.process.Environ {
-    return fakeEnviron(&[_:null]?[*:0]const u8{ "TYPESAFE_API_KEY=ts-key", "GEMINI_API_KEY=gemini-key", "DECISION_PROVIDER=typesafe" });
+fn bothKeysGeminiForced() std.process.Environ {
+    return fakeEnviron(&[_:null]?[*:0]const u8{ "TYPESAFE_API_KEY=ts-key", "GEMINI_API_KEY=gemini-key", "DECISION_PROVIDER=gemini" });
+}
+
+fn geminiKeyOnly() std.process.Environ {
+    return fakeEnviron(&[_:null]?[*:0]const u8{"GEMINI_API_KEY=gemini-key"});
 }
 
 fn geminiForcedWithoutKey() std.process.Environ {
@@ -280,7 +288,7 @@ fn unknownProvider() std.process.Environ {
 }
 
 fn geminiOnVertex() std.process.Environ {
-    return fakeEnviron(&[_:null]?[*:0]const u8{ "GOOGLE_API_KEY=vertex-key", "GOOGLE_GENAI_USE_VERTEXAI=1" });
+    return fakeEnviron(&[_:null]?[*:0]const u8{ "GOOGLE_API_KEY=vertex-key", "GOOGLE_GENAI_USE_VERTEXAI=1", "DECISION_PROVIDER=gemini" });
 }
 
 fn noKey() std.process.Environ {
@@ -329,21 +337,21 @@ test "decisions.Pool: a changed base URL retires a client too" {
     pool.put(second);
 }
 
-test "decisions.Pool: Gemini is preferred, and the provider variable overrides it" {
+test "decisions.Pool: TypeSafe answers unless the provider variable names Gemini" {
     if (comptime !can_fake_environ) return error.SkipZigTest;
 
     var pool: Pool = .init(std.testing.io, std.testing.allocator, bothKeys, .{ .provider_env_var_name = "DECISION_PROVIDER" });
     defer pool.deinit();
 
-    const gemini = try pool.take();
-    try std.testing.expectEqualStrings("gemini-key", gemini.client.gemini.api_key);
-    pool.put(gemini);
-
-    // Switching provider retires the idle Gemini client.
-    pool.environ = bothKeysTypesafeForced;
     const typesafe = try pool.take();
     try std.testing.expectEqualStrings("ts-key", typesafe.client.typesafe.api_key);
     pool.put(typesafe);
+
+    // Switching provider retires the idle TypeSafe client.
+    pool.environ = bothKeysGeminiForced;
+    const gemini = try pool.take();
+    try std.testing.expectEqualStrings("gemini-key", gemini.client.gemini.api_key);
+    pool.put(gemini);
     try std.testing.expectEqual(1, pool.idle.items.len);
 }
 
@@ -354,8 +362,12 @@ test "decisions.envCredentials: a forced provider needs its own key" {
     try std.testing.expectError(error.UnknownProvider, envCredentials(unknownProvider(), "DECISION_PROVIDER"));
     // Not read unless the caller names it.
     try std.testing.expectEqual(Provider.typesafe, envProvider(unknownProvider(), null).?);
+    // A Google key alone is not a choice of Gemini.
+    try std.testing.expectEqual(@as(?Provider, null), envProvider(geminiKeyOnly(), "DECISION_PROVIDER"));
+    try std.testing.expectEqual(Provider.typesafe, envProvider(bothKeysGeminiForced(), null).?);
+    try std.testing.expectEqual(Provider.typesafe, envProvider(bothKeys(), "DECISION_PROVIDER").?);
     // The Decisions API is Developer-API-only, so a Vertex key is no key.
-    try std.testing.expectEqual(@as(?Provider, null), envProvider(geminiOnVertex(), null));
+    try std.testing.expectError(error.MissingApiKey, envCredentials(geminiOnVertex(), "DECISION_PROVIDER"));
 }
 
 test "decisions.Pool: no key is an error, not a client that cannot ask" {

@@ -637,11 +637,11 @@ const verdict = try response.value.choiceEnum("verdict", questions, Verdict);
 
 ### Either provider: `zenai.decisions`
 
-Gemini's [Decisions API](#gemini) takes the same three question types. `zenai.decisions.Pool` asks whichever provider has a key. Its questions and answers are its own provider-neutral types in `zenai.decisions.types`, shaped like the TypeSafe ones above (with the same `choices`, `levels`, `enumChoices`, `choice` and `choiceEnum` helpers), and `decisions.typesafe` and `decisions.gemini` convert them to and from each wire schema (Gemini gets JSON content as compact JSON text). It reads the environment on every ask, so exporting a key mid-run takes effect without a restart, and it keeps one warm client per concurrent caller:
+Gemini's [Decisions API](#gemini) takes the same three question types. `zenai.decisions.Pool` asks TypeSafe, or Gemini when the caller's provider variable names it. Its questions and answers are its own provider-neutral types in `zenai.decisions.types`, shaped like the TypeSafe ones above (with the same `choices`, `levels`, `enumChoices`, `choice` and `choiceEnum` helpers), and `decisions.typesafe` and `decisions.gemini` convert them to and from each wire schema (Gemini gets JSON content as compact JSON text). It reads the environment on every ask, so exporting a key mid-run takes effect without a restart, and it keeps one warm client per concurrent caller:
 
 ```zig
 var pool: zenai.decisions.Pool = .init(io, allocator, environFn, .{
-    // Optional: lets MY_DECISION_PROVIDER=typesafe pick Jev when both keys are set.
+    // Optional: lets MY_DECISION_PROVIDER=gemini pick Gemini over Jev.
     .provider_env_var_name = "MY_DECISION_PROVIDER",
 });
 defer pool.deinit();
@@ -654,7 +654,7 @@ var response = try pool.ask(arena, .{ .text = "The pizza arrived cold." }, quest
 defer response.deinit();
 ```
 
-Gemini (`GOOGLE_API_KEY`/`GEMINI_API_KEY`, not on Vertex) is preferred over `TYPESAFE_API_KEY` when both are set. `GOOGLE_GEMINI_BASE_URL` and `TYPESAFE_BASE_URL` point either one elsewhere. A Gemini input blocked by safety filters fails with `error.InputBlocked`, with the reason in `failure`.
+`TYPESAFE_API_KEY` answers by default. Gemini (`GOOGLE_API_KEY`/`GEMINI_API_KEY`, not on Vertex) is only asked when the provider variable says `gemini`: a Google key is set for many other reasons, so having one is no consent to send content to a decision model. `envHint(name)` spells out what to set for a missing-key message. `GOOGLE_GEMINI_BASE_URL` and `TYPESAFE_BASE_URL` point either one elsewhere. A Gemini input blocked by safety filters fails with `error.InputBlocked`, with the reason in `failure`.
 
 ## Features
 
