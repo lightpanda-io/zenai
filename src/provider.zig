@@ -2370,8 +2370,17 @@ fn mapGeminiFinishReason(response: gemini_types.GenerateContentResponse) FinishR
     return switch (reason) {
         .STOP => .stop,
         .MAX_TOKENS, .CONTINUATION => .max_tokens,
-        .SAFETY, .RECITATION, .PROHIBITED_CONTENT, .SPII, .BLOCKLIST => .safety,
-        .MALFORMED_FUNCTION_CALL => .tool_call,
+        .SAFETY,
+        .RECITATION,
+        .PROHIBITED_CONTENT,
+        .SPII,
+        .BLOCKLIST,
+        .IMAGE_SAFETY,
+        .IMAGE_PROHIBITED_CONTENT,
+        .IMAGE_RECITATION,
+        .MODEL_ARMOR,
+        => .safety,
+        .MALFORMED_FUNCTION_CALL, .UNEXPECTED_TOOL_CALL => .tool_call,
         else => .unknown,
     };
 }
@@ -2708,7 +2717,7 @@ fn mapEffortToGemini(level: Effort) ?gemini_types.ThinkingLevel {
         .low => .LOW,
         .medium => .MEDIUM,
         .high => .HIGH,
-        .xhigh => .HIGH, // Gemini doesn't have XHIGH
+        .xhigh => .HIGH, // XHIGH exists, but gemini-3.8-flash answers it with HTTP 400
     };
 }
 

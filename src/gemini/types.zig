@@ -123,12 +123,37 @@ pub const FinishReason = union(enum) {
     BLOCKLIST,
     PROHIBITED_CONTENT,
     SPII, // Sensitive PII
+    /// The generated function call is syntactically invalid and can't be parsed.
     MALFORMED_FUNCTION_CALL,
+    /// The generated image potentially violates safety policies.
+    IMAGE_SAFETY,
+    /// The generated image may contain prohibited content.
+    IMAGE_PROHIBITED_CONTENT,
+    /// Image generation stopped for a reason not otherwise specified.
+    IMAGE_OTHER,
+    /// The model was expected to generate an image, but didn't.
+    NO_IMAGE,
+    /// The generated image may be a recitation from a source.
+    IMAGE_RECITATION,
+    /// The generated function call is semantically invalid, e.g. function
+    /// calling is not enabled or the function is not declared.
+    UNEXPECTED_TOOL_CALL,
     /// Model called too many tools consecutively, so the system exited execution.
     TOO_MANY_TOOL_CALLS,
+    /// The request has at least one thought signature missing. Developer API only.
+    MISSING_THOUGHT_SIGNATURE,
+    /// The response was malformed.
+    MALFORMED_RESPONSE,
+    /// The request was filtered by an escalation rule. Developer API only.
+    ESCALATION,
+    /// The account is limited or disabled for Prohibited Use Policy
+    /// violations. Developer API only.
+    PUP_LIMITED_DISABLED,
     /// Hit the per-request token limit before generation completed; resume by
     /// sending the candidate's `continuationToken` in the next request.
     CONTINUATION,
+    /// The response was blocked by Model Armor. Vertex AI only.
+    MODEL_ARMOR,
     unknown: []const u8,
 
     pub const jsonParse = jsonutil.StringUnionMethods(@This()).jsonParse;
@@ -409,6 +434,12 @@ pub const Part = struct {
     thoughtSignature: ?[]const u8 = null,
     /// Video metadata for video content (frame rate, clipping).
     videoMetadata: ?VideoMetadata = null,
+    /// Document preprocessing options, for a document in `inlineData` or `fileData`.
+    documentMetadata: ?DocumentMetadata = null,
+    /// Spreadsheet preprocessing options, for a spreadsheet in `inlineData` or `fileData`.
+    spreadsheetMetadata: ?SpreadsheetMetadata = null,
+    /// Audio preprocessing options, for audio in `inlineData` or `fileData`.
+    audioMetadata: ?AudioMetadata = null,
     /// Media resolution for the input media.
     mediaResolution: ?MediaResolution = null,
     /// Custom metadata associated with the Part.
@@ -581,6 +612,9 @@ pub const ThinkingLevel = enum {
     MEDIUM,
     /// High thinking level.
     HIGH,
+    /// Extra-high thinking level. Not every model takes it: gemini-3.8-flash
+    /// answers it with HTTP 400.
+    XHIGH,
 };
 
 // --- Thinking Config ---
@@ -812,6 +846,43 @@ pub const VideoMetadata = struct {
     /// The start offset of the video.
     startOffset: ?[]const u8 = null,
     /// The end offset of the video.
+    endOffset: ?[]const u8 = null,
+    /// Frame rate of the video sent to the model, in (0.0, 24.0]. Defaults to 1.0.
+    fps: ?f64 = null,
+    /// Content layers to return: "FRAMES", "AUDIO", "TRANSCRIPT". Defaults
+    /// to frames and audio.
+    contentLayers: ?[]const []const u8 = null,
+};
+
+/// Static preprocessing options for a document Part.
+pub const DocumentMetadata = struct {
+    /// 1-indexed inclusive start page.
+    startPage: ?i32 = null,
+    /// 1-indexed inclusive end page.
+    endPage: ?i32 = null,
+    /// Content layers to return: "PAGE_IMAGE", "PAGE_TEXT". Defaults to
+    /// page images.
+    contentLayers: ?[]const []const u8 = null,
+};
+
+/// Static preprocessing options for a spreadsheet Part.
+pub const SpreadsheetMetadata = struct {
+    /// The range of cells to extract, in A1 notation (e.g. "A1:D10").
+    /// Defaults to the full occupied area of the sheet.
+    visibleCells: ?[]const u8 = null,
+    /// 1-indexed index of the sheet to extract, in workbook order. Defaults
+    /// to the first sheet.
+    sheetIndex: ?i32 = null,
+    /// Content layers to return: "DATA", "FORMULAS", "VISUAL". Defaults to
+    /// data and formulas.
+    contentLayers: ?[]const []const u8 = null,
+};
+
+/// Static preprocessing options for an audio Part.
+pub const AudioMetadata = struct {
+    /// The start offset of the audio (e.g. "10s").
+    startOffset: ?[]const u8 = null,
+    /// The end offset of the audio.
     endOffset: ?[]const u8 = null,
 };
 
@@ -1167,7 +1238,7 @@ test "FinishReason parses from JSON" {
 
 test "FinishReason preserves unknown values" {
     const json_str =
-        \\{"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"UNEXPECTED_TOOL_CALL"}]}
+        \\{"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"SOME_FUTURE_REASON"}]}
     ;
     const parsed = try std.json.parseFromSlice(
         GenerateContentResponse,
@@ -1176,7 +1247,7 @@ test "FinishReason preserves unknown values" {
         .{ .ignore_unknown_fields = true },
     );
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("UNEXPECTED_TOOL_CALL", parsed.value.candidates.?[0].finishReason.?.unknown);
+    try std.testing.expectEqualStrings("SOME_FUTURE_REASON", parsed.value.candidates.?[0].finishReason.?.unknown);
 }
 
 test "Schema serializes with enum type" {
