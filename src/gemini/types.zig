@@ -455,6 +455,41 @@ pub const Part = struct {
     mediaProcessing: ?MediaProcessing = null,
     /// Speech-synthesis metadata (speaker, style); only valid on text parts.
     speechMetadata: ?SpeechMetadata = null,
+
+    /// Fields that carry no data of their own: a part with a signature and
+    /// only these set is a signature-only part.
+    const non_data_fields = [_][]const u8{
+        "thought",      "thoughtSignature",   "mediaResolution", "videoMetadata",
+        "partMetadata", "audioTranscription", "mediaProcessing", "speechMetadata",
+    };
+
+    fn isSignatureOnly(self: Part) bool {
+        if (self.thoughtSignature == null) return false;
+        inline for (@typeInfo(Part).@"struct".field_names) |name| {
+            const non_data = comptime for (non_data_fields) |f| {
+                if (std.mem.eql(u8, f, name)) break true;
+            } else false;
+            if (!non_data and @field(self, name) != null) return false;
+        }
+        return true;
+    }
+
+    /// Like std's struct stringify, except a signature-only part is sent with
+    /// `"text": ""`: the API may reject a part with no data field.
+    pub fn jsonStringify(self: Part, jw: *std.json.Stringify) !void {
+        var part = self;
+        if (part.isSignatureOnly()) part.text = "";
+        try jw.beginObject();
+        const info = @typeInfo(Part).@"struct";
+        inline for (info.field_names) |name| {
+            const v = @field(part, name);
+            if (v != null or jw.options.emit_null_optional_fields) {
+                try jw.objectField(name);
+                try jw.write(v);
+            }
+        }
+        try jw.endObject();
+    }
 };
 
 /// Extra metadata associated with a part for speech synthesis.
@@ -1290,4 +1325,33 @@ test "Candidate parses CONTINUATION and continuationToken" {
     const c = parsed.value.candidates.?[0];
     try std.testing.expect(std.meta.activeTag(c.finishReason.?) == .CONTINUATION);
     try std.testing.expectEqualStrings("YWJj", c.continuationToken.?);
+}
+
+test "Part sends empty text on a signature-only part" {
+    const cases = [_]struct { part: Part, want: []const u8 }{
+        .{ .part = .{ .thoughtSignature = "c2ln" }, .want =
+        \\{"text":"","thoughtSignature":"c2ln"}
+        },
+        .{ .part = .{ .thought = true, .thoughtSignature = "c2ln" }, .want =
+        \\{"text":"","thought":true,"thoughtSignature":"c2ln"}
+        },
+        .{ .part = .{ .text = "hi", .thoughtSignature = "c2ln" }, .want =
+        \\{"text":"hi","thoughtSignature":"c2ln"}
+        },
+        .{ .part = .{ .functionCall = .{ .name = "f" }, .thoughtSignature = "c2ln" }, .want =
+        \\{"functionCall":{"name":"f"},"thoughtSignature":"c2ln"}
+        },
+        .{ .part = .{ .inlineData = .{ .data = "AA==", .mimeType = "image/png" }, .thoughtSignature = "c2ln" }, .want =
+        \\{"inlineData":{"data":"AA==","mimeType":"image/png"},"thoughtSignature":"c2ln"}
+        },
+        .{ .part = .{ .thought = true }, .want =
+        \\{"thought":true}
+        },
+    };
+    for (cases) |c| {
+        var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer buf.deinit();
+        try std.json.Stringify.value(c.part, .{ .emit_null_optional_fields = false }, &buf.writer);
+        try std.testing.expectEqualStrings(c.want, buf.written());
+    }
 }
