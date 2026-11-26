@@ -52,6 +52,64 @@ pub const ErrorDetail = struct {
     }
 };
 
+/// The response headers named by `Transport.Options.capture_headers`. A
+/// header sent twice keeps its first value. Owns every name and value.
+pub const CapturedHeaders = struct {
+    items: []std.http.Header = &.{},
+
+    /// The value of `name`, any case; null when absent.
+    pub fn get(self: CapturedHeaders, name: []const u8) ?[]const u8 {
+        for (self.items) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+        }
+        return null;
+    }
+
+    pub fn deinit(self: *CapturedHeaders, allocator: std.mem.Allocator) void {
+        freeStrings(allocator, self.items);
+        allocator.free(self.items);
+        self.* = .{};
+    }
+
+    pub fn dupe(self: CapturedHeaders, allocator: std.mem.Allocator) std.mem.Allocator.Error!CapturedHeaders {
+        const items = try allocator.alloc(std.http.Header, self.items.len);
+        var done: usize = 0;
+        errdefer {
+            freeStrings(allocator, items[0..done]);
+            allocator.free(items);
+        }
+        for (self.items, items) |h, *out| {
+            const name = try allocator.dupe(u8, h.name);
+            errdefer allocator.free(name);
+            out.* = .{ .name = name, .value = try allocator.dupe(u8, h.value) };
+            done += 1;
+        }
+        return .{ .items = items };
+    }
+
+    /// The first value of each of `names` in `head`, copied: a head's bytes
+    /// are only valid until its body is read.
+    pub fn fromHead(allocator: std.mem.Allocator, names: []const []const u8, head: std.http.Client.Response.Head) std.mem.Allocator.Error!CapturedHeaders {
+        var borrowed: std.ArrayList(std.http.Header) = .empty;
+        defer borrowed.deinit(allocator);
+        for (names) |name| {
+            var it = head.iterateHeaders();
+            while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) {
+                try borrowed.append(allocator, .{ .name = name, .value = h.value });
+                break;
+            };
+        }
+        return (CapturedHeaders{ .items = borrowed.items }).dupe(allocator);
+    }
+
+    fn freeStrings(allocator: std.mem.Allocator, items: []const std.http.Header) void {
+        for (items) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+    }
+};
+
 /// An `Authorization: Bearer <token>` header whose value is built on first use
 /// and cached.
 pub const BearerAuth = struct {
@@ -350,8 +408,13 @@ pub const Transport = struct {
     log_tag: ?[]const u8,
     /// Sent on every request after the client's own headers. Borrowed.
     extra_headers: []const std.http.Header,
+    /// Response headers to keep in `last_headers`. Borrowed.
+    capture_headers: []const []const u8,
     /// Status and message of the most recent failed request.
     last_error: ErrorDetail = .{},
+    /// The `capture_headers` of the most recent response, successful or not.
+    /// Cleared when a request starts.
+    last_headers: CapturedHeaders = .{},
     /// Set by the host so a SIGINT can abort an in-flight request mid-read.
     interrupt: ?*Interrupt = null,
     /// Enforces `request_timeout_ms`; started on the first timed request.
@@ -367,6 +430,9 @@ pub const Transport = struct {
         /// Hugging Face's `X-HF-Bill-To`. Borrowed: the slice and its strings
         /// must outlive the transport.
         extra_headers: []const std.http.Header = &.{},
+        /// Response headers to keep in `last_headers`, e.g. a gateway's error
+        /// code or `Deprecation`/`Sunset`. Borrowed, like `extra_headers`.
+        capture_headers: []const []const u8 = &.{},
         /// A `std.http.Client` to send requests through, borrowed: `deinit`
         /// leaves it open, and it must outlive the transport. Transports given
         /// the same one share its connection pool and CA bundle, so a request
@@ -396,13 +462,15 @@ pub const Transport = struct {
             .request_timeout_ms = options.request_timeout_ms,
             .log_tag = options.log_tag,
             .extra_headers = options.extra_headers,
+            .capture_headers = options.capture_headers,
         };
     }
 
-    /// Frees `last_error`, stops the timeout thread, and closes the
-    /// connections of a client it owns.
+    /// Frees `last_error` and `last_headers`, stops the timeout thread, and
+    /// closes the connections of a client it owns.
     pub fn deinit(self: *Transport) void {
         self.last_error.deinit(self.allocator);
+        self.last_headers.deinit(self.allocator);
         if (self.watchdog) |w| w.destroy(self.allocator);
         switch (self.http_client) {
             .owned => |*c| c.deinit(),
@@ -423,6 +491,17 @@ pub const Transport = struct {
         self.last_error.setLogged(self.allocator, status, body, self.log_tag);
     }
 
+    /// Replace `last_headers` with `head`'s values of `capture_headers`.
+    fn captureHead(self: *Transport, head: std.http.Client.Response.Head) std.mem.Allocator.Error!void {
+        if (self.capture_headers.len == 0) return;
+        self.setLastHeaders(try .fromHead(self.allocator, self.capture_headers, head));
+    }
+
+    fn setLastHeaders(self: *Transport, captured: CapturedHeaders) void {
+        self.last_headers.deinit(self.allocator);
+        self.last_headers = captured;
+    }
+
     /// Fetch + retry + JSON parse. On a non-retryable HTTP error response,
     /// records it in `last_error` and returns `error.ApiError`. Each attempt is
     /// bounded by `request_timeout_ms` (see `Watchdog`).
@@ -430,6 +509,7 @@ pub const Transport = struct {
         var options = request;
         options.extra_headers = try self.withExtraHeaders(request.extra_headers);
         defer self.freeHeaders(request.extra_headers, options.extra_headers);
+        self.last_headers.deinit(self.allocator);
         const client = self.httpClient();
         const policy = self.retry_policy;
         const deadline: ?Deadline = if (self.request_timeout_ms) |ms| .{
@@ -445,8 +525,9 @@ pub const Transport = struct {
             var keep_buf = false;
             defer if (!keep_buf) response_buf.deinit();
 
-            var retry_after_ms: ?u32 = null;
-            const status = fetchCapturingRetryAfter(self.allocator, client, options, &response_buf.writer, self.interrupt, deadline, &retry_after_ms) catch |err| {
+            var hints: HeadHints = .{ .names = self.capture_headers };
+            const status = fetchCapturingHead(self.allocator, client, options, &response_buf.writer, self.interrupt, deadline, &hints) catch |err| {
+                hints.captured.deinit(self.allocator);
                 // Don't retry a request the user cancelled.
                 if (self.interrupted()) return err;
                 if (retry.isRetryableFetchError(err) and attempt + 1 < policy.max_attempts) {
@@ -456,6 +537,7 @@ pub const Transport = struct {
                 return err;
             };
 
+            self.setLastHeaders(hints.captured);
             const body = response_buf.written();
             const status_code: u10 = @backingInt(status);
             if (status_code >= 200 and status_code < 300) {
@@ -469,7 +551,7 @@ pub const Transport = struct {
             }
 
             if (retry.isRetryableStatus(status_code) and attempt + 1 < policy.max_attempts) {
-                retry.sleepBackoffHinted(client.io, attempt, policy, retry_after_ms);
+                retry.sleepBackoffHinted(client.io, attempt, policy, hints.retry_after_ms);
                 continue;
             }
             self.setErrorDetail(status_code, body);
@@ -565,6 +647,7 @@ pub const Transport = struct {
     ) SseError!void {
         const all = try self.withExtraHeaders(headers);
         defer self.freeHeaders(headers, all);
+        self.last_headers.deinit(self.allocator);
         return reconnectOnStale(SseError!void, self.interrupt, streamLinesOnce, .{
             self, url, all, payload, EventT, context, callback, frame,
         });
@@ -594,8 +677,8 @@ pub fn fetchInterruptible(
     response_writer: *std.Io.Writer,
     interrupt: ?*Interrupt,
 ) std.http.Client.FetchError!std.http.Status {
-    var retry_after_ms: ?u32 = null;
-    return fetchCapturingRetryAfter(allocator, client, options, response_writer, interrupt, null, &retry_after_ms);
+    var hints: HeadHints = .{};
+    return fetchCapturingHead(allocator, client, options, response_writer, interrupt, null, &hints);
 }
 
 /// JSON-encode a request body the way every provider expects it: optional
@@ -621,21 +704,34 @@ fn retryAfterFromHead(head: std.http.Client.Response.Head) ?u32 {
     return seconds_hint;
 }
 
-/// `fetchInterruptible` plus capture of the response's Retry-After hint into
-/// `retry_after_ms` (read from the head before the body is streamed, while
-/// the header bytes are still valid) so `Transport.fetchJson` can honor it,
-/// and an optional `deadline` after which the exchange fails with
-/// `error.Timeout` (see `Watchdog`).
-fn fetchCapturingRetryAfter(
+/// Read from a response head before its body, while its bytes are valid.
+const HeadHints = struct {
+    retry_after_ms: ?u32 = null,
+    /// Headers to copy into `captured`; empty copies nothing.
+    names: []const []const u8 = &.{},
+    captured: CapturedHeaders = .{},
+
+    fn read(self: *HeadHints, allocator: std.mem.Allocator, head: std.http.Client.Response.Head) std.mem.Allocator.Error!void {
+        self.retry_after_ms = retryAfterFromHead(head);
+        if (self.names.len == 0) return;
+        const captured: CapturedHeaders = try .fromHead(allocator, self.names, head);
+        self.captured.deinit(allocator);
+        self.captured = captured;
+    }
+};
+
+/// `fetchInterruptible` plus `hints` and an optional `deadline` after which
+/// the exchange fails with `error.Timeout` (see `Watchdog`).
+fn fetchCapturingHead(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     options: std.http.Client.FetchOptions,
     response_writer: *std.Io.Writer,
     interrupt: ?*Interrupt,
     deadline: ?Deadline,
-    retry_after_ms: *?u32,
+    hints: *HeadHints,
 ) std.http.Client.FetchError!std.http.Status {
-    return reconnectOnStale(std.http.Client.FetchError!std.http.Status, interrupt, fetchOnce, .{ allocator, client, options, response_writer, interrupt, deadline, retry_after_ms });
+    return reconnectOnStale(std.http.Client.FetchError!std.http.Status, interrupt, fetchOnce, .{ allocator, client, options, response_writer, interrupt, deadline, hints });
 }
 
 fn fetchOnce(
@@ -645,7 +741,7 @@ fn fetchOnce(
     response_writer: *std.Io.Writer,
     interrupt: ?*Interrupt,
     deadline: ?Deadline,
-    retry_after_ms: *?u32,
+    hints: *HeadHints,
 ) std.http.Client.FetchError!std.http.Status {
     const uri = switch (options.location) {
         .url => |u| try std.Uri.parse(u),
@@ -686,7 +782,7 @@ fn fetchOnce(
     if (deadline) |d| d.watchdog.arm(&req, d.timeout_ms);
     defer if (deadline) |d| if (d.watchdog.disarm()) guard.poison();
 
-    const status = exchange(allocator, &req, redirect_behavior, options, response_writer, retry_after_ms) catch |err| {
+    const status = exchange(allocator, &req, redirect_behavior, options, response_writer, hints) catch |err| {
         if (deadline) |d| if (d.watchdog.isFired()) return error.Timeout;
         return err;
     };
@@ -706,14 +802,14 @@ fn exchange(
     redirect_behavior: std.http.Client.Request.RedirectBehavior,
     options: std.http.Client.FetchOptions,
     response_writer: *std.Io.Writer,
-    retry_after_ms: *?u32,
+    hints: *HeadHints,
 ) std.http.Client.FetchError!std.http.Status {
     const own_redirect_buffer = redirect_behavior != .unhandled and options.redirect_buffer == null;
     const redirect_buffer: []u8 = if (redirect_behavior == .unhandled) &.{} else options.redirect_buffer orelse try allocator.alloc(u8, 8 * 1024);
     defer if (own_redirect_buffer) allocator.free(redirect_buffer);
 
     var response = try sendReceiveHead(req, options.payload, redirect_buffer);
-    retry_after_ms.* = retryAfterFromHead(response.head);
+    try hints.read(allocator, response.head);
 
     const decompress_buffer: []u8 = switch (response.head.content_encoding) {
         .identity => &.{},
@@ -896,6 +992,7 @@ fn streamLinesOnce(
 
     var redirect_buf: [0]u8 = undefined;
     var response = try sendReceiveHead(&req, payload, &redirect_buf);
+    try transport.captureHead(response.head);
 
     const transfer_buf = try allocator.alloc(u8, 256 * 1024);
     defer allocator.free(transfer_buf);
@@ -1189,6 +1286,10 @@ const Serve = enum {
     respond_negotiated,
     /// Answer one request with 200 if it carries `X-Extra: v`, else 400.
     respond_if_extra_header,
+    /// Answer one request with 200 and a `Deprecation` header sent twice.
+    respond_deprecated,
+    /// Answer one request with 403, a JSON error and `X-Gateway-Error`.
+    reject_with_gateway_error,
 };
 
 /// `{"ok":true}\n`, gzipped.
@@ -1265,7 +1366,75 @@ fn serveOnce(server: *std.Io.net.Server, serve: Serve) void {
             }
             request.respond("{\"ok\":true}\n", .{ .status = if (found) .ok else .bad_request }) catch return;
         },
+        .respond_deprecated, .reject_with_gateway_error => {
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(io, &read_buf);
+            var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
+            var request = http_server.receiveHead() catch return;
+            if (serve == .respond_deprecated) {
+                request.respond("{\"ok\":true}\n", .{ .extra_headers = &.{
+                    .{ .name = "Deprecation", .value = "@1767225600" },
+                    .{ .name = "Deprecation", .value = "@0" },
+                } }) catch return;
+            } else {
+                request.respond("{\"error\":{\"message\":\"model access is off\"}}", .{
+                    .status = .forbidden,
+                    .extra_headers = &.{.{ .name = "X-Gateway-Error", .value = "llm_not_enabled" }},
+                }) catch return;
+            }
+        },
     }
+}
+
+const gateway_headers: []const []const u8 = &.{ "deprecation", "x-gateway-error" };
+
+test "capture_headers keeps the named headers of a successful JSON call" {
+    var t: Loopback = try .init();
+    defer t.deinit();
+    t.transport.capture_headers = gateway_headers;
+
+    var response = try t.served(.respond_deprecated, Loopback.postOk, .{&t});
+    response.deinit();
+    try std.testing.expectEqualStrings("@1767225600", t.transport.last_headers.get("Deprecation").?);
+    try std.testing.expectEqual(null, t.transport.last_headers.get("x-gateway-error"));
+    try std.testing.expectEqual(1, t.transport.last_headers.items.len);
+
+    // A request that gets no head clears them.
+    try std.testing.expectError(error.HttpConnectionClosing, t.fetch(.hang_up));
+    try std.testing.expectEqual(0, t.transport.last_headers.items.len);
+}
+
+test "a failed call keeps its captured headers" {
+    var t: Loopback = try .init();
+    defer t.deinit();
+    t.transport.capture_headers = gateway_headers;
+
+    try std.testing.expectError(error.ApiError, t.served(.reject_with_gateway_error, Loopback.postOk, .{&t}));
+    try std.testing.expectEqual(403, t.transport.last_error.status);
+    try std.testing.expectEqualStrings("model access is off", t.transport.last_error.message.?);
+    try std.testing.expectEqualStrings("llm_not_enabled", t.transport.last_headers.get("X-Gateway-Error").?);
+}
+
+test "a failed stream keeps its captured headers" {
+    // A loopback of its own: a failed call leaves a connection in the backlog.
+    var t: Loopback = try .init();
+    defer t.deinit();
+    t.transport.capture_headers = gateway_headers;
+
+    try std.testing.expectError(error.ApiError, t.stream(.reject_with_gateway_error));
+    try std.testing.expectEqualStrings("llm_not_enabled", t.transport.last_headers.get("x-gateway-error").?);
+}
+
+test "streams capture headers, and nothing is kept unless named" {
+    var t: Loopback = try .init();
+    defer t.deinit();
+
+    _ = try t.served(.respond_deprecated, Loopback.streamOk, .{&t});
+    try std.testing.expectEqual(0, t.transport.last_headers.items.len);
+
+    t.transport.capture_headers = gateway_headers;
+    try std.testing.expectEqual(1, try t.served(.respond_deprecated, Loopback.streamOk, .{&t}));
+    try std.testing.expectEqualStrings("@1767225600", t.transport.last_headers.get("deprecation").?);
 }
 
 test "extra_headers reach the server on JSON calls and streams" {

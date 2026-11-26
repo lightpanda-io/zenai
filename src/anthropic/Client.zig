@@ -40,6 +40,9 @@ pub const InitOptions = struct {
     /// Sent on every request after the auth headers; borrowed, see
     /// `http.Transport.Options.extra_headers`.
     extra_headers: []const std.http.Header = &.{},
+    /// Response headers to keep in `transport.last_headers`; borrowed, see
+    /// `http.Transport.Options.capture_headers`.
+    capture_headers: []const []const u8 = &.{},
 };
 
 /// Create a new Anthropic API client.
@@ -50,6 +53,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
             .request_timeout_ms = options.request_timeout_ms,
             .http_client = options.http_client,
             .extra_headers = options.extra_headers,
+            .capture_headers = options.capture_headers,
             .log_tag = "Anthropic",
         }),
         .api_key = api_key,

@@ -3,8 +3,8 @@
 //! warm.
 //!
 //! Which provider answers is read from the environment on every ask, and so
-//! are its credentials. TypeSafe answers unless the provider variable names
-//! Gemini: a Google key is set for many other reasons, so it is no consent to
+//! are its credentials, unless `setCredentials` overrides them. TypeSafe
+//! answers unless the provider variable names Gemini: a Google key is set for many other reasons, so it is no consent to
 //! send content to a decision model. A client borrows its API key and base
 //! URL rather than copying them, and the environment they came from can
 //! change under it, so the pool keeps its own copies and retires any client
@@ -32,6 +32,8 @@ allocator: std.mem.Allocator,
 /// restart.
 environ: *const fn () std.process.Environ,
 options: Options,
+/// Set by `setCredentials`; owns `api_key` and `base_url`.
+override: ?Credentials = null,
 idle: std.ArrayList(Pooled) = .empty,
 mutex: std.Io.Mutex = .init,
 
@@ -84,10 +86,12 @@ const Pooled = struct {
     },
     api_key: []const u8,
     base_url: ?[]const u8,
+    extra_headers: []const std.http.Header,
 
     fn matches(self: Pooled, credentials: Credentials) bool {
         if (std.meta.activeTag(self.client) != credentials.provider) return false;
         if (!std.mem.eql(u8, self.api_key, credentials.api_key)) return false;
+        if (self.extra_headers.ptr != credentials.extra_headers.ptr or self.extra_headers.len != credentials.extra_headers.len) return false;
         const a = self.base_url orelse return credentials.base_url == null;
         const b = credentials.base_url orelse return false;
         return std.mem.eql(u8, a, b);
@@ -99,6 +103,9 @@ pub const Credentials = struct {
     api_key: []const u8,
     /// Null is the provider's default.
     base_url: ?[]const u8,
+    /// Sent with every ask on these credentials only. Borrowed: it must
+    /// outlive the pool.
+    extra_headers: []const std.http.Header = &.{},
 };
 
 pub const CredentialsError = error{
@@ -143,6 +150,29 @@ pub fn deinit(self: *Pool) void {
     defer self.mutex.unlock(self.io);
     for (self.idle.items) |pooled| self.destroy(pooled);
     self.idle.deinit(self.allocator);
+    self.freeOverride();
+}
+
+/// Use `credentials` for every ask instead of the environment, or go back to
+/// the environment with null. Copies `api_key` and `base_url`.
+pub fn setCredentials(self: *Pool, credentials: ?Credentials) std.mem.Allocator.Error!void {
+    var copy = credentials;
+    if (copy) |*c| {
+        c.api_key = try self.allocator.dupe(u8, c.api_key);
+        errdefer self.allocator.free(c.api_key);
+        if (c.base_url) |url| c.base_url = try self.allocator.dupe(u8, url);
+    }
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    self.freeOverride();
+    self.override = copy;
+}
+
+fn freeOverride(self: *Pool) void {
+    const c = self.override orelse return;
+    self.allocator.free(c.api_key);
+    if (c.base_url) |url| self.allocator.free(url);
+    self.override = null;
 }
 
 /// One ask, on a client of its own. On `error.ApiError`, `failure` carries the
@@ -186,15 +216,15 @@ pub fn ask(
 }
 
 fn take(self: *Pool) !Pooled {
-    const credentials = try envCredentials(self.environ(), self.options.provider_env_var_name);
+    // Held throughout: `setCredentials` frees the override it replaces.
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const credentials = self.override orelse
+        try envCredentials(self.environ(), self.options.provider_env_var_name);
 
-    {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        while (self.idle.pop()) |pooled| {
-            if (pooled.matches(credentials)) return pooled;
-            self.destroy(pooled);
-        }
+    while (self.idle.pop()) |pooled| {
+        if (pooled.matches(credentials)) return pooled;
+        self.destroy(pooled);
     }
 
     const key_copy = try self.allocator.dupe(u8, credentials.api_key);
@@ -205,18 +235,21 @@ fn take(self: *Pool) !Pooled {
     return .{
         .api_key = key_copy,
         .base_url = url_copy,
+        .extra_headers = credentials.extra_headers,
         .client = switch (credentials.provider) {
             .gemini => .{ .gemini = try self.create(GeminiClient, key_copy, .{
                 .base_url = url_copy,
                 .retry_policy = self.options.retry_policy,
                 .request_timeout_ms = self.options.request_timeout_ms,
                 .http_client = self.options.http_client,
+                .extra_headers = credentials.extra_headers,
             }) },
             .typesafe => .{ .typesafe = try self.create(TypesafeClient, key_copy, .{
-                .base_url = url_copy.?,
+                .base_url = url_copy orelse TypesafeClient.default_base_url,
                 .retry_policy = self.options.retry_policy,
                 .request_timeout_ms = self.options.request_timeout_ms,
                 .http_client = self.options.http_client,
+                .extra_headers = credentials.extra_headers,
             }) },
         },
     };
@@ -374,4 +407,45 @@ test "decisions.Pool: no key is an error, not a client that cannot ask" {
     var pool: Pool = .init(std.testing.io, std.testing.allocator, noKey, .{});
     defer pool.deinit();
     try std.testing.expectError(error.MissingApiKey, pool.take());
+}
+
+test "decisions.Pool: set credentials win over the environment until cleared" {
+    if (comptime !can_fake_environ) return error.SkipZigTest;
+
+    var pool: Pool = .init(std.testing.io, std.testing.allocator, firstKey, .{});
+    defer pool.deinit();
+
+    var key_buf = "gateway-token".*;
+    try pool.setCredentials(.{ .provider = .typesafe, .api_key = &key_buf, .base_url = "http://127.0.0.1:9999/typesafe" });
+    // Copied: the caller's buffer can change.
+    key_buf[0] = 'X';
+    const gateway = try pool.take();
+    try std.testing.expectEqualStrings("gateway-token", gateway.client.typesafe.api_key);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9999/typesafe", gateway.client.typesafe.base_url);
+    pool.put(gateway);
+
+    try pool.setCredentials(null);
+    const own = try pool.take();
+    try std.testing.expectEqualStrings("first-key", own.client.typesafe.api_key);
+    try std.testing.expectEqualStrings(TypesafeClient.default_base_url, own.client.typesafe.base_url);
+    pool.put(own);
+    try std.testing.expectEqual(1, pool.idle.items.len);
+}
+
+test "decisions.Pool: extra headers go only with the credentials that carry them" {
+    var pool: Pool = .init(std.testing.io, std.testing.allocator, noKey, .{});
+    defer pool.deinit();
+
+    const extra = [_]std.http.Header{.{ .name = "X-Client-Version", .value = "1.0" }};
+    try pool.setCredentials(.{ .provider = .typesafe, .api_key = "tok", .base_url = null, .extra_headers = &extra });
+    const with = try pool.take();
+    try std.testing.expectEqualSlices(std.http.Header, &extra, with.client.typesafe.transport.extra_headers);
+    pool.put(with);
+
+    // Same key without the headers: the idle client is retired, not reused.
+    try pool.setCredentials(.{ .provider = .typesafe, .api_key = "tok", .base_url = null });
+    const without = try pool.take();
+    try std.testing.expectEqual(0, without.client.typesafe.transport.extra_headers.len);
+    pool.put(without);
+    try std.testing.expectEqual(1, pool.idle.items.len);
 }

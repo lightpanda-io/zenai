@@ -52,6 +52,12 @@ pub const InitOptions = struct {
     /// Borrowed `std.http.Client` to share a connection pool with other
     /// clients; see `http.Transport.Options.http_client`. Null owns one.
     http_client: ?*std.http.Client = null,
+    /// Sent on every request after the auth header; borrowed, see
+    /// `http.Transport.Options.extra_headers`.
+    extra_headers: []const std.http.Header = &.{},
+    /// Response headers to keep in `transport.last_headers`; borrowed, see
+    /// `http.Transport.Options.capture_headers`.
+    capture_headers: []const []const u8 = &.{},
 };
 
 /// `api_key` and `options.base_url` are borrowed, not copied: they must
@@ -62,6 +68,8 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
             .retry_policy = options.retry_policy,
             .request_timeout_ms = options.request_timeout_ms,
             .http_client = options.http_client,
+            .extra_headers = options.extra_headers,
+            .capture_headers = options.capture_headers,
             .log_tag = "TypeSafe",
         }),
         .api_key = api_key,

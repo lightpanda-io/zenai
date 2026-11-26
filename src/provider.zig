@@ -528,6 +528,9 @@ pub const Client = union(enum) {
         /// Headers sent on every request, e.g. Hugging Face's `X-HF-Bill-To`.
         /// Borrowed: see `http.Transport.Options.extra_headers`.
         extra_headers: []const std.http.Header = &.{},
+        /// Response headers to keep, e.g. a gateway's error code. Borrowed:
+        /// see `http.Transport.Options.capture_headers`.
+        capture_headers: []const []const u8 = &.{},
     };
 
     /// Construct the client for `backend`, authenticating with `key`; the
@@ -546,6 +549,7 @@ pub const Client = union(enum) {
                     .request_timeout_ms = options.request_timeout_ms,
                     .http_client = options.http_client,
                     .extra_headers = options.extra_headers,
+                    .capture_headers = options.capture_headers,
                 };
                 if (base_url) |u| impl_opts.base_url = u;
                 if (tag == .vertex) impl_opts.vertex = settings;
@@ -598,6 +602,12 @@ pub const Client = union(enum) {
     pub fn lastError(self: Client) LastError {
         const detail = self.transport().last_error;
         return .{ .status = detail.status, .message = detail.message };
+    }
+
+    /// The last response's `InitOptions.capture_headers`, successful or not.
+    /// Owned by the client and valid until its next request.
+    pub fn lastHeaders(self: Client) http.CapturedHeaders {
+        return self.transport().last_headers;
     }
 
     /// Generate content from a list of messages.
