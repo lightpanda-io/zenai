@@ -1399,8 +1399,13 @@ test "capture_headers keeps the named headers of a successful JSON call" {
     try std.testing.expectEqual(null, t.transport.last_headers.get("x-gateway-error"));
     try std.testing.expectEqual(1, t.transport.last_headers.items.len);
 
-    // A request that gets no head clears them.
-    try std.testing.expectError(error.HttpConnectionClosing, t.fetch(.hang_up));
+    // A request that gets no head clears them. Windows can report the
+    // hang-up as an abort rather than a clean close.
+    if (t.fetch(.hang_up)) |r| {
+        var unexpected = r;
+        unexpected.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expect(isStaleConnection(err));
     try std.testing.expectEqual(0, t.transport.last_headers.items.len);
 }
 
