@@ -27,6 +27,8 @@ pub const InitOptions = struct {
     base_url: []const u8 = "http://localhost:11434/v1",
     /// Sent on every request; borrowed, see `openai.Client.InitOptions`.
     extra_headers: []const std.http.Header = &.{},
+    /// See `openai.Client.InitOptions.capture_headers`.
+    capture_headers: []const []const u8 = &.{},
     retry_policy: retry.RetryPolicy = .{},
     /// See `openai.Client.InitOptions.request_timeout_ms`.
     request_timeout_ms: ?u32 = null,
@@ -40,6 +42,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
     var openai: OpenAIClient = .init(io, allocator, api_key, .{
         .base_url = options.base_url,
         .extra_headers = options.extra_headers,
+        .capture_headers = options.capture_headers,
         .retry_policy = options.retry_policy,
         .request_timeout_ms = options.request_timeout_ms,
         .http_client = options.http_client,

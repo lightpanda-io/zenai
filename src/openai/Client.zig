@@ -41,6 +41,9 @@ pub const InitOptions = struct {
     /// `X-HF-Bill-To`). Borrowed: the slice and its strings must outlive the
     /// client.
     extra_headers: []const std.http.Header = &.{},
+    /// Response headers to keep in `transport.last_headers`; borrowed, see
+    /// `http.Transport.Options.capture_headers`.
+    capture_headers: []const []const u8 = &.{},
     /// Retry policy for transient HTTP failures (5xx, 429, and known
     /// flaky network errors). Pass `RetryPolicy.disabled` to opt out.
     retry_policy: RetryPolicy = .{},
@@ -80,6 +83,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, api_key: []const u8, optio
             .request_timeout_ms = options.request_timeout_ms,
             .http_client = options.http_client,
             .extra_headers = options.extra_headers,
+            .capture_headers = options.capture_headers,
             .log_tag = "OpenAI",
         }),
         .api_key = api_key,
