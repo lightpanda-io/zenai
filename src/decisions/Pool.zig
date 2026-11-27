@@ -114,12 +114,16 @@ pub const CredentialsError = error{
     UnknownProvider,
 };
 
+/// The provider `provider_env_var_name` forces, or null when it is unset.
+pub fn envForcedProvider(environ: std.process.Environ, provider_env_var_name: ?[]const u8) error{UnknownProvider}!?Provider {
+    const name = provider_env_var_name orelse return null;
+    const value = provider.envGet(environ, name) orelse return null;
+    return std.meta.stringToEnum(Provider, value) orelse error.UnknownProvider;
+}
+
 /// The provider an ask would go to, and what it would authenticate with.
 pub fn envCredentials(environ: std.process.Environ, provider_env_var_name: ?[]const u8) CredentialsError!Credentials {
-    const forced: ?Provider = if (provider_env_var_name) |name| blk: {
-        const value = provider.envGet(environ, name) orelse break :blk null;
-        break :blk std.meta.stringToEnum(Provider, value) orelse return error.UnknownProvider;
-    } else null;
+    const forced = try envForcedProvider(environ, provider_env_var_name);
 
     if (forced == .gemini) {
         const gemini = provider.fromEnv(environ, .gemini);

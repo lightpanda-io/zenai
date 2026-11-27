@@ -74,6 +74,7 @@ pub const decisions = struct {
     pub const Response = types.Response;
     pub const envCredentials = Pool.envCredentials;
     pub const envProvider = Pool.envProvider;
+    pub const envForcedProvider = Pool.envForcedProvider;
     pub const envHint = Pool.envHint;
     pub const gemini_base_url_env_var_name = Pool.gemini_base_url_env_var_name;
 
