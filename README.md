@@ -118,23 +118,21 @@ const ai = try zenai.provider.Client.init(io, allocator, .{
 defer ai.deinit(allocator);
 ```
 
-When the gateway itself says which protocol, path and model each use goes to, `zenai.gateway` builds those endpoints from its config. Define the config's shape with `gateway.Route` fields; `loadConfig` fetches it with the token as a bearer and caches it on disk for `ttl_ms` (6 hours by default), falling back to an older cached copy when the gateway is down:
+When the gateway itself says which protocol, path and model each use goes to, `zenai.gateway.Gateway` builds those endpoints from its config. Define the config's shape with `gateway.Route` fields. `config` fetches it with the key as a bearer token and caches it on disk for `ttl_ms` (6 hours by default), falling back to an older cached copy when the gateway is down:
 
 ```zig
+const gw: zenai.gateway.Gateway = .{ .url = "https://gateway.example.com", .key = gateway_token };
 const Config = struct { agent: zenai.gateway.Route, decisions: zenai.gateway.Route };
-const config = try zenai.gateway.loadConfig(Config, io, arena, .{
-    .url = "https://gateway.example.com/v1/config",
-    .key = gateway_token,
+const config = try gw.config(Config, io, arena, .{
+    .path = "/v1/config",
     .cache_path = "/home/me/.local/share/app/gateway.json",
 });
-const gw: zenai.gateway.Gateway = .{ .url = "https://gateway.example.com", .key = gateway_token };
-const endpoint = try gw.endpoint(arena, config.agent) orelse return error.UnsupportedProtocol;
-const ai = try zenai.provider.Client.init(io, allocator, endpoint, .{});
+const ai = try zenai.provider.Client.init(io, allocator, try gw.endpoint(arena, config.agent), .{});
 defer ai.deinit(allocator);
-try pool.setCredentials(try gw.decisionCredentials(arena, config.decisions) orelse return error.UnsupportedProtocol);
+try pool.setCredentials(try gw.decisionCredentials(arena, config.decisions));
 ```
 
-`endpoint` returns null for a protocol zenai can't speak at another URL, so an older client can tell the user to update instead of failing on the first request. A route with a `model` serves only that model, which `listChatModelIds` then returns. Every gateway endpoint keeps the `Deprecation` and `Sunset` response headers; `zenai.gateway.deprecation(client.lastHeaders())` reports a deprecated route and its sunset date.
+`endpoint` and `decisionCredentials` fail with `error.UnsupportedProtocol` for a protocol zenai can't speak at another URL, so an older client can tell the user to update before the first request. A route with a `model` serves only that model, which `listChatModelIds` then returns. The cache is keyed by the config URL and the gateway's `extra_headers`, so a client that sends its version there refetches after an upgrade.
 
 `zenai.provider.info(tag)` gives each tag's default base URL, key variable, default model and whether it is a local server.
 
