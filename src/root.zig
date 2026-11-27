@@ -88,6 +88,7 @@ pub const decisions = struct {
 };
 
 pub const provider = @import("provider.zig");
+pub const gateway = @import("gateway.zig");
 /// Multi-turn conversation on `provider.Client`, for any backend.
 pub const Chat = @import("Chat.zig");
 pub const retry = @import("retry.zig");
