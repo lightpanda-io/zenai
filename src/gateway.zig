@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const http = @import("http.zig");
+const retry = @import("retry.zig");
 const provider = @import("provider.zig");
 const Pool = @import("decisions/Pool.zig");
 
@@ -59,7 +60,7 @@ pub const Gateway = struct {
         return .{
             .backend = .of(tag),
             .key = self.key,
-            .base_url = try std.mem.concatWithSentinel(arena, u8, &.{ self.url, route.path }, 0),
+            .base_url = try self.routeUrl(arena, route),
             .default_model = route.model,
             .models = if (route.model) |m| try arena.dupe([]const u8, &.{m}) else null,
             .extra_headers = self.extra_headers,
@@ -73,17 +74,15 @@ pub const Gateway = struct {
         return .{
             .provider = std.meta.stringToEnum(Pool.Provider, route.protocol) orelse return null,
             .api_key = self.key,
-            .base_url = try std.mem.concat(arena, u8, &.{ self.url, route.path }),
+            .base_url = try self.routeUrl(arena, route),
             .extra_headers = self.extra_headers,
         };
     }
-};
 
-/// The first of `routes` that speaks `protocol`.
-pub fn findRoute(routes: []const Route, protocol: []const u8) ?Route {
-    for (routes) |r| if (std.mem.eql(u8, r.protocol, protocol)) return r;
-    return null;
-}
+    fn routeUrl(self: Gateway, arena: std.mem.Allocator, route: Route) std.mem.Allocator.Error![:0]u8 {
+        return std.mem.concatWithSentinel(arena, u8, &.{ self.url, route.path }, 0);
+    }
+};
 
 pub const LoadOptions = struct {
     /// Fetched with a GET and the gateway's key as a bearer token.
@@ -96,6 +95,9 @@ pub const LoadOptions = struct {
     /// How long a cached copy is used without asking the gateway.
     ttl_ms: i64 = 6 * std.time.ms_per_hour,
     request_timeout_ms: u32 = 10_000,
+    /// One attempt by default: a startup shouldn't wait out backoff when the
+    /// cache is there to fall back on.
+    retry_policy: retry.RetryPolicy = .disabled,
     log_tag: []const u8 = "gateway",
 };
 
@@ -134,6 +136,7 @@ pub fn loadConfig(comptime T: type, io: std.Io, arena: std.mem.Allocator, option
 fn fetchConfig(comptime T: type, io: std.Io, arena: std.mem.Allocator, options: LoadOptions) !T {
     var transport: http.Transport = .init(io, arena, .{
         .request_timeout_ms = options.request_timeout_ms,
+        .retry_policy = options.retry_policy,
         .extra_headers = options.extra_headers,
         .log_tag = options.log_tag,
     });
@@ -189,12 +192,6 @@ test "Gateway.decisionCredentials: decision providers only" {
     try testing.expectEqualStrings("https://gw/typesafe", c.base_url.?);
     try testing.expectEqualStrings("tok", c.api_key);
     try testing.expectEqual(null, try test_gateway.decisionCredentials(arena.allocator(), .{ .protocol = "anthropic", .path = "/a" }));
-}
-
-test "findRoute" {
-    const routes = [_]Route{ .{ .protocol = "typesafe", .path = "/t" }, .{ .protocol = "gemini", .path = "/g" } };
-    try testing.expectEqualStrings("/g", findRoute(&routes, "gemini").?.path);
-    try testing.expectEqual(null, findRoute(&routes, "anthropic"));
 }
 
 test "deprecation: the sunset date when the gateway gives one" {

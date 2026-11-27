@@ -1397,8 +1397,8 @@ fn isLoopbackUrl(url: []const u8) bool {
 
 /// Chat-capable model IDs for `endpoint`, allocated in `arena`:
 /// `endpoint.models` as given, else asked of the server through a `Client`
-/// built with `options` and sorted. A local server on loopback isn't retried, since a
-/// refused connection there is definitive.
+/// built with `options` and sorted. A local server on loopback isn't
+/// retried, since a refused connection there is definitive.
 pub fn listChatModelIds(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1406,11 +1406,12 @@ pub fn listChatModelIds(
     endpoint: Endpoint,
     options: Client.InitOptions,
 ) ![][]const u8 {
-    var ids: std.ArrayList([]const u8) = .empty;
     if (endpoint.models) |models| {
-        for (models) |m| try ids.append(arena, try arena.dupe(u8, m));
-        return ids.toOwnedSlice(arena);
+        const ids = try arena.alloc([]const u8, models.len);
+        for (models, ids) |m, *id| id.* = try arena.dupe(u8, m);
+        return ids;
     }
+    var ids: std.ArrayList([]const u8) = .empty;
     const tag = endpoint.tag();
     // Codex has no listable models endpoint under OAuth; callers fall back to
     // the models.dev catalog.
