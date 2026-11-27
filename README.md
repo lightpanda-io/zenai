@@ -262,7 +262,7 @@ defer client.deinit();
 
 Generation, streaming, `Chat` and `countTokens` work in both modes. Model listing needs project/location mode, because Google's `ListPublisherModels` rejects API keys. Embeddings and decisions are Developer-API-only and return `error.UnsupportedByBackend` on Vertex.
 
-Through the provider abstraction, the backend is `.{ .vertex = .{ .project = "my-project", .location = "global" } }`, or plain `.vertex` for express mode. `provider.detectKeys` picks `.vertex` when `GOOGLE_GENAI_USE_VERTEXAI=1` (or `true`) is set, and express mode reads `GOOGLE_API_KEY`. `provider.fromEnv(environ, .vertex)` fills project mode from `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`/`GOOGLE_CLOUD_REGION` (default `"global"`), but you still pass the access token explicitly as the credential.
+Through the provider abstraction, the backend is `.{ .vertex = .{ .project = "my-project", .location = "global" } }`, or plain `.vertex` for express mode. `provider.detectKeys` picks `.vertex` when `GOOGLE_GENAI_USE_VERTEXAI=1` (or `true`) is set, and express mode reads `GOOGLE_API_KEY`. `provider.fromEnv(environ, .vertex)` fills project mode from `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`/`GOOGLE_CLOUD_REGION` (default `"global"`). With `VERTEX_API_KEY` also set, the express key is sent project-scoped (`.credential = .api_key`), which reaches models only served on `"global"`, like Gemini 4, that the unscoped express endpoint answers with 404. Otherwise you pass an access token explicitly as the credential.
 
 </details>
 
