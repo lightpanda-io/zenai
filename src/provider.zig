@@ -510,13 +510,8 @@ pub const Client = union(enum) {
         return self.transport().allocator;
     }
 
-    /// Options every provider takes; what only one provider takes lives in
-    /// its `Backend` variant.
+    /// How the client talks over HTTP; what it talks to is the `Endpoint`.
     pub const InitOptions = struct {
-        /// Overrides the provider's default base URL. Required for
-        /// `.openai_compatible`, which has none (`fromEnv` reads it from
-        /// OPENAI_BASE_URL).
-        base_url: ?[:0]const u8 = null,
         retry_policy: retry.RetryPolicy = .{},
         /// Per-attempt wall-clock bound on non-streaming requests, from an
         /// established connection to the end of the body (connect excluded);
@@ -525,31 +520,26 @@ pub const Client = union(enum) {
         /// Borrowed `std.http.Client` to share a connection pool with other
         /// clients; see `http.Transport.Options.http_client`. Null owns one.
         http_client: ?*std.http.Client = null,
-        /// Headers sent on every request, e.g. Hugging Face's `X-HF-Bill-To`.
-        /// Borrowed: see `http.Transport.Options.extra_headers`.
-        extra_headers: []const std.http.Header = &.{},
-        /// Response headers to keep, e.g. a gateway's error code. Borrowed:
-        /// see `http.Transport.Options.capture_headers`.
-        capture_headers: []const []const u8 = &.{},
     };
 
-    /// Construct the client for `backend`, authenticating with `key`; the
-    /// caller owns it and must release it with `deinit`. Reads no environment
-    /// variables: see `fromEnv` for the conventional ones.
-    pub fn init(io: std.Io, allocator: std.mem.Allocator, backend: Backend, key: [:0]const u8, options: InitOptions) !Client {
-        return switch (backend) {
+    /// Construct the client for `endpoint`; the caller owns it and must
+    /// release it with `deinit`. Reads no environment variables: see
+    /// `fromEnv` for the conventional ones.
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, endpoint: Endpoint, options: InitOptions) !Client {
+        const key = endpoint.key;
+        return switch (endpoint.backend) {
             inline else => |settings, tag| blk: {
                 const ClientPtr = @FieldType(Client, @tagName(tag));
                 const Impl = @typeInfo(ClientPtr).pointer.child;
                 // Never fall through to api.openai.com.
-                const base_url: ?[:0]const u8 = options.base_url orelse info(tag).base_url orelse
+                const base_url: ?[:0]const u8 = endpoint.base_url orelse info(tag).base_url orelse
                     if (tag == .openai_compatible) return error.MissingBaseUrl else null;
                 var impl_opts: Impl.InitOptions = .{
                     .retry_policy = options.retry_policy,
                     .request_timeout_ms = options.request_timeout_ms,
                     .http_client = options.http_client,
-                    .extra_headers = options.extra_headers,
-                    .capture_headers = options.capture_headers,
+                    .extra_headers = endpoint.extra_headers,
+                    .capture_headers = endpoint.capture_headers,
                 };
                 if (base_url) |u| impl_opts.base_url = u;
                 if (tag == .vertex) impl_opts.vertex = settings;
@@ -604,7 +594,7 @@ pub const Client = union(enum) {
         return .{ .status = detail.status, .message = detail.message };
     }
 
-    /// The last response's `InitOptions.capture_headers`, successful or not.
+    /// The last response's `Endpoint.capture_headers`, successful or not.
     /// Owned by the client and valid until its next request.
     pub fn lastHeaders(self: Client) http.CapturedHeaders {
         return self.transport().last_headers;
@@ -1160,8 +1150,37 @@ pub const Backend = union(Tag) {
     }
 };
 
-/// What the conventional env vars configure for one provider: the pieces of a
-/// `Client.init` call, which itself reads no environment.
+/// What a `Client` talks to. `fromEnv(...).endpoint(key)` builds one from the
+/// conventional env vars; a proxy or gateway that speaks a built-in protocol
+/// at its own URL is just an `Endpoint` with that URL.
+pub const Endpoint = struct {
+    backend: Backend,
+    key: [:0]const u8,
+    /// Null is the provider's default. Required for `.openai_compatible`,
+    /// which has none.
+    base_url: ?[:0]const u8 = null,
+    /// Null is `info(tag).default_model`.
+    default_model: ?[]const u8 = null,
+    /// What `listChatModelIds` returns instead of asking the server.
+    models: ?[]const []const u8 = null,
+    /// Sent on every request, e.g. Hugging Face's `X-HF-Bill-To`. Borrowed:
+    /// see `http.Transport.Options.extra_headers`.
+    extra_headers: []const std.http.Header = &.{},
+    /// Response headers to keep, e.g. a gateway's error code. Borrowed: see
+    /// `http.Transport.Options.capture_headers`.
+    capture_headers: []const []const u8 = &.{},
+
+    pub fn tag(self: Endpoint) Tag {
+        return std.meta.activeTag(self.backend);
+    }
+
+    pub fn defaultModel(self: Endpoint) []const u8 {
+        return self.default_model orelse info(self.tag()).default_model;
+    }
+};
+
+/// What the conventional env vars configure for one provider. `endpoint`
+/// turns it into what `Client.init` takes, with a key from anywhere.
 pub const EnvConfig = struct {
     /// `envApiKey(environ, tag)`; null when none is set.
     key: ?[:0]const u8,
@@ -1170,9 +1189,13 @@ pub const EnvConfig = struct {
     /// with a project, VERTEX_API_KEY makes the credential an API key rather
     /// than an access token. Every other tag gets `Backend.of(tag)`.
     backend: Backend,
-    /// For `InitOptions.base_url`: OPENAI_BASE_URL for `.openai_compatible`,
-    /// null for the others, which have their own default.
+    /// OPENAI_BASE_URL for `.openai_compatible`, null for the others, which
+    /// have their own default.
     base_url: ?[:0]const u8,
+
+    pub fn endpoint(self: EnvConfig, key: [:0]const u8) Endpoint {
+        return .{ .backend = self.backend, .key = key, .base_url = self.base_url };
+    }
 };
 
 pub fn fromEnv(environ: std.process.Environ, tag: Tag) EnvConfig {
@@ -1372,26 +1395,30 @@ fn isLoopbackUrl(url: []const u8) bool {
         std.mem.startsWith(u8, host, "127.");
 }
 
-/// Fetch chat-capable model IDs for `backend`, sorted and allocated in
-/// `arena`. Builds a `Client` with `options` for the request; a local server
-/// on loopback isn't retried, since a refused connection there is definitive.
+/// Chat-capable model IDs for `endpoint`, allocated in `arena`:
+/// `endpoint.models` as given, else asked of the server through a `Client`
+/// built with `options` and sorted. A local server on loopback isn't retried, since a
+/// refused connection there is definitive.
 pub fn listChatModelIds(
     io: std.Io,
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
-    backend: Backend,
-    api_key: [:0]const u8,
+    endpoint: Endpoint,
     options: Client.InitOptions,
 ) ![][]const u8 {
     var ids: std.ArrayList([]const u8) = .empty;
-    const tag = std.meta.activeTag(backend);
+    if (endpoint.models) |models| {
+        for (models) |m| try ids.append(arena, try arena.dupe(u8, m));
+        return ids.toOwnedSlice(arena);
+    }
+    const tag = endpoint.tag();
     // Codex has no listable models endpoint under OAuth; callers fall back to
     // the models.dev catalog.
     if (tag == .codex) return ids.toOwnedSlice(arena);
 
     var opts = options;
-    if (info(tag).local and isLoopbackUrl(options.base_url orelse info(tag).base_url.?)) opts.retry_policy = .disabled;
-    const client = try Client.init(io, allocator, backend, api_key, opts);
+    if (info(tag).local and isLoopbackUrl(endpoint.base_url orelse info(tag).base_url.?)) opts.retry_policy = .disabled;
+    const client = try Client.init(io, allocator, endpoint, opts);
     defer client.deinit(allocator);
 
     switch (client) {
@@ -1544,26 +1571,48 @@ test "Client.init: each backend's settings reach its client, shared options reac
     const io = std.testing.io;
     const extra = [_]std.http.Header{.{ .name = "X-Extra", .value = "v" }};
 
-    try std.testing.expectError(error.MissingBaseUrl, Client.init(io, a, .openai_compatible, "k", .{}));
+    try std.testing.expectError(error.MissingBaseUrl, Client.init(io, a, .{ .backend = .openai_compatible, .key = "k" }, .{}));
 
-    const vertex = try Client.init(io, a, .{ .vertex = .{ .project = "p", .location = "europe-west4" } }, "tok", .{ .extra_headers = &extra });
+    const vertex = try Client.init(io, a, .{ .backend = .{ .vertex = .{ .project = "p", .location = "europe-west4" } }, .key = "tok", .extra_headers = &extra }, .{});
     defer vertex.deinit(a);
     try std.testing.expectEqualStrings("p", vertex.vertex.vertex.?.project.?);
     try std.testing.expectEqualStrings("europe-west4", vertex.vertex.vertex.?.location);
     try std.testing.expectEqualSlices(std.http.Header, &extra, vertex.transport().extra_headers);
 
-    const codex = try Client.init(io, a, .{ .codex = .{ .account_id = "acct" } }, "tok", .{});
+    const codex = try Client.init(io, a, .{ .backend = .{ .codex = .{ .account_id = "acct" } }, .key = "tok" }, .{});
     defer codex.deinit(a);
     try std.testing.expectEqualStrings("acct", codex.codex.chatgpt.?.account_id.?);
     try std.testing.expectEqualStrings(openai_mod.codex_base_url, codex.codex.base_url);
 
-    const claude = try Client.init(io, a, .anthropic, "k", .{ .extra_headers = &extra });
+    const claude = try Client.init(io, a, .{ .backend = .anthropic, .key = "k", .extra_headers = &extra }, .{});
     defer claude.deinit(a);
     try std.testing.expectEqualSlices(std.http.Header, &extra, claude.transport().extra_headers);
 
-    const gemini = try Client.init(io, a, Backend.of(.gemini), "k", .{});
+    const gemini = try Client.init(io, a, fromEnv(.empty, .gemini).endpoint("k"), .{});
     defer gemini.deinit(a);
     try std.testing.expect(gemini.gemini.vertex == null);
+}
+
+test "Endpoint: a gateway's fixed models and default model win over the provider's" {
+    const a = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const gateway: Endpoint = .{
+        .backend = .gemini,
+        .key = "tok",
+        .base_url = "https://gw.example/gemini",
+        .default_model = "default",
+        .models = &.{ "default", "a-real-model" },
+    };
+    try std.testing.expectEqualStrings("default", gateway.defaultModel());
+    try std.testing.expectEqualStrings(defaultModel(.gemini), fromEnv(.empty, .gemini).endpoint("k").defaultModel());
+    const ids = try listChatModelIds(std.testing.io, a, arena.allocator(), gateway, .{});
+    try std.testing.expectEqualSlices(u8, "default", ids[0]);
+    try std.testing.expectEqualSlices(u8, "a-real-model", ids[1]);
+
+    const client = try Client.init(std.testing.io, a, gateway, .{});
+    defer client.deinit(a);
+    try std.testing.expectEqualStrings("https://gw.example/gemini", client.gemini.base_url.?);
 }
 
 test "fromEnv: key, vertex settings and the openai_compatible base URL" {

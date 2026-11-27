@@ -193,8 +193,7 @@ const CannedServer = struct {
     /// An OpenAI-compatible client pointed at this server.
     fn client(self: *CannedServer) !Client {
         const url = try std.fmt.bufPrintSentinel(&self.url_buf, "http://127.0.0.1:{d}", .{self.server.socket.address.getPort()}, 0);
-        return Client.init(std.testing.io, std.testing.allocator, .openai_compatible, "key", .{
-            .base_url = url,
+        return Client.init(std.testing.io, std.testing.allocator, .{ .backend = .openai_compatible, .key = "key", .base_url = url }, .{
             .retry_policy = .disabled,
             .request_timeout_ms = 2000,
         });

@@ -84,19 +84,37 @@ The OpenAI-compatible backends all use the OpenAI client with a different `base_
 | `.openai_compatible` | `OPENAI_BASE_URL` | `OPENAI_API_KEY` |
 
 ```zig
-const ai = try zenai.provider.Client.init(io, allocator, .llama_cpp, "llama.cpp", .{});
+const ai = try zenai.provider.Client.init(io, allocator, .{ .backend = .llama_cpp, .key = "llama.cpp" }, .{});
 defer ai.deinit(allocator);
 ```
 
-The first argument after the allocator is a `provider.Backend`: a tag, plus the settings only that provider takes (`.{ .vertex = .{ .project = "p" } }`, `.{ .codex = .{ .account_id = id } }`). The options struct holds what every provider takes: `base_url`, `retry_policy`, `request_timeout_ms`, `http_client` and `extra_headers` (sent on every request, e.g. Hugging Face's `X-HF-Bill-To`).
+The first argument after the allocator is a `provider.Endpoint`, what the client talks to:
 
-`init` reads no environment variables. `zenai.provider.fromEnv(environ, tag)` returns what the conventional ones configure for a tag: its key, its backend settings and, for `.openai_compatible`, the base URL:
+- `backend`: a tag, plus the settings only that provider takes (`.{ .vertex = .{ .project = "p" } }`, `.{ .codex = .{ .account_id = id } }`).
+- `key`, and `base_url` to override the provider's default.
+- `extra_headers`, sent on every request (e.g. Hugging Face's `X-HF-Bill-To`), and `capture_headers`, response headers kept for `Client.lastHeaders()`.
+- `default_model`, and `models`, a fixed list `listChatModelIds` returns instead of asking the server.
+
+The options struct holds how the client talks over HTTP: `retry_policy`, `request_timeout_ms` and `http_client`.
+
+`init` reads no environment variables. `zenai.provider.fromEnv(environ, tag)` returns what the conventional ones configure for a tag: its key, its backend settings and, for `.openai_compatible`, the base URL. `endpoint(key)` turns that into an `Endpoint`:
 
 ```zig
 const cfg = zenai.provider.fromEnv(environ, .openai_compatible);
-const ai = try zenai.provider.Client.init(io, allocator, cfg.backend, cfg.key orelse return error.MissingApiKey, .{
-    .base_url = cfg.base_url,
-});
+const ai = try zenai.provider.Client.init(io, allocator, cfg.endpoint(cfg.key orelse return error.MissingApiKey), .{});
+defer ai.deinit(allocator);
+```
+
+A proxy or gateway that speaks one of these protocols at its own URL is an `Endpoint` too:
+
+```zig
+const ai = try zenai.provider.Client.init(io, allocator, .{
+    .backend = .gemini,
+    .key = gateway_token,
+    .base_url = "https://gateway.example.com/gemini",
+    .default_model = "default",
+    .models = &.{"default"},
+}, .{});
 defer ai.deinit(allocator);
 ```
 
@@ -339,7 +357,7 @@ The `.codex` provider talks to the backend Codex CLI uses (`chatgpt.com/backend-
 zenai doesn't run the OAuth login. Get the token yourself (the browser's `lightpanda agent` does it in `src/agent/auth/codex.zig`), then go through the provider abstraction:
 
 ```zig
-const ai = try zenai.provider.Client.init(io, allocator, .{ .codex = .{ .account_id = account_id } }, access_token, .{});
+const ai = try zenai.provider.Client.init(io, allocator, .{ .backend = .{ .codex = .{ .account_id = account_id } }, .key = access_token }, .{});
 defer ai.deinit(allocator);
 
 var result = try ai.generateContent("gpt-5.5", &.{
