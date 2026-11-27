@@ -28,22 +28,34 @@ base_url: ?[]const u8,
 api_version: []const u8,
 /// Vertex AI backend config; null targets the Gemini Developer API.
 vertex: ?VertexConfig,
-/// Used in Vertex project/location mode.
+/// Used in Vertex project/location mode with an access token.
 bearer: http.BearerAuth = .{},
 
 /// Google Vertex AI backend configuration. When set on `InitOptions`, the
 /// client targets Vertex AI instead of the Gemini Developer API.
 pub const VertexConfig = struct {
-    /// GCP project ID for project/location mode, where `api_key` must be an
-    /// OAuth access token (e.g. `gcloud auth print-access-token`). Null
-    /// selects express mode: plain API-key auth against the global endpoint,
-    /// with no `projects/{p}/locations/{l}/` path prefix.
+    /// GCP project for project/location mode, where `credential` says what
+    /// `api_key` holds. Null selects express mode: plain API-key auth against
+    /// the global endpoint, with no `projects/{p}/locations/{l}/` path
+    /// prefix, which Vertex resolves in the key's own region.
     project: ?[]const u8 = null,
     /// GCP location, e.g. "us-central1". "global" (the default) uses
     /// https://aiplatform.googleapis.com; other values use the regional
     /// https://{location}-aiplatform.googleapis.com host. Ignored in
     /// express mode.
     location: []const u8 = "global",
+    /// What `api_key` holds in project/location mode. An express-mode API
+    /// key works there too, and reaches models its region doesn't serve
+    /// (e.g. ones only on "global"). Ignored in express mode.
+    credential: Credential = .access_token,
+
+    pub const Credential = enum {
+        /// OAuth access token (e.g. `gcloud auth print-access-token`),
+        /// sent as `Authorization: Bearer`.
+        access_token,
+        /// Vertex express-mode API key, sent as `x-goog-api-key`.
+        api_key,
+    };
 };
 
 /// Options for customizing the API endpoint.
@@ -153,10 +165,12 @@ pub const ApiError = error{ MissingApiKey, UnsupportedByBackend } || http.FetchE
 const default_base_url = "https://generativelanguage.googleapis.com";
 
 /// The auth header for this client's backend: `x-goog-api-key` for the
-/// Developer API and Vertex express mode, or `Authorization: Bearer` in
-/// Vertex project/location mode where `api_key` holds an OAuth access token.
+/// Developer API and Vertex API keys, or `Authorization: Bearer` in Vertex
+/// project/location mode where `api_key` holds an OAuth access token.
 fn authHeader(self: *Client) error{OutOfMemory}!std.http.Header {
-    if (self.vertex) |v| if (v.project != null) return self.bearer.header(self.transport.allocator, self.api_key);
+    if (self.vertex) |v| if (v.project != null and v.credential == .access_token) {
+        return self.bearer.header(self.transport.allocator, self.api_key);
+    };
     return .{ .name = "x-goog-api-key", .value = self.api_key };
 }
 
@@ -718,6 +732,20 @@ test "authHeader: api key vs cached bearer token" {
     // Built once and cached; deinit frees it (leak-checked by the test allocator).
     const second = try project.authHeader();
     try std.testing.expectEqual(first.value.ptr, second.value.ptr);
+
+    var project_key = Client.init(std.testing.io, std.testing.allocator, "key", .{
+        .vertex = .{ .project = "p", .credential = .api_key },
+    });
+    defer project_key.deinit();
+    const key_header = try project_key.authHeader();
+    try std.testing.expectEqualStrings("x-goog-api-key", key_header.name);
+    try std.testing.expectEqualStrings("key", key_header.value);
+    const url = try project_key.modelUrl("gemini-4-hydrogen", .{ .action = "generateContent" });
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(
+        "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/publishers/google/models/gemini-4-hydrogen:generateContent",
+        url,
+    );
 }
 
 test "vertex: developer-only methods are unsupported" {

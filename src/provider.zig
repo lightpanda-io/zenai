@@ -1167,7 +1167,8 @@ pub const EnvConfig = struct {
     key: ?[:0]const u8,
     /// `.vertex` takes its project from GOOGLE_CLOUD_PROJECT and its location
     /// from GOOGLE_CLOUD_LOCATION, then GOOGLE_CLOUD_REGION, then "global";
-    /// every other tag gets `Backend.of(tag)`.
+    /// with a project, VERTEX_API_KEY makes the credential an API key rather
+    /// than an access token. Every other tag gets `Backend.of(tag)`.
     backend: Backend,
     /// For `InitOptions.base_url`: OPENAI_BASE_URL for `.openai_compatible`,
     /// null for the others, which have their own default.
@@ -1182,6 +1183,7 @@ pub fn fromEnv(environ: std.process.Environ, tag: Tag) EnvConfig {
                 .project = envGet(environ, "GOOGLE_CLOUD_PROJECT"),
                 .location = envGet(environ, "GOOGLE_CLOUD_LOCATION") orelse
                     envGet(environ, "GOOGLE_CLOUD_REGION") orelse "global",
+                .credential = if (envGet(environ, "VERTEX_API_KEY") != null) .api_key else .access_token,
             } },
             else => .of(tag),
         },
@@ -1272,15 +1274,16 @@ pub fn envApiKey(environ: std.process.Environ, tag: Tag) ?[:0]const u8 {
             null
         else
             envGet(environ, "GOOGLE_API_KEY") orelse envGet(environ, "GEMINI_API_KEY"),
-        // Express mode only: with GOOGLE_CLOUD_PROJECT set, the credential
-        // must be an OAuth access token the caller supplies explicitly —
-        // not detectable from env. VERTEX_API_KEY is unambiguous vertex
-        // intent, so it skips the GOOGLE_GENAI_USE_VERTEXAI opt-in.
-        .vertex => if (envGet(environ, "GOOGLE_CLOUD_PROJECT") != null)
-            null
-        else
-            envGet(environ, "VERTEX_API_KEY") orelse
-                (if (useVertex(environ)) envGet(environ, "GOOGLE_API_KEY") else null),
+        // VERTEX_API_KEY is unambiguous vertex intent, so it skips the
+        // GOOGLE_GENAI_USE_VERTEXAI opt-in, and with GOOGLE_CLOUD_PROJECT set
+        // it is sent project-scoped (`fromEnv` marks it an API key). Without
+        // it, project mode needs an OAuth access token the caller supplies —
+        // not detectable from env — and GOOGLE_API_KEY stays express-only.
+        .vertex => envGet(environ, "VERTEX_API_KEY") orelse
+            if (envGet(environ, "GOOGLE_CLOUD_PROJECT") == null and useVertex(environ))
+                envGet(environ, "GOOGLE_API_KEY")
+            else
+                null,
         // Codex authenticates with an OAuth subscription token supplied by the
         // caller, not an env var — never env-detected.
         .codex => null,
@@ -1584,6 +1587,18 @@ test "fromEnv: key, vertex settings and the openai_compatible base URL" {
         const vertex = fromEnv(environ, .vertex).backend.vertex;
         try std.testing.expectEqualStrings("proj", vertex.project.?);
         try std.testing.expectEqualStrings("us-east5", vertex.location);
+        try std.testing.expectEqual(.access_token, vertex.credential);
+        try std.testing.expect(fromEnv(environ, .vertex).key == null);
+
+        const keyed: std.process.Environ = .{ .block = .{ .slice = &[_:null]?[*:0]const u8{
+            "VERTEX_API_KEY=AQ.test",
+            "GOOGLE_CLOUD_PROJECT=proj",
+        } } };
+        const keyed_env = fromEnv(keyed, .vertex);
+        try std.testing.expectEqualStrings("AQ.test", keyed_env.key.?);
+        try std.testing.expectEqualStrings("proj", keyed_env.backend.vertex.project.?);
+        try std.testing.expectEqualStrings("global", keyed_env.backend.vertex.location);
+        try std.testing.expectEqual(.api_key, keyed_env.backend.vertex.credential);
     }
 }
 
