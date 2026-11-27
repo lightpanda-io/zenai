@@ -1,8 +1,7 @@
-//! A gateway: one URL and token in front of several model providers. Its
-//! config (any JSON shape the caller defines) names a `Route` per use, and
+//! A gateway: one URL and token in front of several model providers, whose
+//! config (a JSON shape the caller defines) names a `Route` per use.
 //! `Gateway` turns a route into what `provider.Client.init` or the decision
-//! pool takes. `loadConfig` fetches that config with a disk cache, so a
-//! gateway that is briefly down doesn't stop the caller.
+//! pool takes; `loadConfig` fetches the config through a disk cache.
 
 const std = @import("std");
 const http = @import("http.zig");
