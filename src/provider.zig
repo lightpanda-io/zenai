@@ -1212,7 +1212,7 @@ pub const Info = struct {
 pub fn info(tag: Tag) Info {
     return switch (tag) {
         .anthropic => .{ .env_var = "ANTHROPIC_API_KEY", .default_model = "claude-sonnet-5-5" },
-        .gemini => .{ .key_hint = "GOOGLE_API_KEY/GEMINI_API_KEY", .default_model = "gemini-3.8-flash" },
+        .gemini => .{ .key_hint = "GOOGLE_API_KEY/GEMINI_API_KEY", .default_model = "gemini-4-hydrogen" },
         .vertex => .{ .key_hint = "VERTEX_API_KEY/GOOGLE_API_KEY", .default_model = "gemini-3.8-flash" },
         .openai => .{ .key_hint = "OPENAI_API_KEY", .default_model = "gpt-6-luna" },
         .codex => .{ .base_url = openai_mod.codex_base_url, .key_hint = "a ChatGPT subscription (OAuth)", .default_model = "gpt-5.5" },
@@ -1462,7 +1462,6 @@ test "isLoopbackUrl: loopback hosts disable retry, remote hosts keep it" {
 
 test "vertex: gemini-backed, no OpenAI preset, gated auto-detection" {
     try std.testing.expect(defaultBaseUrl(.vertex) == null);
-    try std.testing.expectEqualStrings(defaultModel(.gemini), defaultModel(.vertex));
     try std.testing.expect(envVarName(.vertex).len > 0);
     // Candidacy is runtime-gated by GOOGLE_GENAI_USE_VERTEXAI (useVertex),
     // not comptime-excluded, so the tag stays in the candidate list.
