@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const http = @import("http.zig");
+const json = @import("json.zig");
 const retry = @import("retry.zig");
 const provider = @import("provider.zig");
 const Pool = @import("decisions/Pool.zig");
@@ -112,8 +113,7 @@ pub fn loadConfig(comptime T: type, io: std.Io, arena: std.mem.Allocator, option
     const Cache = struct { fetched_ms: i64, url: []const u8, config: T };
     const now = std.Io.Clock.real.now(io).toMilliseconds();
     const cached: ?Cache = if (options.cache_path) |path| blk: {
-        const data = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024 * 1024)) catch break :blk null;
-        const c = std.json.parseFromSliceLeaky(Cache, arena, data, .{ .ignore_unknown_fields = true }) catch break :blk null;
+        const c = json.readFile(Cache, io, arena, path, 1024 * 1024) orelse break :blk null;
         break :blk if (std.mem.eql(u8, c.url, options.url)) c else null;
     } else null;
     if (cached) |c| if (now - c.fetched_ms <= options.ttl_ms) return c.config;
@@ -126,7 +126,7 @@ pub fn loadConfig(comptime T: type, io: std.Io, arena: std.mem.Allocator, option
         log.err("{s}: config fetch from {s} failed ({t})", .{ options.log_tag, options.url, err });
         return error.GatewayUnavailable;
     };
-    if (options.cache_path) |path| writeCache(io, path, Cache{ .fetched_ms = now, .url = options.url, .config = config }) catch |err| {
+    if (options.cache_path) |path| json.writeFileAtomic(io, path, Cache{ .fetched_ms = now, .url = options.url, .config = config }, .default_file) catch |err| {
         log.warn("{s}: config cache write failed ({t})", .{ options.log_tag, err });
     };
     return config;
@@ -144,17 +144,6 @@ fn fetchConfig(comptime T: type, io: std.Io, arena: std.mem.Allocator, options: 
     const response = try transport.getJson(options.url, &.{try bearer.header(arena, options.key)}, T);
     // Not deinit'ed: its strings live in `arena`.
     return response.value;
-}
-
-/// Temp file plus rename, so a failed write keeps the previous copy.
-fn writeCache(io: std.Io, path: []const u8, value: anytype) !void {
-    var af = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true });
-    defer af.deinit(io);
-    var buf: [1024]u8 = undefined;
-    var w = af.file.writer(io, &buf);
-    try std.json.Stringify.value(value, .{}, &w.interface);
-    try w.end();
-    try af.replace(io);
 }
 
 const testing = std.testing;
@@ -213,7 +202,7 @@ test "loadConfig: a fresh cached copy for the same gateway skips the fetch" {
     const path = try std.fs.path.join(a, &.{ dir, "gw.json" });
 
     const now = std.Io.Clock.real.now(testing.io).toMilliseconds();
-    try writeCache(testing.io, path, .{ .fetched_ms = now, .url = "http://127.0.0.1:1/v1/config", .config = Config{ .agent = .{ .protocol = "gemini", .path = "/g" } } });
+    try json.writeFileAtomic(testing.io, path, .{ .fetched_ms = now, .url = "http://127.0.0.1:1/v1/config", .config = Config{ .agent = .{ .protocol = "gemini", .path = "/g" } } }, .default_file);
     const config = try loadConfig(Config, testing.io, a, .{ .url = "http://127.0.0.1:1/v1/config", .key = "tok", .cache_path = path });
     try testing.expectEqualStrings("/g", config.agent.path);
 }

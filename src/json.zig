@@ -206,6 +206,25 @@ pub fn dupeValue(a: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.
 }
 
 /// Serialize any value to a JSON string, allocated with `allocator`.
+/// `path` parsed as `T` into `arena`, ignoring unknown fields; null when it is
+/// missing, larger than `max_bytes` or not a `T`.
+pub fn readFile(comptime T: type, io: std.Io, arena: std.mem.Allocator, path: []const u8, max_bytes: usize) ?T {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_bytes)) catch return null;
+    return std.json.parseFromSliceLeaky(T, arena, data, .{ .ignore_unknown_fields = true }) catch null;
+}
+
+/// `value` as JSON to `path` through a temp file and a rename, so a failed
+/// write keeps the previous file.
+pub fn writeFileAtomic(io: std.Io, path: []const u8, value: anytype, permissions: std.Io.File.Permissions) !void {
+    var af = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .permissions = permissions, .replace = true });
+    defer af.deinit(io);
+    var buf: [1024]u8 = undefined;
+    var w = af.file.writer(io, &buf);
+    try std.json.Stringify.value(value, .{}, &w.interface);
+    try w.end();
+    try af.replace(io);
+}
+
 pub fn stringifyAlloc(allocator: std.mem.Allocator, value: anytype, options: std.json.Stringify.Options) std.mem.Allocator.Error![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
